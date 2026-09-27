@@ -1,0 +1,343 @@
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+use crate::{CancellationToken, DownloadProgress};
+use anyhow::{Context, Result, ensure};
+use candle_core::{DType, Device};
+use candle_nn::VarBuilder;
+use hf_hub::{
+    Cache, Repo, RepoType,
+    api::{Progress, sync::ApiBuilder},
+};
+use serde::de::DeserializeOwned;
+
+pub const MODEL: &str = "Qwen/Qwen-Image-2.1";
+// Matches the checkpoint used by the original Python CLI. Pin architecture and weights together.
+pub const REVISION: &str = "790c92633540aa0cb11d9abf19eb46d861714758";
+
+pub struct Weights {
+    local: Option<PathBuf>,
+    offline: bool,
+}
+
+impl Weights {
+    pub fn new(local: Option<PathBuf>, offline: bool) -> Self {
+        Self { local, offline }
+    }
+
+    pub fn file(&self, name: &str) -> Result<PathBuf> {
+        self.file_with_progress(name, &mut |_| {})
+    }
+
+    fn file_with_progress(
+        &self,
+        name: &str,
+        on_progress: &mut dyn FnMut(DownloadProgress),
+    ) -> Result<PathBuf> {
+        if let Some(root) = &self.local {
+            let path = root.join(name);
+            ensure!(
+                path.is_file(),
+                "missing checkpoint file: {}",
+                path.display()
+            );
+            return Ok(path);
+        }
+        let repo = Repo::with_revision(MODEL.into(), RepoType::Model, REVISION.into());
+        let cache = std::env::var_os("HF_HUB_CACHE")
+            .map(|p| Cache::new(p.into()))
+            .unwrap_or_else(Cache::from_env);
+        // Python's hub client does not create refs/<commit> for a pinned revision.
+        let snapshot = cache
+            .path()
+            .join(repo.folder_name())
+            .join("snapshots")
+            .join(REVISION)
+            .join(name);
+        if snapshot.is_file() {
+            return Ok(snapshot);
+        }
+        if let Some(path) = cache.repo(repo.clone()).get(name) {
+            return Ok(path);
+        }
+        ensure!(
+            !self.offline,
+            "{name} is not cached; allow downloads or supply a local model directory"
+        );
+        on_progress(DownloadProgress {
+            file: name.into(),
+            downloaded: 0,
+            total: None,
+        });
+        ApiBuilder::from_env()
+            .with_cache_dir(cache.path().clone())
+            .with_progress(false)
+            .build()?
+            .repo(repo)
+            .download_with_progress(name, DownloadReporter::new(on_progress))
+            .with_context(|| format!("downloading {MODEL}/{name}"))
+    }
+
+    pub fn prepare(
+        &self,
+        cancellation: &CancellationToken,
+        on_progress: &mut dyn FnMut(DownloadProgress),
+    ) -> Result<()> {
+        let mut fetch = |name: &str| -> Result<PathBuf> {
+            cancellation.check()?;
+            let path = self.file_with_progress(name, on_progress)?;
+            cancellation.check()?;
+            Ok(path)
+        };
+        for name in [
+            "transformer/config.json",
+            "processor/tokenizer.json",
+            "vae/config.json",
+        ] {
+            fetch(name)?;
+        }
+        for (component, base) in [
+            ("text_encoder", "model"),
+            ("transformer", "diffusion_pytorch_model"),
+        ] {
+            let index: serde_json::Value = read_json(&fetch(&format!(
+                "{component}/{base}.safetensors.index.json"
+            ))?)?;
+            for name in shard_names(&index)? {
+                fetch(&format!("{component}/{name}"))?;
+            }
+        }
+        fetch("vae/diffusion_pytorch_model.safetensors")?;
+        Ok(())
+    }
+
+    pub fn config<T: DeserializeOwned>(&self, name: &str) -> Result<T> {
+        read_json(&self.file(name)?)
+    }
+
+    pub fn builder(
+        &self,
+        component: &str,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<VarBuilder<'static>> {
+        let files = if component == "vae" {
+            vec![self.file("vae/diffusion_pytorch_model.safetensors")?]
+        } else {
+            let base = if component == "text_encoder" {
+                "model"
+            } else {
+                "diffusion_pytorch_model"
+            };
+            let index: serde_json::Value =
+                self.config(&format!("{component}/{base}.safetensors.index.json"))?;
+            shard_names(&index)?
+                .into_iter()
+                .map(|name| self.file(&format!("{component}/{name}")))
+                .collect::<Result<Vec<_>>>()?
+        };
+        // SAFETY: checkpoint files are read-only for the lifetime of this process. Do not modify
+        // files in --model-dir while inference is running. The builder owns its mmap handles.
+        unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device) }
+            .with_context(|| format!("loading {component} weights"))
+    }
+}
+
+fn shard_names(index: &serde_json::Value) -> Result<BTreeSet<&str>> {
+    let map = index["weight_map"]
+        .as_object()
+        .context("missing checkpoint weight_map")?;
+    ensure!(!map.is_empty(), "checkpoint weight_map is empty");
+    map.values()
+        .map(|v| v.as_str().context("invalid weight filename"))
+        .collect()
+}
+
+struct DownloadReporter<'a> {
+    callback: &'a mut dyn FnMut(DownloadProgress),
+    progress: DownloadProgress,
+    last_emit: Instant,
+}
+
+impl<'a> DownloadReporter<'a> {
+    fn new(callback: &'a mut dyn FnMut(DownloadProgress)) -> Self {
+        Self {
+            callback,
+            progress: DownloadProgress {
+                file: String::new(),
+                downloaded: 0,
+                total: None,
+            },
+            last_emit: Instant::now(),
+        }
+    }
+    fn emit(&mut self) {
+        (self.callback)(self.progress.clone());
+        self.last_emit = Instant::now();
+    }
+}
+
+impl Progress for DownloadReporter<'_> {
+    fn init(&mut self, size: usize, filename: &str) {
+        self.progress = DownloadProgress {
+            file: filename.into(),
+            downloaded: 0,
+            total: Some(size as u64),
+        };
+        self.emit();
+    }
+    fn update(&mut self, size: usize) {
+        self.progress.downloaded += size as u64;
+        if self.last_emit.elapsed() >= Duration::from_millis(100) {
+            self.emit();
+        }
+    }
+    fn finish(&mut self) {
+        self.emit();
+    }
+}
+
+fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    serde_json::from_reader(std::fs::File::open(path)?)
+        .with_context(|| format!("reading {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Tests own their directories; never alter the user's model cache.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("img-gen-weights-{}", rand::random::<u64>()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn prepare_checks_all_shards_and_uses_local_files_without_downloads() -> Result<()> {
+        let directory = TempDir::new();
+        let weights = Weights::new(Some(directory.0.clone()), true);
+        for component in ["processor", "text_encoder", "transformer", "vae"] {
+            std::fs::create_dir(directory.0.join(component))?;
+        }
+        for name in [
+            "processor/tokenizer.json",
+            "transformer/config.json",
+            "vae/config.json",
+            "vae/diffusion_pytorch_model.safetensors",
+        ] {
+            std::fs::write(directory.0.join(name), b"fixture")?;
+        }
+        for (component, base) in [
+            ("text_encoder", "model"),
+            ("transformer", "diffusion_pytorch_model"),
+        ] {
+            std::fs::write(directory.0.join(format!("{component}/{base}.safetensors.index.json")),
+                br#"{"weight_map":{"a":"one.safetensors","b":"two.safetensors","c":"one.safetensors"}}"#)?;
+            for name in ["one.safetensors", "two.safetensors"] {
+                std::fs::write(directory.0.join(component).join(name), b"fixture")?;
+            }
+        }
+        let cancellation = CancellationToken::default();
+        weights.prepare(&cancellation, &mut |_| {
+            panic!("local file triggered download")
+        })?;
+        std::fs::remove_file(directory.0.join("transformer/two.safetensors"))?;
+        let error = weights
+            .prepare(&cancellation, &mut |_| panic!("offline download"))
+            .unwrap_err();
+        assert!(error.to_string().contains("two.safetensors"));
+        cancellation.cancel();
+        assert!(
+            weights
+                .prepare(&cancellation, &mut |_| {})
+                .unwrap_err()
+                .is::<crate::Cancelled>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn download_progress_counts_resumed_bytes_and_resets_on_retry() {
+        let mut events = Vec::new();
+        let mut callback = |event| events.push(event);
+        let mut progress = DownloadReporter::new(&mut callback);
+        progress.init(100, "model.safetensors");
+        progress.update(40); // hf-hub reports bytes already in its .part file.
+        progress.update(20);
+        progress.init(100, "model.safetensors"); // new attempt resets its counter.
+        progress.update(60);
+        progress.update(40);
+        progress.finish();
+        let last = events.last().unwrap();
+        assert_eq!(last.downloaded, 100);
+        assert_eq!(last.total, Some(100));
+        assert_eq!(last.file, "model.safetensors");
+    }
+
+    #[test]
+    #[ignore = "requires permission to bind a loopback HTTP fixture server"]
+    fn missing_file_download_reports_actual_bytes() -> Result<()> {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            thread,
+        };
+        let directory = TempDir::new();
+        let server = TcpListener::bind("127.0.0.1:0")?;
+        let endpoint = format!("http://{}", server.local_addr()?);
+        let data = vec![42_u8; 65536];
+        let expected = data.clone();
+        let worker = thread::spawn(move || {
+            for metadata in [true, false] {
+                let (mut stream, _) = server.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = if metadata { &data[..1] } else { &data[..] };
+                write!(stream, "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nX-Repo-Commit: {}\r\nETag: fixture\r\nConnection: close\r\n\r\n",
+                    body.len(), body.len() - 1, data.len(), REVISION).unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+        let mut events = Vec::new();
+        let api = ApiBuilder::new()
+            .with_endpoint(endpoint)
+            .with_cache_dir(directory.0.clone())
+            .with_progress(false)
+            .build()?;
+        let repo = Repo::with_revision(MODEL.into(), RepoType::Model, REVISION.into());
+        let path = api.repo(repo).download_with_progress(
+            "fixture.safetensors",
+            DownloadReporter::new(&mut |event| events.push(event)),
+        )?;
+        worker.join().unwrap();
+        assert_eq!(std::fs::read(path)?, expected);
+        assert_eq!(events.first().unwrap().downloaded, 0);
+        let last = events.last().unwrap();
+        assert_eq!(last.downloaded, expected.len() as u64);
+        assert_eq!(last.total, Some(expected.len() as u64));
+        Ok(())
+    }
+}

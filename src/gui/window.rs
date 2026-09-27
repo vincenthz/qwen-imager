@@ -1,0 +1,733 @@
+use std::{num::NonZeroUsize, path::Path, sync::Arc, thread, time::Duration};
+
+use anyhow::Context as _;
+use image::ImageDecoder;
+
+use crate::timing::{GenerationTiming, format_duration};
+
+use gpui::{
+    Context, Entity, ObjectFit, PathPromptOptions, RenderImage, Task, Window, div, img, prelude::*,
+    px, relative, rgb,
+};
+use gpui_component::{
+    Disableable, Icon, Selectable,
+    button::*,
+    input::{Input, InputState},
+};
+use qwen_imager::{
+    CancellationToken, Cancelled, DownloadProgress, Event, Generation, Generator, ModelOptions,
+    Request, RgbaImage, Stage,
+};
+
+const MAX_REFERENCES: usize = 10;
+
+enum Message {
+    Checked(qwen_imager::Result<()>),
+    Download(DownloadProgress),
+    Prepared(qwen_imager::Result<()>),
+    Inference(Event),
+    Complete(qwen_imager::Result<Generation>),
+}
+
+struct ReferenceImage {
+    name: String,
+    image: Arc<RgbaImage>,
+    preview: Arc<RenderImage>,
+}
+
+impl ReferenceImage {
+    fn load(path: &Path) -> anyhow::Result<Self> {
+        let mut decoder = image::ImageReader::open(path)?
+            .with_guessed_format()?
+            .into_decoder()?;
+        let orientation = decoder.orientation()?;
+        let mut image = image::DynamicImage::from_decoder(decoder)?;
+        image.apply_orientation(orientation);
+        anyhow::ensure!(
+            image.width() > 0 && image.height() > 0,
+            "image must not be empty"
+        );
+        // Bound the display texture; inference still receives the original RGBA pixels.
+        let preview = render_image(&image.thumbnail(1024, 1024).to_rgba8());
+        Ok(Self {
+            name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            image: Arc::new(image.to_rgba8()),
+            preview,
+        })
+    }
+}
+
+pub struct ImageWindow {
+    prompt: Entity<InputState>,
+    steps: Entity<InputState>,
+    size: Entity<InputState>,
+    seed: Entity<InputState>,
+    automatic_seed: bool,
+    busy: bool,
+    ready: bool,
+    checking_model: bool,
+    loading_image: bool,
+    references: Vec<ReferenceImage>,
+    cancellation: CancellationToken,
+    status: String,
+    progress: f32,
+    image: Option<Arc<RgbaImage>>,
+    rendered: Option<Arc<RenderImage>>,
+    // Dropping the task closes the bounded channel when the window closes.
+    receiver: Option<Task<()>>,
+    timing: Option<GenerationTiming>,
+    ticker: Option<Task<()>>,
+}
+
+impl ImageWindow {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let prompt = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .rows(3)
+                .placeholder("Describe the image or the changes you want…")
+        });
+        let steps = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value("20")
+                .validate(|text, _| text.bytes().all(|c| c.is_ascii_digit()))
+        });
+        let size = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value("512")
+                .validate(|text, _| text.bytes().all(|c| c.is_ascii_digit()))
+        });
+        let seed = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(rand::random_range(0..(1_u64 << 30)).to_string())
+                .validate(|text, _| text.bytes().all(|c| c.is_ascii_digit()))
+        });
+        let mut view = Self {
+            prompt,
+            steps,
+            size,
+            seed,
+            automatic_seed: true,
+            busy: false,
+            ready: false,
+            checking_model: true,
+            loading_image: false,
+            references: Vec::new(),
+            cancellation: CancellationToken::default(),
+            status: "Checking model files…".into(),
+            progress: 0.,
+            image: None,
+            rendered: None,
+            receiver: None,
+            timing: None,
+            ticker: None,
+        };
+        view.check_model(window, cx);
+        view
+    }
+
+    fn check_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.busy = true;
+        let cancellation = self.cancellation.clone();
+        let sender = self.listen(window, cx);
+        thread::spawn(move || {
+            // Startup only checks local files, including every indexed weight shard.
+            // Downloads are authorized exclusively by the Download button below.
+            let mut generator = Generator::new(ModelOptions {
+                offline: true,
+                ..Default::default()
+            });
+            let result = generator.prepare(&cancellation, |_| {});
+            let _ = sender.send_blocking(Message::Checked(result));
+        });
+    }
+
+    fn prepare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.ready {
+            return;
+        }
+        self.busy = true;
+        self.cancellation = CancellationToken::default();
+        self.status = "Preparing download…".into();
+        self.progress = 0.;
+        let cancellation = self.cancellation.clone();
+        let sender = self.listen(window, cx);
+        thread::spawn(move || {
+            let mut generator = Generator::new(ModelOptions::default());
+            let result = generator.prepare(&cancellation, |progress| {
+                if sender.send_blocking(Message::Download(progress)).is_err() {
+                    cancellation.cancel();
+                }
+            });
+            let _ = sender.send_blocking(Message::Prepared(result));
+        });
+        cx.notify();
+    }
+
+    fn generate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.loading_image || !self.ready {
+            return;
+        }
+        let mut request = Request::new(self.prompt.read(cx).value().to_string());
+        let size = self.size.read(cx).value().parse::<u32>().ok();
+        let Some(size) = size.filter(|size| (32..=2048).contains(size) && size % 32 == 0) else {
+            self.status =
+                "Size must be a multiple of 32 between 32 and 2048 pixels (square image).".into();
+            cx.notify();
+            return;
+        };
+        request.scale = f64::from(size) / 2048.;
+        // Keep the Size control's square output dimensions when editing a reference.
+        request.ratio = Some("1:1".into());
+        let Ok(steps) = self.steps.read(cx).value().parse::<usize>() else {
+            self.status = "Enter a positive whole number of steps.".into();
+            cx.notify();
+            return;
+        };
+        request.steps = steps;
+        if !self.automatic_seed {
+            let Ok(seed) = self.seed.read(cx).value().parse::<u64>() else {
+                self.status = "Enter a seed from 0 to 18446744073709551615.".into();
+                cx.notify();
+                return;
+            };
+            request.seed = seed;
+        }
+        request.preview_every = NonZeroUsize::new(1);
+        if let Err(error) = request.dimensions() {
+            self.status = error.to_string();
+            cx.notify();
+            return;
+        }
+        if self.automatic_seed {
+            request.seed = self.randomize_seed(window, cx);
+        }
+        self.busy = true;
+        self.progress = 0.;
+        self.status = "Preparing generation…".into();
+        self.timing = Some(GenerationTiming::new(request.steps));
+        self.ticker = Some(cx.spawn(async move |view, cx| {
+            loop {
+                gpui::Timer::after(Duration::from_secs(1)).await;
+                if !view
+                    .update(cx, |view, cx| {
+                        cx.notify();
+                        view.timing.is_some()
+                    })
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+            }
+        }));
+        self.clear_image(window);
+        self.cancellation = CancellationToken::default();
+        let cancellation = self.cancellation.clone();
+        let sender = self.listen(window, cx);
+        let references: Vec<_> = self
+            .references
+            .iter()
+            .map(|reference| reference.image.clone())
+            .collect();
+        thread::spawn(move || {
+            request.images = references
+                .into_iter()
+                .map(|reference| (*reference).clone())
+                .collect();
+            let mut generator = Generator::new(ModelOptions {
+                offline: true,
+                ..Default::default()
+            });
+            let result = generator.generate(&request, &cancellation, |event| {
+                if sender.send_blocking(Message::Inference(event)).is_err() {
+                    cancellation.cancel();
+                }
+            });
+            let _ = sender.send_blocking(Message::Complete(result));
+        });
+        cx.notify();
+    }
+
+    fn load_image(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.busy || self.loading_image || !self.ready || self.references.len() >= MAX_REFERENCES
+        {
+            return;
+        }
+        self.loading_image = true;
+        let available = MAX_REFERENCES - self.references.len();
+        let answer = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Add reference images".into()),
+        });
+        cx.spawn_in(window, async move |view, cx| {
+            let result = async {
+                let Some(paths) = answer.await?? else {
+                    return Ok(None);
+                };
+                if paths.is_empty() {
+                    return Ok(None);
+                }
+                anyhow::ensure!(paths.len() <= available, "Choose at most {available} more images (10 references maximum).");
+                cx.background_executor()
+                    .spawn(async move {
+                        paths.into_iter().map(|path| {
+                            ReferenceImage::load(&path)
+                                .with_context(|| format!("opening {}", path.display()))
+                        }).collect::<anyhow::Result<Vec<_>>>().map(Some)
+                    })
+                    .await
+            }
+            .await;
+            let _ = view.update_in(cx, |view, window, cx| {
+                view.loading_image = false;
+                match result {
+                    Ok(Some(references)) => {
+                        view.clear_image(window);
+                        view.references.extend(references);
+                        view.status = format!(
+                            "{} reference image(s) loaded. Describe the changes you want, then Generate.",
+                            view.references.len()
+                        );
+                        view.progress = 0.;
+                    }
+                    Ok(None) => {} // Cancelling the picker preserves existing references.
+                    Err(error) => view.status = format!("Could not load image: {error:#}"),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn remove_reference(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.loading_image || index >= self.references.len() {
+            return;
+        }
+        let reference = self.references.remove(index);
+        let _ = window.drop_image(reference.preview);
+        self.status = if self.references.is_empty() {
+            "References removed. Generate from your prompt alone.".into()
+        } else {
+            format!("{} reference image(s) loaded.", self.references.len())
+        };
+        cx.notify();
+    }
+
+    fn randomize_seed(&mut self, window: &mut Window, cx: &mut Context<Self>) -> u64 {
+        let seed = rand::random_range(0..(1_u64 << 30));
+        self.seed.update(cx, |input, cx| {
+            input.set_value(seed.to_string(), window, cx)
+        });
+        seed
+    }
+
+    fn toggle_seed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.automatic_seed = !self.automatic_seed;
+        if self.automatic_seed {
+            self.randomize_seed(window, cx);
+        }
+        // Switching to Manual retains the displayed seed, including the last run's.
+        cx.notify();
+    }
+
+    fn listen(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> async_channel::Sender<Message> {
+        let (sender, receiver) = async_channel::bounded(2);
+        self.receiver = Some(cx.spawn_in(window, async move |view, cx| {
+            while let Ok(message) = receiver.recv().await {
+                if view
+                    .update_in(cx, |view, window, cx| {
+                        view.receive(message, window);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+        sender
+    }
+
+    fn receive(&mut self, message: Message, window: &mut Window) {
+        // Keep the cancellation message visible until the worker has stopped.
+        if self.cancellation.is_cancelled()
+            && matches!(message, Message::Download(_) | Message::Inference(_))
+        {
+            return;
+        }
+        match message {
+            Message::Checked(result) => {
+                self.checking_model = false;
+                self.busy = false;
+                self.ready = result.is_ok();
+                self.status = if self.ready {
+                    "Model ready. Enter a prompt to begin.".into()
+                } else {
+                    String::new()
+                };
+                self.progress = if self.ready { 1. } else { 0. };
+            }
+            Message::Download(progress) => {
+                self.progress = progress.total.filter(|&n| n > 0).map_or(0., |total| {
+                    (progress.downloaded as f64 / total as f64).clamp(0., 1.) as f32
+                });
+                self.status = match progress.total {
+                    Some(total) => format!(
+                        "Downloading {} — {:.1} / {:.1} MB ({:.0}%)",
+                        progress.file,
+                        progress.downloaded as f64 / 1_000_000.,
+                        total as f64 / 1_000_000.,
+                        self.progress * 100.
+                    ),
+                    None => format!("Connecting to download {}…", progress.file),
+                };
+            }
+            Message::Prepared(result) => {
+                self.busy = false;
+                self.ready = result.is_ok();
+                self.status = match result {
+                    Ok(()) => "Model ready. Enter a prompt to begin.".into(),
+                    Err(error) => error_status(error),
+                };
+                self.progress = if self.ready { 1. } else { 0. };
+            }
+            Message::Inference(event) => match event {
+                Event::Progress {
+                    stage,
+                    completed,
+                    total,
+                } => {
+                    if stage == Stage::DenoiserLoading
+                        && completed == total
+                        && let Some(timing) = &mut self.timing
+                    {
+                        timing.start_steps();
+                    }
+                    self.progress = completed as f32 / total.max(1) as f32;
+                    let name = match stage {
+                        Stage::Loading => "Preparing model",
+                        Stage::TextEncoding => "Encoding prompt",
+                        Stage::ReferenceVision { .. } | Stage::ReferenceEncoding => {
+                            "Encoding reference"
+                        }
+                        Stage::DenoiserLoading => "Loading denoiser",
+                        Stage::Decoding => "Decoding final image",
+                    };
+                    self.status = format!("{name} — {completed}/{total}");
+                }
+                Event::StepFinished { step, total, .. } => {
+                    self.progress = step as f32 / total as f32;
+                    self.status = format!("Step {step}/{total} — decoding preview…");
+                }
+                Event::Preview { step, total, image } => {
+                    self.set_image(image, window);
+                    if let Some(timing) = &mut self.timing {
+                        timing.complete_step(step);
+                    }
+                    self.status = format!("Step {step}/{total}");
+                }
+                _ => {}
+            },
+            Message::Complete(result) => {
+                self.busy = false;
+                self.timing = None;
+                self.ticker = None;
+                match result {
+                    Ok(generated) => {
+                        self.set_image(generated.image, window);
+                        self.progress = 1.;
+                        self.status = format!("Complete — {}", format_duration(generated.elapsed));
+                    }
+                    Err(error) => self.status = error_status(error),
+                }
+            }
+        }
+    }
+
+    fn clear_image(&mut self, window: &mut Window) {
+        if let Some(old) = self.rendered.take() {
+            let _ = window.drop_image(old);
+        }
+        self.image = None;
+    }
+
+    fn set_image(&mut self, image: Arc<RgbaImage>, window: &mut Window) {
+        if self
+            .image
+            .as_ref()
+            .is_some_and(|old| Arc::ptr_eq(old, &image))
+        {
+            return;
+        }
+        self.clear_image(window);
+        self.rendered = Some(render_image(&image));
+        self.image = Some(image);
+    }
+
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        if !self.busy {
+            return;
+        }
+        self.cancellation.cancel();
+        self.timing = None;
+        self.ticker = None;
+        self.status = if self.ready {
+            "Cancelling after the current operation…"
+        } else {
+            "Cancelling after the current file finishes downloading…"
+        }
+        .into();
+        cx.notify();
+    }
+
+    fn save(&mut self, cx: &mut Context<Self>) {
+        let Some(image) = self.image.clone() else {
+            return;
+        };
+        let directory = std::env::current_dir().unwrap_or_default();
+        let answer = cx.prompt_for_new_path(&directory, Some("qwen-image.png"));
+        cx.spawn(async move |view, cx| {
+            let result = async {
+                let Some(path) = answer.await?? else {
+                    return Ok(None);
+                };
+                // Save exactly the path approved by the native dialog; do not change
+                // it afterwards and bypass the dialog's overwrite confirmation.
+                anyhow::ensure!(
+                    path.extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("png")),
+                    "Choose a filename ending in .png"
+                );
+                cx.background_executor()
+                    .spawn(async move {
+                        image.save_with_format(&path, image::ImageFormat::Png)?;
+                        Ok::<_, anyhow::Error>(Some(format!("Saved {}", path.display())))
+                    })
+                    .await
+            }
+            .await;
+            let _ = view.update(cx, |view, cx| {
+                match result {
+                    Ok(Some(status)) => view.status = status,
+                    Err(error) => view.status = format!("Could not save: {error:#}"),
+                    Ok(None) => return,
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+}
+
+impl Drop for ImageWindow {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
+impl Render for ImageWindow {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.ready {
+            return div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_5()
+                .bg(rgb(0x15171b))
+                .text_color(rgb(0xe4e7ec))
+                .child(
+                    div().w_full().max_w(px(460.)).flex().flex_col().gap_4()
+                        .map(|content| {
+                            if self.checking_model {
+                                return content.child("Checking local model files…");
+                            }
+                            content
+                                .child("The image model is not fully available on this Mac. Download it to start generating images. The full model needs about 32 GB of disk space; files already downloaded will be reused.")
+                                .child(div().child(
+                                    Button::new("download")
+                                        .primary()
+                                        .label(if self.busy {
+                                            if self.cancellation.is_cancelled() { "Cancelling…" } else { "Cancel" }
+                                        } else { "Download" })
+                                        .disabled(self.busy && self.cancellation.is_cancelled())
+                                        .on_click(cx.listener(|view, _, window, cx| {
+                                            if view.busy { view.cancel(cx); } else { view.prepare(window, cx); }
+                                        }))))
+                                .when(self.busy, |content| content.child(
+                                    div().h(px(6.)).w_full().rounded_md().overflow_hidden().bg(rgb(0x303640))
+                                        .child(div().h_full().w(relative(self.progress.clamp(0., 1.))).bg(rgb(0x8aa6ff)))))
+                                .when(!self.status.is_empty(), |content| content.child(
+                                    div().text_sm().text_color(rgb(0x9da6b5)).child(self.status.clone())))
+                        }),
+                );
+        }
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .p_5()
+            .bg(rgb(0x15171b))
+            .text_color(rgb(0xe4e7ec))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().child(Input::new(&self.prompt).disabled(self.busy)))
+                    .child(
+                        Button::new("generate")
+                            .primary()
+                            .flex_shrink_0()
+                            .label(if self.busy {
+                                if self.cancellation.is_cancelled() { "Cancelling…" } else { "Cancel" }
+                            } else {
+                                "Generate"
+                            })
+                            .disabled(self.loading_image || (self.busy && self.cancellation.is_cancelled()))
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                if view.busy { view.cancel(cx); } else { view.generate(window, cx); }
+                            })),
+                    )
+                    .child(
+                        Button::new("save")
+                            .flex_shrink_0()
+                            .icon(Icon::default().path("icons/save.svg"))
+                            .tooltip("Save PNG")
+                            .disabled(self.busy || self.loading_image || self.image.is_none())
+                            .on_click(cx.listener(|view, _, _, cx| view.save(cx))),
+                    ),
+            )
+            .child(div().flex().flex_wrap().items_center().gap_3()
+                .child(div().flex().items_center().gap_2()
+                    .child("Steps")
+                    .child(Input::new(&self.steps).w(px(72.)).disabled(self.busy)))
+                .child(div().flex().items_center().gap_2()
+                    .child("Size (px)")
+                    .child(Input::new(&self.size).w(px(80.)).disabled(self.busy)))
+                .child(div().flex().items_center().gap_2()
+                    .child(Button::new("seed-mode")
+                        .label(if self.automatic_seed { "Auto seed" } else { "Manual seed" })
+                        .selected(self.automatic_seed)
+                        .tooltip(if self.automatic_seed {
+                            "A new random seed each generation. Click to use the displayed seed manually."
+                        } else { "Use this seed each generation. Click to switch to automatic random seeds." })
+                        .disabled(self.busy)
+                        .on_click(cx.listener(|view, _, window, cx| view.toggle_seed(window, cx))))
+                    .child(Input::new(&self.seed).w(px(200.)).disabled(self.busy || self.automatic_seed))))
+            .child(div().id("reference-images").flex().items_center().gap_2()
+                .flex_shrink_0().overflow_x_scroll().py_1()
+                .children(self.references.iter().enumerate().map(|(index, reference)| {
+                    div().relative().w(px(72.)).h(px(72.)).flex_shrink_0()
+                        .rounded_md().border_1().border_color(rgb(0x303640)).bg(rgb(0x22262d))
+                        .child(img(reference.preview.clone()).size_full().object_fit(ObjectFit::Contain))
+                        .child(div().absolute().bottom_0().left_0().px_1().text_xs()
+                            .bg(rgb(0x15171b)).child((index + 1).to_string()))
+                        .child(Button::new(("remove-image", index))
+                            .absolute().top(px(2.)).right(px(2.)).w(px(22.)).h(px(22.)).p_0()
+                            .label("−").tooltip(format!("Remove {}", reference.name))
+                            .disabled(self.busy || self.loading_image)
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.remove_reference(index, window, cx);
+                            })))
+                }))
+                .child(Button::new("add-images").w(px(72.)).h(px(72.)).flex_shrink_0()
+                    .icon(Icon::default().path("icons/image.svg"))
+                    .label("+")
+                    .tooltip(if self.loading_image { "Loading images…" }
+                        else if self.references.len() >= MAX_REFERENCES { "Maximum of 10 reference images" }
+                        else { "Add reference images" })
+                    .disabled(self.busy || self.loading_image || self.references.len() >= MAX_REFERENCES)
+                    .on_click(cx.listener(|view, _, window, cx| view.load_image(window, cx)))))
+            .child(
+                div()
+                    .h(px(6.))
+                    .w_full()
+                    .rounded_md()
+                    .overflow_hidden()
+                    .bg(rgb(0x303640))
+                    .child(
+                        div()
+                            .h_full()
+                            .w(relative(self.progress.clamp(0., 1.)))
+                            .bg(rgb(0x8aa6ff)),
+                    ),
+            )
+            .child(div().flex().flex_wrap().justify_between().gap_2().text_sm()
+                .child(self.status.clone())
+                .map(|row| match &self.timing {
+                    Some(timing) => row.child(div().text_color(rgb(0x9da6b5)).child(timing.label())),
+                    None => row,
+                }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .overflow_hidden()
+                    .bg(rgb(0x22262d))
+                    .map(|container| match self.rendered.as_ref().or_else(|| self.references.last().map(|reference| &reference.preview)) {
+                        Some(image) => container.child(
+                            img(image.clone())
+                                .size_full()
+                                .object_fit(ObjectFit::Contain),
+                        ),
+                        None => container.child(
+                            div()
+                                .text_color(rgb(0x9da6b5))
+                                .child("Your image will appear here"),
+                        ),
+                    }),
+            )
+    }
+}
+
+fn error_status(error: anyhow::Error) -> String {
+    if error.is::<Cancelled>() {
+        "Cancelled. You can try again.".into()
+    } else {
+        format!("Error: {error:#}")
+    }
+}
+
+fn render_image(rgba: &RgbaImage) -> Arc<RenderImage> {
+    // GPUI's RenderImage expects BGRA bytes. Preserve alpha for the preview.
+    let mut bgra = rgba.clone();
+    for pixel in bgra.pixels_mut() {
+        pixel.0.swap(0, 2);
+    }
+    Arc::new(RenderImage::new(vec![image::Frame::new(bgra)]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn preview_swaps_red_blue_and_preserves_alpha() {
+        let rgba = RgbaImage::from_raw(1, 1, vec![200, 30, 10, 128]).unwrap();
+        assert_eq!(
+            render_image(&rgba).as_bytes(0).unwrap(),
+            &[10, 30, 200, 128]
+        );
+        assert_eq!(rgba.as_raw(), &[200, 30, 10, 128]);
+    }
+}
