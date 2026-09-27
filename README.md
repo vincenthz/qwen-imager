@@ -10,7 +10,7 @@ The library takes and returns in-memory RGBA images.
 
 ```sh
 cd rust
-cargo run --release --no-default-features --features gui --bin img-gen-gui
+cargo run --release --no-default-features --features gui --bin QwenImager
 ```
 
 The window checks the Hugging Face cache at startup without network access. If
