@@ -1,7 +1,7 @@
 //! The Qwen3-VL-8B encoder used by Qwen Image 2.1, without generation or an LM head.
 use anyhow::{Result, ensure};
 use candle_core::{DType, Device, Tensor};
-use candle_nn::Module;
+use candle_nn::{Module, VarBuilder};
 use tokenizers::Tokenizer;
 
 use crate::{
@@ -13,17 +13,30 @@ use crate::{
 const SYSTEM: &str = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n";
 const IMAGE_TOKEN: u32 = 151655;
 
+#[derive(Clone)]
 pub struct Encoded {
     pub hidden: Tensor,
     pub image_mask: Vec<bool>,
 }
 
+impl Encoded {
+    pub fn to_device(&self, device: &Device) -> candle_core::Result<Self> {
+        Ok(Self {
+            hidden: self.hidden.to_device(device)?,
+            image_mask: self.image_mask.clone(),
+        })
+    }
+}
+
+/// `visual` supplies each reference's vision features, given its index and the
+/// vision tower's weights, so the caller can reuse them across requests.
 pub fn encode(
     weights: &Weights,
     prompt: &str,
     images: &[image::RgbaImage],
     device: &Device,
     observer: &mut crate::Observer<'_>,
+    mut visual: impl FnMut(usize, VarBuilder, &mut crate::Observer<'_>) -> Result<vision::Visual>,
 ) -> Result<Encoded> {
     let tokenizer = Tokenizer::from_file(weights.file("processor/tokenizer.json")?)
         .map_err(anyhow::Error::msg)?;
@@ -76,10 +89,9 @@ pub fn encode(
     let (positions, spans) = positions(&ids, &grids)?;
     let dtype = DType::BF16;
     let vb = weights.builder("text_encoder", dtype, device)?.pp("model");
-    let mut visual = Vec::new();
-    for (i, img) in images.iter().enumerate() {
-        visual.push(vision::encode(img, vb.pp("visual"), i, observer)?);
-    }
+    let visual = (0..images.len())
+        .map(|i| visual(i, vb.pp("visual"), observer))
+        .collect::<Result<Vec<_>>>()?;
     observer.progress(crate::Stage::TextEncoding, 0, 36)?;
     let language = vb.pp("language_model");
     let embed = candle_nn::embedding(151936, 4096, language.pp("embed_tokens"))?;

@@ -134,6 +134,12 @@ interrupt a running GPU operation, VAE encode/decode, download, or callback.
 Use `error.is::<img_gen::Cancelled>()` to distinguish it from inference failure.
 `Generator` accepts sequential requests and releases model tensors between stages
 and requests to limit memory; it does not retain a permanently loaded checkpoint.
+It does keep the latest request's encoder output, and each reference's vision
+features and VAE latents, in CPU memory. Reusing the same `Generator` with an
+unchanged prompt and references (a new seed, step count, or size) skips the
+text/vision encoders and reference encoding. Changing only the prompt still reuses
+the per-reference results. Cached results are bit-identical to recomputing them.
+Stages served from the cache emit no `Progress` events.
 
 ## CLI
 

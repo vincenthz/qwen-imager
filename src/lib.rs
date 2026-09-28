@@ -168,14 +168,18 @@ impl std::error::Error for Cancelled {}
 
 /// Reusable configuration for sequential requests. Model tensors are released
 /// between stages/requests to limit memory; this is not a permanently loaded model.
+/// Encoder results for the latest prompt and references are cached in CPU memory,
+/// so reusing one generator for a new seed, step count, or size skips re-encoding.
 pub struct Generator {
     weights: weights::Weights,
+    cache: pipeline::Cache,
 }
 
 impl Generator {
     pub fn new(options: ModelOptions) -> Self {
         Self {
             weights: weights::Weights::new(options.model_dir, options.offline),
+            cache: pipeline::Cache::default(),
         }
     }
 
@@ -206,7 +210,7 @@ impl Generator {
         };
         cancellation.check()?;
         let start = Instant::now();
-        let image = pipeline::run(request, &self.weights, &mut observer)?;
+        let image = pipeline::run(request, &self.weights, &mut self.cache, &mut observer)?;
         let elapsed = start.elapsed();
         observer.emit(Event::Finished { elapsed })?;
         Ok(Generation { image, elapsed })

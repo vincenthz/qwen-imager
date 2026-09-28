@@ -1,4 +1,4 @@
-use img_gen::{
+use qwen_imager::{
     CancellationToken, Cancelled, Event, Generator, ModelOptions, Request, RgbaImage, Stage,
 };
 use std::sync::Arc;
@@ -65,14 +65,14 @@ fn ui_messages_and_inputs_can_cross_threads() {
     fn send<T: Send>() {}
     send::<Request>();
     send::<Event>();
-    send::<img_gen::Generation>();
+    send::<qwen_imager::Generation>();
     send::<CancellationToken>();
     send::<Generator>();
 }
 
 #[test]
 #[ignore = "requires cached Qwen Image 2.1 checkpoint and Metal GPU"]
-fn previews_preserve_output_and_report_ordered_progress() -> img_gen::Result<()> {
+fn previews_preserve_output_and_report_ordered_progress() -> qwen_imager::Result<()> {
     let mut request = Request::new("A red ceramic teapot on a wooden table.");
     request.scale = 0.0625;
     request.steps = 3;
@@ -81,12 +81,21 @@ fn previews_preserve_output_and_report_ordered_progress() -> img_gen::Result<()>
     generator.prepare(&cancellation, |_| {
         panic!("cached model triggered a download")
     })?;
-    let baseline = generator.generate(&request, &cancellation, |event| {
-        assert!(!matches!(event, Event::Preview { .. }));
-    })?;
     request.preview_every = std::num::NonZeroUsize::new(1);
     let mut events = Vec::new();
     let generated = generator.generate(&request, &cancellation, |e| events.push(e))?;
+    // The rerun reuses the cached encoder output and must not change pixels.
+    request.preview_every = None;
+    let baseline = generator.generate(&request, &cancellation, |event| {
+        assert!(!matches!(
+            event,
+            Event::Preview { .. }
+                | Event::Progress {
+                    stage: Stage::TextEncoding,
+                    ..
+                }
+        ));
+    })?;
     assert_eq!(baseline.image.as_raw(), generated.image.as_raw());
     assert_eq!(generated.image.dimensions(), (128, 128));
     assert!(matches!(
@@ -131,8 +140,9 @@ fn previews_preserve_output_and_report_ordered_progress() -> img_gen::Result<()>
     assert_eq!(text_layers, (0..=36).collect::<Vec<_>>());
     assert_eq!(prefix_layers, (0..=32).collect::<Vec<_>>());
     // Cancellation during encoder loading must stop before denoising/Finished.
+    // A fresh generator has no cached encoder output, so the encoder runs.
     let cancellation = CancellationToken::default();
-    let error = generator
+    let error = self::generator()
         .generate(&request, &cancellation, |event| {
             assert!(!matches!(
                 event,
@@ -151,5 +161,51 @@ fn previews_preserve_output_and_report_ordered_progress() -> img_gen::Result<()>
         })
         .unwrap_err();
     assert!(error.is::<Cancelled>());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires cached Qwen Image 2.1 checkpoint and Metal GPU"]
+fn cached_encoder_results_match_a_fresh_generator() -> qwen_imager::Result<()> {
+    let cancellation = CancellationToken::default();
+    let mut request = Request::new("A red ceramic teapot on a wooden table.");
+    request.scale = 0.0625;
+    request.steps = 2;
+    let mut generator = generator();
+    let reference = generator.generate(&request, &cancellation, |_| {})?.image;
+    request.prompt = "Make the teapot blue.".into();
+    request.images.push((*reference).clone());
+    generator.generate(&request, &cancellation, |_| {})?;
+    // A new prompt reuses the reference's vision features and latents; a new
+    // seed also reuses the encoder output.
+    let mut stages = Vec::new();
+    for (prompt, seed) in [
+        ("Make the teapot green.", 42),
+        ("Make the teapot green.", 7),
+    ] {
+        request.prompt = prompt.into();
+        request.seed = seed;
+        let mut events = Vec::new();
+        let cached = generator.generate(&request, &cancellation, |e| events.push(e))?;
+        let fresh = self::generator().generate(&request, &cancellation, |_| {})?;
+        assert_eq!(cached.image.as_raw(), fresh.image.as_raw());
+        stages.push(
+            events
+                .into_iter()
+                .filter_map(|e| match e {
+                    Event::Progress { stage, .. } if stage != Stage::Loading => Some(stage),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert!(stages[0].contains(&Stage::TextEncoding));
+    assert!(!stages[0].contains(&Stage::ReferenceEncoding));
+    assert!(!stages[0].contains(&Stage::ReferenceVision { index: 0 }));
+    assert!(
+        stages[1]
+            .iter()
+            .all(|s| matches!(s, Stage::DenoiserLoading | Stage::Decoding))
+    );
     Ok(())
 }

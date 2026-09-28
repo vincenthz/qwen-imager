@@ -1,4 +1,11 @@
-use crate::{Event, Observer, Request, Stage, dit::Dit, text, vae::Vae, weights::Weights};
+use crate::{
+    Event, Observer, Request, Stage,
+    dit::Dit,
+    text::{self, Encoded},
+    vae::Vae,
+    vision::{self, Visual},
+    weights::Weights,
+};
 use anyhow::{Context, Result, ensure};
 use candle_core::{DType, Device, Tensor};
 use image::{RgbaImage, imageops::FilterType};
@@ -28,9 +35,28 @@ pub fn validate(args: &Request) -> Result<(u32, u32)> {
     )
 }
 
+/// Results that depend only on the prompt and reference images, kept between
+/// requests so re-rolling the seed or changing steps/size skips the encoders.
+/// Tensors are held on the CPU, so no Metal device or GPU memory outlives a
+/// request. Only the latest request's references are kept (at most 10).
+#[derive(Default)]
+pub struct Cache {
+    /// The prompt and encoder output for exactly `references`, in order.
+    encoded: Option<(String, Encoded)>,
+    references: Vec<CachedReference>,
+}
+
+struct CachedReference {
+    /// The resized reference, compared exactly.
+    image: RgbaImage,
+    visual: Option<Visual>,
+    latents: Option<Tensor>,
+}
+
 pub fn run(
     args: &Request,
     weights: &Weights,
+    cache: &mut Cache,
     observer: &mut Observer<'_>,
 ) -> Result<Arc<RgbaImage>> {
     let (width, height) = validate(args)?;
@@ -63,42 +89,98 @@ pub fn run(
         "checkpoint must be the original Qwen/Qwen-Image-2.1 architecture"
     );
     observer.progress(Stage::Loading, 1, 1)?;
-    let encoded = text::encode(weights, &args.prompt, &references, &device, observer)?;
+    let cpu = Device::Cpu;
+    // Keep entries for the references still in use, in request order.
+    let mut previous = std::mem::take(&mut cache.references);
+    let same_references = previous.len() == references.len()
+        && previous.iter().zip(&references).all(|(c, r)| c.image == *r);
+    if !same_references
+        || cache
+            .encoded
+            .as_ref()
+            .is_some_and(|(p, _)| *p != args.prompt)
+    {
+        cache.encoded = None;
+    }
+    for img in &references {
+        let entry = match previous.iter().position(|c| c.image == *img) {
+            Some(i) => previous.swap_remove(i),
+            None => CachedReference {
+                image: img.clone(),
+                visual: None,
+                latents: None,
+            },
+        };
+        cache.references.push(entry);
+    }
+    drop(previous);
+    let encoded = match &cache.encoded {
+        Some((_, encoded)) => encoded.to_device(&device)?,
+        None => {
+            let entries = &mut cache.references;
+            let encoded = text::encode(
+                weights,
+                &args.prompt,
+                &references,
+                &device,
+                observer,
+                |i, vb, observer| {
+                    if let Some(visual) = &entries[i].visual {
+                        return Ok(visual.to_device(&device)?);
+                    }
+                    let visual = vision::encode(&references[i], vb, i, observer)?;
+                    entries[i].visual = Some(visual.to_device(&cpu)?);
+                    Ok(visual)
+                },
+            )?;
+            cache.encoded = Some((args.prompt.clone(), encoded.to_device(&cpu)?));
+            encoded
+        }
+    };
     device.synchronize()?;
     let mut reference_latents = Vec::new();
     let mut shapes = Vec::new();
-    if !references.is_empty() {
-        let vae = Vae::new(
-            weights.builder("vae", DType::BF16, &device)?,
-            weights.config("vae/config.json")?,
-        )?;
-        for (i, img) in references.iter().enumerate() {
-            observer.progress(Stage::ReferenceEncoding, i, references.len())?;
-            let (h, w) = (img.height() as usize / 16, img.width() as usize / 16);
-            let rgba: Vec<f32> = img
-                .as_raw()
-                .iter()
-                .map(|v| *v as f32 / 127.5 - 1.0)
-                .collect();
-            let rgba = Tensor::from_vec(
-                rgba,
-                (1, img.height() as usize, img.width() as usize, 4),
-                &device,
-            )?
-            .permute((0, 3, 1, 2))?
-            .contiguous()?
-            .to_dtype(DType::BF16)?;
-            reference_latents.push(
-                vae.encode(&rgba)?
-                    .reshape((1, 64, h * w))?
-                    .transpose(1, 2)?
-                    .contiguous()?,
-            );
-            shapes.push((h, w));
-            observer.progress(Stage::ReferenceEncoding, i + 1, references.len())?;
+    let mut vae = None;
+    for (i, entry) in cache.references.iter_mut().enumerate() {
+        let img = &entry.image;
+        let (h, w) = (img.height() as usize / 16, img.width() as usize / 16);
+        shapes.push((h, w));
+        if let Some(latents) = &entry.latents {
+            reference_latents.push(latents.to_device(&device)?);
+            continue;
         }
-        device.synchronize()?;
+        observer.progress(Stage::ReferenceEncoding, i, references.len())?;
+        let vae = match &mut vae {
+            Some(vae) => vae,
+            None => vae.insert(Vae::new(
+                weights.builder("vae", DType::BF16, &device)?,
+                weights.config("vae/config.json")?,
+            )?),
+        };
+        let rgba: Vec<f32> = img
+            .as_raw()
+            .iter()
+            .map(|v| *v as f32 / 127.5 - 1.0)
+            .collect();
+        let rgba = Tensor::from_vec(
+            rgba,
+            (1, img.height() as usize, img.width() as usize, 4),
+            &device,
+        )?
+        .permute((0, 3, 1, 2))?
+        .contiguous()?
+        .to_dtype(DType::BF16)?;
+        let latents = vae
+            .encode(&rgba)?
+            .reshape((1, 64, h * w))?
+            .transpose(1, 2)?
+            .contiguous()?;
+        entry.latents = Some(latents.to_device(&cpu)?);
+        reference_latents.push(latents);
+        observer.progress(Stage::ReferenceEncoding, i + 1, references.len())?;
     }
+    drop(vae);
+    device.synchronize()?;
     let (h, w) = (height as usize / 16, width as usize / 16);
     let mut rng = StdRng::seed_from_u64(args.seed);
     let noise: Vec<f32> = (0..64 * h * w)

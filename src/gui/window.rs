@@ -1,4 +1,10 @@
-use std::{num::NonZeroUsize, path::Path, sync::Arc, thread, time::Duration};
+use std::{
+    num::NonZeroUsize,
+    path::Path,
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
 
 use anyhow::Context as _;
 use image::ImageDecoder;
@@ -91,6 +97,9 @@ pub struct ImageWindow {
     receiver: Option<Task<()>>,
     timing: Option<GenerationTiming>,
     ticker: Option<Task<()>>,
+    // One generator for the window's lifetime, so reruns with the same prompt
+    // or references reuse its cached encoder results. Only one run holds it.
+    generator: Arc<Mutex<Generator>>,
 }
 
 impl ImageWindow {
@@ -138,6 +147,10 @@ impl ImageWindow {
             receiver: None,
             timing: None,
             ticker: None,
+            generator: Arc::new(Mutex::new(Generator::new(ModelOptions {
+                offline: true,
+                ..Default::default()
+            }))),
         };
         view.check_model(window, cx);
         view
@@ -241,6 +254,7 @@ impl ImageWindow {
         self.cancellation = CancellationToken::default();
         let cancellation = self.cancellation.clone();
         let sender = self.listen(window, cx);
+        let generator = self.generator.clone();
         let references: Vec<_> = self
             .references
             .iter()
@@ -251,10 +265,9 @@ impl ImageWindow {
                 .into_iter()
                 .map(|reference| (*reference).clone())
                 .collect();
-            let mut generator = Generator::new(ModelOptions {
-                offline: true,
-                ..Default::default()
-            });
+            // A panicked run leaves the cache consistent: entries are only
+            // stored once complete.
+            let mut generator = generator.lock().unwrap_or_else(|e| e.into_inner());
             let result = generator.generate(&request, &cancellation, |event| {
                 if sender.send_blocking(Message::Inference(event)).is_err() {
                     cancellation.cancel();

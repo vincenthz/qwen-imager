@@ -9,6 +9,19 @@ pub struct Visual {
     pub deep: Vec<Tensor>,
 }
 
+impl Visual {
+    pub fn to_device(&self, device: &candle_core::Device) -> Result<Self> {
+        Ok(Self {
+            hidden: self.hidden.to_device(device)?,
+            deep: self
+                .deep
+                .iter()
+                .map(|t| t.to_device(device))
+                .collect::<Result<_>>()?,
+        })
+    }
+}
+
 pub fn encode(
     image: &RgbaImage,
     vb: VarBuilder,

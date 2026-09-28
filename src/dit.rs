@@ -274,16 +274,11 @@ impl Dit {
         let activated = candle_nn::ops::silu(&time)?;
         let modulation = self.modulation.forward(&activated)?.unsqueeze(1)?;
         let mut x = self.img_in.forward(latents)?;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
+        // No per-block finiteness readback: it would stall the Metal queue 32
+        // times per step. The caller checks the latents once per step.
+        for block in &mut self.blocks {
             observer.check()?;
             x = block.forward(&x, &modulation, &self.cos, &self.sin, None)?;
-            ensure!(
-                x.to_dtype(DType::F32)?
-                    .sum_all()?
-                    .to_scalar::<f32>()?
-                    .is_finite(),
-                "non-finite denoiser block {i}"
-            );
         }
         let scale = (self.final_scale.forward(&activated)?.unsqueeze(1)? + 1.0)?;
         Ok(self.out.forward(&ops::norm(&x)?.broadcast_mul(&scale)?)?)
