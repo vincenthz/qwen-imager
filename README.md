@@ -44,7 +44,12 @@ the native file picker. You can select several files at once, up to 10 images in
 total. Each image appears as a numbered thumbnail with a **−** button to remove
 it; another add tile stays to the right. The row scrolls horizontally when needed.
 Describe the desired changes in the prompt, then Generate. All attached images
-are used in their displayed order and stay loaded between runs. Removing every
+are used in their displayed order and stay loaded between runs. When a generation
+with references finishes, a **Before** toggle appears at the right of the status row: it
+switches the view between the last reference image and the generated result, and
+a corner label shows which one is displayed. Save always writes the generated image. After any generation
+finishes, **Use as input** (on the same row) replaces all reference images with
+the result, so the next Generate edits it. Removing every
 thumbnail returns to text-only generation. Output remains square at the selected
 Size. Image decoding runs in the background, preserves alpha, and respects photo
 orientation. Cancelling the picker, selecting too many files, or choosing an

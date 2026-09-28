@@ -47,17 +47,22 @@ impl ReferenceImage {
             image.width() > 0 && image.height() > 0,
             "image must not be empty"
         );
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        Ok(Self::new(name, Arc::new(image.to_rgba8())))
+    }
+
+    fn new(name: String, image: Arc<RgbaImage>) -> Self {
         // Bound the display texture; inference still receives the original RGBA pixels.
-        let preview = render_image(&image.thumbnail(1024, 1024).to_rgba8());
-        Ok(Self {
-            name: path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
-            image: Arc::new(image.to_rgba8()),
-            preview,
-        })
+        let thumbnail = image::imageops::thumbnail(&*image, 1024, 1024);
+        Self {
+            name,
+            preview: render_image(&thumbnail),
+            image,
+        }
     }
 }
 
@@ -77,6 +82,11 @@ pub struct ImageWindow {
     progress: f32,
     image: Option<Arc<RgbaImage>>,
     rendered: Option<Arc<RenderImage>>,
+    // Reference preview shown by the Before/After toggle once a generation finishes.
+    before: Option<Arc<RenderImage>>,
+    showing_before: bool,
+    // The displayed image is a finished result (not a preview), so it can become the input.
+    completed: bool,
     // Dropping the task closes the bounded channel when the window closes.
     receiver: Option<Task<()>>,
     timing: Option<GenerationTiming>,
@@ -122,6 +132,9 @@ impl ImageWindow {
             progress: 0.,
             image: None,
             rendered: None,
+            before: None,
+            showing_before: false,
+            completed: false,
             receiver: None,
             timing: None,
             ticker: None,
@@ -311,12 +324,40 @@ impl ImageWindow {
             return;
         }
         let reference = self.references.remove(index);
+        if self
+            .before
+            .as_ref()
+            .is_some_and(|before| Arc::ptr_eq(before, &reference.preview))
+        {
+            self.clear_comparison();
+        }
         let _ = window.drop_image(reference.preview);
         self.status = if self.references.is_empty() {
             "References removed. Generate from your prompt alone.".into()
         } else {
             format!("{} reference image(s) loaded.", self.references.len())
         };
+        cx.notify();
+    }
+
+    fn use_as_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.loading_image || !self.completed {
+            return;
+        }
+        let Some(image) = self.image.clone() else {
+            return;
+        };
+        // Clears the before/after comparison before its reference textures are dropped.
+        self.clear_image(window);
+        for reference in self.references.drain(..) {
+            let _ = window.drop_image(reference.preview);
+        }
+        self.references
+            .push(ReferenceImage::new("Generated image".into(), image));
+        self.progress = 0.;
+        self.status =
+            "Generated image is now the reference. Describe the changes you want, then Generate."
+                .into();
         cx.notify();
     }
 
@@ -449,6 +490,9 @@ impl ImageWindow {
                 match result {
                     Ok(generated) => {
                         self.set_image(generated.image, window);
+                        // References cannot change while busy, so these are the run's inputs.
+                        self.before = self.references.last().map(|r| r.preview.clone());
+                        self.completed = true;
                         self.progress = 1.;
                         self.status = format!("Complete — {}", format_duration(generated.elapsed));
                     }
@@ -463,6 +507,22 @@ impl ImageWindow {
             let _ = window.drop_image(old);
         }
         self.image = None;
+        self.clear_comparison();
+    }
+
+    // The before texture is owned by its reference thumbnail, so it is not dropped here.
+    fn clear_comparison(&mut self) {
+        self.before = None;
+        self.showing_before = false;
+        self.completed = false;
+    }
+
+    fn toggle_before(&mut self, cx: &mut Context<Self>) {
+        if self.before.is_none() {
+            return;
+        }
+        self.showing_before = !self.showing_before;
+        cx.notify();
     }
 
     fn set_image(&mut self, image: Arc<RgbaImage>, window: &mut Window) {
@@ -611,7 +671,7 @@ impl Render for ImageWindow {
                             .tooltip("Save PNG")
                             .disabled(self.busy || self.loading_image || self.image.is_none())
                             .on_click(cx.listener(|view, _, _, cx| view.save(cx))),
-                    ),
+                    )
             )
             .child(div().flex().flex_wrap().items_center().gap_3()
                 .child(div().flex().items_center().gap_2()
@@ -668,12 +728,32 @@ impl Render for ImageWindow {
                             .bg(rgb(0x8aa6ff)),
                     ),
             )
-            .child(div().flex().flex_wrap().justify_between().gap_2().text_sm()
+            .child(div().flex().flex_wrap().items_center().justify_between().gap_2().text_sm()
                 .child(self.status.clone())
                 .map(|row| match &self.timing {
                     Some(timing) => row.child(div().text_color(rgb(0x9da6b5)).child(timing.label())),
                     None => row,
-                }))
+                })
+                .when(self.completed, |row| row.child(
+                    div().flex().items_center().gap_2().ml_auto()
+                    .child(
+                        Button::new("use-as-input")
+                            .flex_shrink_0()
+                            .label("Use as input")
+                            .tooltip("Replace all reference images with this result to keep editing it")
+                            .disabled(self.loading_image)
+                            .on_click(cx.listener(|view, _, window, cx| view.use_as_input(window, cx))),
+                    )
+                    .when(self.before.is_some(), |row| row.child(
+                        Button::new("before-after")
+                            .flex_shrink_0()
+                            .label("Before")
+                            .selected(self.showing_before)
+                            .tooltip(if self.showing_before {
+                                "Showing the reference image. Click to show the generated image."
+                            } else { "Show the reference image before generation" })
+                            .on_click(cx.listener(|view, _, _, cx| view.toggle_before(cx))),
+                    )))))
             .child(
                 div()
                     .flex_1()
@@ -685,7 +765,8 @@ impl Render for ImageWindow {
                     .rounded_md()
                     .overflow_hidden()
                     .bg(rgb(0x22262d))
-                    .map(|container| match self.rendered.as_ref().or_else(|| self.references.last().map(|reference| &reference.preview)) {
+                    .relative()
+                    .map(|container| match self.before.as_ref().filter(|_| self.showing_before).or(self.rendered.as_ref()).or_else(|| self.references.last().map(|reference| &reference.preview)) {
                         Some(image) => container.child(
                             img(image.clone())
                                 .size_full()
@@ -696,7 +777,11 @@ impl Render for ImageWindow {
                                 .text_color(rgb(0x9da6b5))
                                 .child("Your image will appear here"),
                         ),
-                    }),
+                    })
+                    .when(self.before.is_some(), |container| container.child(
+                        div().absolute().top_2().left_2().px_2().py_1().rounded_md().text_xs()
+                            .bg(rgb(0x15171b)).text_color(rgb(0xe4e7ec))
+                            .child(if self.showing_before { "Before" } else { "After" }))),
             )
     }
 }
