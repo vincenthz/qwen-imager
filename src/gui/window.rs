@@ -1,6 +1,8 @@
 use std::{
+    cell::Cell,
     num::NonZeroUsize,
     path::Path,
+    rc::Rc,
     sync::{Arc, Mutex},
     thread,
     time::Duration,
@@ -12,8 +14,9 @@ use image::ImageDecoder;
 use crate::timing::{GenerationTiming, format_duration};
 
 use gpui::{
-    Context, Entity, ObjectFit, PathPromptOptions, RenderImage, Task, Window, div, img, prelude::*,
-    px, relative, rgb,
+    Bounds, Context, CursorStyle, DevicePixels, Entity, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ObjectFit, PathBuilder, PathPromptOptions, Pixels, Point, RenderImage, Task,
+    Window, canvas, div, img, point, prelude::*, px, relative, rgb, size,
 };
 use gpui_component::{
     Disableable, Icon, Selectable,
@@ -27,6 +30,53 @@ use qwen_imager::{
 
 const MAX_REFERENCES: usize = 10;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaintColor {
+    Red,
+    Blue,
+    Green,
+    White,
+}
+
+impl PaintColor {
+    const ALL: [Self; 4] = [Self::Red, Self::Blue, Self::Green, Self::White];
+
+    fn rgb(self) -> [u8; 3] {
+        match self {
+            Self::Red => [255, 0, 0],
+            Self::Blue => [0, 0, 255],
+            Self::Green => [0, 255, 0],
+            Self::White => [255, 255, 255],
+        }
+    }
+
+    fn hex(self) -> u32 {
+        let [r, g, b] = self.rgb();
+        u32::from_be_bytes([0, r, g, b])
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Red => "Red",
+            Self::Blue => "Blue",
+            Self::Green => "Green",
+            Self::White => "White",
+        }
+    }
+}
+
+// Brush widths as a fraction of the image's longer side, so strokes keep their
+// look between the on-screen preview and the full-resolution reference.
+const BRUSHES: [(&str, f32); 3] = [("S", 0.006), ("M", 0.015), ("L", 0.035)];
+
+/// A freehand stroke in normalized image coordinates (0..1 on both axes).
+#[derive(Clone)]
+struct Stroke {
+    color: PaintColor,
+    width: f32,
+    points: Vec<(f32, f32)>,
+}
+
 enum Message {
     Checked(qwen_imager::Result<()>),
     Download(DownloadProgress),
@@ -39,6 +89,8 @@ struct ReferenceImage {
     name: String,
     image: Arc<RgbaImage>,
     preview: Arc<RenderImage>,
+    // Paint not yet applied to `image`; it is baked in when generation starts.
+    strokes: Vec<Stroke>,
 }
 
 impl ReferenceImage {
@@ -68,7 +120,22 @@ impl ReferenceImage {
             name,
             preview: render_image(&thumbnail),
             image,
+            strokes: Vec::new(),
         }
+    }
+
+    /// Applies pending strokes to the full-resolution pixels and refreshes the preview.
+    fn bake(&mut self, window: &mut Window) {
+        if self.strokes.is_empty() {
+            return;
+        }
+        let mut painted = (*self.image).clone();
+        for stroke in &self.strokes {
+            rasterize_stroke(&mut painted, stroke);
+        }
+        let name = std::mem::take(&mut self.name);
+        let old = std::mem::replace(self, Self::new(name, Arc::new(painted)));
+        let _ = window.drop_image(old.preview);
     }
 }
 
@@ -83,6 +150,14 @@ pub struct ImageWindow {
     checking_model: bool,
     loading_image: bool,
     references: Vec<ReferenceImage>,
+    // Reference being painted on in the main view, if any.
+    painting: Option<usize>,
+    paint_color: PaintColor,
+    brush: f32,
+    // A stroke is in progress (the last stroke of the painted reference).
+    drawing: bool,
+    // Window-space bounds of the main view, recorded at paint time for mouse mapping.
+    canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
     cancellation: CancellationToken,
     status: String,
     progress: f32,
@@ -136,6 +211,11 @@ impl ImageWindow {
             checking_model: true,
             loading_image: false,
             references: Vec::new(),
+            painting: None,
+            paint_color: PaintColor::Red,
+            brush: BRUSHES[1].1,
+            drawing: false,
+            canvas_bounds: Rc::default(),
             cancellation: CancellationToken::default(),
             status: "Checking model files…".into(),
             progress: 0.,
@@ -251,6 +331,10 @@ impl ImageWindow {
             }
         }));
         self.clear_image(window);
+        self.stop_painting();
+        for reference in &mut self.references {
+            reference.bake(window);
+        }
         self.cancellation = CancellationToken::default();
         let cancellation = self.cancellation.clone();
         let sender = self.listen(window, cx);
@@ -337,6 +421,11 @@ impl ImageWindow {
             return;
         }
         let reference = self.references.remove(index);
+        match self.painting {
+            Some(painting) if painting == index => self.stop_painting(),
+            Some(painting) if painting > index => self.painting = Some(painting - 1),
+            _ => {}
+        }
         if self
             .before
             .as_ref()
@@ -362,6 +451,7 @@ impl ImageWindow {
         };
         // Clears the before/after comparison before its reference textures are dropped.
         self.clear_image(window);
+        self.stop_painting();
         for reference in self.references.drain(..) {
             let _ = window.drop_image(reference.preview);
         }
@@ -371,6 +461,107 @@ impl ImageWindow {
         self.status =
             "Generated image is now the reference. Describe the changes you want, then Generate."
                 .into();
+        cx.notify();
+    }
+
+    fn toggle_painting(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.busy || self.loading_image || index >= self.references.len() {
+            return;
+        }
+        if self.painting == Some(index) {
+            self.stop_painting();
+        } else {
+            self.drawing = false;
+            self.painting = Some(index);
+            self.status = format!(
+                "Drawing on image {}. Paint over it, then Generate.",
+                index + 1
+            );
+        }
+        cx.notify();
+    }
+
+    fn stop_painting(&mut self) {
+        self.painting = None;
+        self.drawing = false;
+    }
+
+    fn painted_reference(&mut self) -> Option<&mut ReferenceImage> {
+        self.painting
+            .and_then(|index| self.references.get_mut(index))
+    }
+
+    // Maps a window position to normalized image coordinates, clamped to the image.
+    fn image_point(&self, position: Point<Pixels>) -> Option<(f32, f32)> {
+        let reference = self.references.get(self.painting?)?;
+        let rect = contain(self.canvas_bounds.get(), reference.image.dimensions());
+        let width = f32::from(rect.size.width);
+        let height = f32::from(rect.size.height);
+        if width <= 0. || height <= 0. {
+            return None;
+        }
+        let x = f32::from(position.x - rect.origin.x) / width;
+        let y = f32::from(position.y - rect.origin.y) / height;
+        Some((x, y))
+    }
+
+    fn start_stroke(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let Some((x, y)) = self.image_point(event.position) else {
+            return;
+        };
+        if !(0. ..=1.).contains(&x) || !(0. ..=1.).contains(&y) {
+            return;
+        }
+        let stroke = Stroke {
+            color: self.paint_color,
+            width: self.brush,
+            points: vec![(x, y)],
+        };
+        if let Some(reference) = self.painted_reference() {
+            reference.strokes.push(stroke);
+            self.drawing = true;
+            cx.notify();
+        }
+    }
+
+    fn extend_stroke(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.drawing {
+            return;
+        }
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.drawing = false;
+            return;
+        }
+        let Some((x, y)) = self.image_point(event.position) else {
+            return;
+        };
+        let point = (x.clamp(0., 1.), y.clamp(0., 1.));
+        if let Some(stroke) = self
+            .painted_reference()
+            .and_then(|reference| reference.strokes.last_mut())
+            && stroke.points.last() != Some(&point)
+        {
+            stroke.points.push(point);
+            cx.notify();
+        }
+    }
+
+    fn undo_stroke(&mut self, cx: &mut Context<Self>) {
+        self.drawing = false;
+        if let Some(reference) = self.painted_reference() {
+            reference.strokes.pop();
+        }
+        cx.notify();
+    }
+
+    fn clear_strokes(&mut self, cx: &mut Context<Self>) {
+        self.drawing = false;
+        if let Some(reference) = self.painted_reference() {
+            reference.strokes.clear();
+        }
         cx.notify();
     }
 
@@ -706,9 +897,16 @@ impl Render for ImageWindow {
             .child(div().id("reference-images").flex().items_center().gap_2()
                 .flex_shrink_0().overflow_x_scroll().py_1()
                 .children(self.references.iter().enumerate().map(|(index, reference)| {
-                    div().relative().w(px(72.)).h(px(72.)).flex_shrink_0()
-                        .rounded_md().border_1().border_color(rgb(0x303640)).bg(rgb(0x22262d))
+                    let selected = self.painting == Some(index);
+                    div().id(("reference", index)).relative().w(px(72.)).h(px(72.)).flex_shrink_0()
+                        .rounded_md().border_1()
+                        .border_color(if selected { rgb(0x8aa6ff) } else { rgb(0x303640) })
+                        .bg(rgb(0x22262d))
+                        .when(!self.busy && !self.loading_image, |tile| tile.cursor_pointer())
+                        .on_click(cx.listener(move |view, _, _, cx| view.toggle_painting(index, cx)))
                         .child(img(reference.preview.clone()).size_full().object_fit(ObjectFit::Contain))
+                        .when(!reference.strokes.is_empty(), |tile| tile.child(
+                            stroke_overlay(reference, None)))
                         .child(div().absolute().bottom_0().left_0().px_1().text_xs()
                             .bg(rgb(0x15171b)).child((index + 1).to_string()))
                         .child(Button::new(("remove-image", index))
@@ -767,6 +965,43 @@ impl Render for ImageWindow {
                             } else { "Show the reference image before generation" })
                             .on_click(cx.listener(|view, _, _, cx| view.toggle_before(cx))),
                     )))))
+            .when_some(self.painting.filter(|_| !self.busy), |view_root, index| {
+                let has_strokes = !self.references[index].strokes.is_empty();
+                view_root.child(div().flex().flex_wrap().items_center().gap_2().text_sm()
+                    .child(format!("Draw on image {}", index + 1))
+                    .children(PaintColor::ALL.into_iter().map(|color| {
+                        let selected = self.paint_color == color;
+                        div().id(color.name()).w(px(24.)).h(px(24.)).rounded_full()
+                            .border_2()
+                            .border_color(if selected { rgb(0x8aa6ff) } else { rgb(0x303640) })
+                            .bg(rgb(color.hex()))
+                            .cursor_pointer()
+                            .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(color.name()).build(window, cx))
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.paint_color = color;
+                                cx.notify();
+                            }))
+                    }))
+                    .child(div().w(px(8.)))
+                    .children(BRUSHES.into_iter().map(|(label, width)| {
+                        Button::new(("brush", (width * 1000.) as usize))
+                            .label(label)
+                            .selected(self.brush == width)
+                            .tooltip("Brush size")
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.brush = width;
+                                cx.notify();
+                            }))
+                    }))
+                    .child(div().w(px(8.)))
+                    .child(Button::new("undo-stroke").label("Undo").disabled(!has_strokes)
+                        .on_click(cx.listener(|view, _, _, cx| view.undo_stroke(cx))))
+                    .child(Button::new("clear-strokes").label("Clear").disabled(!has_strokes)
+                        .on_click(cx.listener(|view, _, _, cx| view.clear_strokes(cx))))
+                    .child(Button::new("done-painting").label("Done").ml_auto()
+                        .tooltip("Stop drawing. Paint is applied when you Generate.")
+                        .on_click(cx.listener(move |view, _, _, cx| view.toggle_painting(index, cx)))))
+            })
             .child(
                 div()
                     .flex_1()
@@ -779,7 +1014,18 @@ impl Render for ImageWindow {
                     .overflow_hidden()
                     .bg(rgb(0x22262d))
                     .relative()
-                    .map(|container| match self.before.as_ref().filter(|_| self.showing_before).or(self.rendered.as_ref()).or_else(|| self.references.last().map(|reference| &reference.preview)) {
+                    .map(|container| match self.painting.and_then(|index| self.references.get(index)) {
+                        Some(reference) => {
+                            let bounds = self.canvas_bounds.clone();
+                            container
+                                .cursor(CursorStyle::Crosshair)
+                                .on_mouse_down(MouseButton::Left, cx.listener(|view, event, _, cx| view.start_stroke(event, cx)))
+                                .on_mouse_move(cx.listener(|view, event, _, cx| view.extend_stroke(event, cx)))
+                                .on_mouse_up(MouseButton::Left, cx.listener(|view, _, _, _| view.drawing = false))
+                                .child(img(reference.preview.clone()).size_full().object_fit(ObjectFit::Contain))
+                                .child(stroke_overlay(reference, Some(bounds)))
+                        }
+                        None => container.map(|container| match self.before.as_ref().filter(|_| self.showing_before).or(self.rendered.as_ref()).or_else(|| self.references.last().map(|reference| &reference.preview)) {
                         Some(image) => container.child(
                             img(image.clone())
                                 .size_full()
@@ -790,8 +1036,8 @@ impl Render for ImageWindow {
                                 .text_color(rgb(0x9da6b5))
                                 .child("Your image will appear here"),
                         ),
-                    })
-                    .when(self.before.is_some(), |container| container.child(
+                    })})
+                    .when(self.before.is_some() && self.painting.is_none(), |container| container.child(
                         div().absolute().top_2().left_2().px_2().py_1().rounded_md().text_xs()
                             .bg(rgb(0x15171b)).text_color(rgb(0xe4e7ec))
                             .child(if self.showing_before { "Before" } else { "After" }))),
@@ -804,6 +1050,113 @@ fn error_status(error: anyhow::Error) -> String {
         "Cancelled. You can try again.".into()
     } else {
         format!("Error: {error:#}")
+    }
+}
+
+fn contain(bounds: Bounds<Pixels>, (width, height): (u32, u32)) -> Bounds<Pixels> {
+    let image = size(
+        DevicePixels::from(width as i32),
+        DevicePixels::from(height as i32),
+    );
+    ObjectFit::Contain.get_bounds(bounds, image)
+}
+
+// Draws a reference's pending strokes over its contained preview; optionally
+// records the element bounds so mouse positions can be mapped back.
+fn stroke_overlay(
+    reference: &ReferenceImage,
+    record: Option<Rc<Cell<Bounds<Pixels>>>>,
+) -> impl IntoElement {
+    let strokes = reference.strokes.clone();
+    let dimensions = reference.image.dimensions();
+    canvas(
+        move |bounds, _, _| {
+            if let Some(record) = record {
+                record.set(bounds);
+            }
+        },
+        move |bounds, (), window, _| {
+            let rect = contain(bounds, dimensions);
+            let scale = f32::from(rect.size.width.max(rect.size.height));
+            let to_window = |(x, y): (f32, f32)| {
+                point(
+                    rect.origin.x + rect.size.width * x,
+                    rect.origin.y + rect.size.height * y,
+                )
+            };
+            window.with_content_mask(Some(gpui::ContentMask { bounds: rect }), |window| {
+                for stroke in &strokes {
+                    let width = (stroke.width * scale).max(1.);
+                    let color = rgb(stroke.color.hex());
+                    // Round caps and joins: a dot at every vertex plus straight segments.
+                    for &p in &stroke.points {
+                        let center = to_window(p);
+                        let radius = px(width / 2.);
+                        window.paint_quad(
+                            gpui::fill(
+                                Bounds::new(
+                                    point(center.x - radius, center.y - radius),
+                                    size(radius * 2., radius * 2.),
+                                ),
+                                color,
+                            )
+                            .corner_radii(radius),
+                        );
+                    }
+                    if stroke.points.len() > 1 {
+                        let mut path = PathBuilder::stroke(px(width));
+                        path.move_to(to_window(stroke.points[0]));
+                        for &p in &stroke.points[1..] {
+                            path.line_to(to_window(p));
+                        }
+                        if let Ok(path) = path.build() {
+                            window.paint_path(path, color);
+                        }
+                    }
+                }
+            });
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
+/// Paints an opaque round-capped polyline onto the image.
+fn rasterize_stroke(image: &mut RgbaImage, stroke: &Stroke) {
+    let (width, height) = image.dimensions();
+    let radius = (stroke.width * width.max(height) as f32 / 2.).max(0.5);
+    let [r, g, b] = stroke.color.rgb();
+    let points: Vec<(f32, f32)> = stroke
+        .points
+        .iter()
+        .map(|&(x, y)| (x * width as f32, y * height as f32))
+        .collect();
+    let segments = points
+        .windows(2)
+        .map(|w| (w[0], w[1]))
+        .chain(points.first().map(|&p| (p, p)));
+    for (a, b_) in segments {
+        let x0 = (a.0.min(b_.0) - radius).floor().max(0.) as u32;
+        let y0 = (a.1.min(b_.1) - radius).floor().max(0.) as u32;
+        let x1 = ((a.0.max(b_.0) + radius).ceil() as u32).min(width);
+        let y1 = ((a.1.max(b_.1) + radius).ceil() as u32).min(height);
+        let (dx, dy) = (b_.0 - a.0, b_.1 - a.1);
+        let length = dx * dx + dy * dy;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                // Distance from the pixel centre to the segment.
+                let (px_, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                let t = if length > 0. {
+                    (((px_ - a.0) * dx + (py - a.1) * dy) / length).clamp(0., 1.)
+                } else {
+                    0.
+                };
+                let (ex, ey) = (px_ - (a.0 + t * dx), py - (a.1 + t * dy));
+                if ex * ex + ey * ey <= radius * radius {
+                    image.put_pixel(x, y, image::Rgba([r, g, b, 255]));
+                }
+            }
+        }
     }
 }
 
@@ -827,5 +1180,20 @@ mod tests {
             &[10, 30, 200, 128]
         );
         assert_eq!(rgba.as_raw(), &[200, 30, 10, 128]);
+    }
+
+    #[test]
+    fn stroke_paints_the_segment_and_nothing_else() {
+        let mut image = RgbaImage::from_pixel(100, 100, image::Rgba([0, 0, 0, 255]));
+        let stroke = Stroke {
+            color: PaintColor::Green,
+            width: 0.04,
+            points: vec![(0.1, 0.5), (0.9, 0.5)],
+        };
+        rasterize_stroke(&mut image, &stroke);
+        assert_eq!(image.get_pixel(50, 50).0, [0, 255, 0, 255]);
+        assert_eq!(image.get_pixel(10, 51).0, [0, 255, 0, 255]);
+        assert_eq!(image.get_pixel(50, 45).0, [0, 0, 0, 255]);
+        assert_eq!(image.get_pixel(2, 50).0, [0, 0, 0, 255]);
     }
 }

@@ -55,6 +55,15 @@ Size. Image decoding runs in the background, preserves alpha, and respects photo
 orientation. Cancelling the picker, selecting too many files, or choosing an
 unreadable file keeps the previous references without adding a partial selection.
 
+Click a reference thumbnail to draw on it. The main view then shows that image,
+and a toolbar above it offers red, blue, green and white paint, three brush
+sizes (**S**/**M**/**L**, relative to the image's longer side), **Undo**,
+**Clear**, and **Done**. Drag on the image to paint freehand. The thumbnail
+shows pending paint; click it again or press Done to return to the result
+view. When you click Generate, the paint is applied to the full-resolution
+reference, so that run and **Before** use the painted image. After that the
+paint can no longer be undone; to start over, remove the image and add it again.
+
 Model downloads, inference, and saving run off the UI thread. A bounded event
 queue limits retained preview buffers, and old image textures are released when
 replaced. Closing the window stops the app. During download, Cancel takes effect
