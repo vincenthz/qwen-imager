@@ -25,8 +25,13 @@ can retry with Download. The model is approximately 32 GB; `HF_HOME` and
 Enter a prompt and click **Generate** to its right. **Steps** defaults to 20;
 the adjacent **Size (px)** field sets the square image's side length (default
 512, multiples of 32 from 32 to 2048). **Auto previews** (the default) decodes
-a preview after every step. Click that control before generating to switch to **Manual previews**. In manual mode,
-click **Preview** during generation to decode the latest fully completed step in
+a preview after every step. Click that control before generating to switch to
+**Manual previews**, which automatically requests previews after step 5 and
+halfway through sampling (rounded up for odd step counts). Matching milestones
+produce one preview; the final step uses the normal final decode. If a preview
+is already being decoded, milestones are combined and retried with the latest
+completed snapshot when the decoder is free. You can also click **Preview**
+during generation to decode the latest fully completed step in
 the background while sampling continues. A click during model loading waits for
 the first completed step. Only one preview can be pending at a time; its image
 shows the source step number. The final image always appears automatically.

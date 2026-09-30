@@ -30,6 +30,34 @@ use qwen_imager::{
 
 const MAX_REFERENCES: usize = 10;
 
+#[derive(Default)]
+struct ManualPreviewSchedule {
+    due_step: Option<usize>,
+}
+
+impl ManualPreviewSchedule {
+    fn on_event(&mut self, event: &Event, request: impl FnOnce() -> bool) -> bool {
+        match event {
+            Event::StepFinished { step, total, .. } => {
+                if step == total {
+                    self.due_step = None; // Final decoding supplies this image.
+                } else if *step == 5 || *step == total.div_ceil(2) {
+                    self.due_step = Some(*step);
+                }
+            }
+            Event::Preview { step, .. } => {
+                if self.due_step.is_some_and(|due| *step >= due) {
+                    self.due_step = None;
+                }
+            }
+            _ => return false,
+        }
+        // Coalesce milestones while a decode is busy. Retry with the latest
+        // completed snapshot as soon as the decoder becomes available.
+        self.due_step.is_some() && request()
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PaintColor {
     Red,
@@ -78,6 +106,7 @@ struct Stroke {
 }
 
 enum Message {
+    PreviewRequested,
     Checked(qwen_imager::Result<()>),
     Download(DownloadProgress),
     Prepared(qwen_imager::Result<()>),
@@ -367,8 +396,15 @@ impl ImageWindow {
             // A panicked run leaves the cache consistent: entries are only
             // stored once complete.
             let mut generator = generator.lock().unwrap_or_else(|e| e.into_inner());
+            let mut preview_schedule = ManualPreviewSchedule::default();
             let result = generator.generate(&request, &cancellation, |event| {
-                if sender.send_blocking(Message::Inference(event)).is_err() {
+                let requested = !cancellation.is_cancelled()
+                    && request.preview_control.as_ref().is_some_and(|control| {
+                        preview_schedule.on_event(&event, || control.request_preview())
+                    });
+                if sender.send_blocking(Message::Inference(event)).is_err()
+                    || (requested && sender.send_blocking(Message::PreviewRequested).is_err())
+                {
                     cancellation.cancel();
                 }
             });
@@ -639,11 +675,15 @@ impl ImageWindow {
     fn receive(&mut self, message: Message, window: &mut Window) {
         // Keep the cancellation message visible until the worker has stopped.
         if self.cancellation.is_cancelled()
-            && matches!(message, Message::Download(_) | Message::Inference(_))
+            && matches!(
+                message,
+                Message::Download(_) | Message::Inference(_) | Message::PreviewRequested
+            )
         {
             return;
         }
         match message {
+            Message::PreviewRequested => self.preview_pending = true,
             Message::Checked(result) => {
                 self.checking_model = false;
                 self.busy = false;
@@ -946,7 +986,7 @@ impl Render for ImageWindow {
                         .label(if self.automatic_previews { "Auto previews" } else { "Manual previews" })
                         .selected(self.automatic_previews)
                         .disabled(self.busy)
-                        .tooltip("Switch between a preview every step and previews only when requested")
+                        .tooltip("Switch between every-step previews and manual previews with automatic previews at step 5 and halfway")
                         .on_click(cx.listener(|view, _, _, cx| {
                             if !view.busy { view.automatic_previews = !view.automatic_previews; cx.notify(); }
                         })))
@@ -1240,6 +1280,66 @@ fn render_image(rgba: &RgbaImage) -> Arc<RenderImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn step_event(step: usize, total: usize) -> Event {
+        Event::StepFinished {
+            step,
+            total,
+            duration: Duration::ZERO,
+        }
+    }
+
+    fn preview_event(step: usize, total: usize) -> Event {
+        Event::Preview {
+            step,
+            total,
+            image: Arc::new(RgbaImage::new(1, 1)),
+        }
+    }
+
+    #[test]
+    fn manual_milestones_handle_short_odd_and_overlapping_runs() {
+        for (total, expected) in [
+            (1, vec![]),
+            (2, vec![1]),
+            (5, vec![3]),
+            (8, vec![4, 5]),
+            (9, vec![5]),
+            (10, vec![5]),
+            (11, vec![5, 6]),
+            (20, vec![5, 10]),
+        ] {
+            let mut schedule = ManualPreviewSchedule::default();
+            let mut requested = Vec::new();
+            for step in 1..=total {
+                if schedule.on_event(&step_event(step, total), || true) {
+                    requested.push(step);
+                    assert!(
+                        !schedule
+                            .on_event(&preview_event(step, total), || panic!("duplicate preview"))
+                    );
+                }
+            }
+            assert_eq!(requested, expected, "total steps: {total}");
+        }
+    }
+
+    #[test]
+    fn manual_milestones_coalesce_busy_decodes_and_yield_to_final_image() {
+        let mut schedule = ManualPreviewSchedule::default();
+        assert!(!schedule.on_event(&step_event(5, 20), || false));
+        assert!(!schedule.on_event(&step_event(10, 20), || false));
+        assert!(schedule.on_event(&preview_event(4, 20), || true));
+        assert!(!schedule.on_event(&preview_event(10, 20), || panic!(
+            "milestone already delivered"
+        )));
+        assert!(!schedule.on_event(&step_event(11, 20), || panic!("no milestone due")));
+
+        let mut schedule = ManualPreviewSchedule::default();
+        assert!(!schedule.on_event(&step_event(5, 20), || false));
+        assert!(!schedule.on_event(&step_event(20, 20), || panic!("final decode is sufficient")));
+        assert!(!schedule.on_event(&preview_event(4, 20), || panic!("sampling has finished")));
+    }
+
     #[test]
     fn preview_swaps_red_blue_and_preserves_alpha() {
         let rgba = RgbaImage::from_raw(1, 1, vec![200, 30, 10, 128]).unwrap();
