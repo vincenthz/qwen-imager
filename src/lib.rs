@@ -16,6 +16,7 @@ mod preview;
 mod shared;
 mod text;
 mod vae;
+mod vae_kernels;
 mod vision;
 mod weights;
 

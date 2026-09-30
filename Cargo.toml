@@ -36,6 +36,7 @@ gpui = { version = "0.2.2", default-features = false, features = ["runtime_shade
 gpui-component = { version = "0.5.1", optional = true }
 candle-core = { version = "0.9", features = ["metal"] }
 candle-nn = { version = "0.9", features = ["metal"] }
+candle-metal-kernels = "0.9"
 clap = { version = "4", features = ["derive"], optional = true }
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }

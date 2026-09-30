@@ -1,7 +1,7 @@
 //! Still-image specialization of the Qwen 2.1 RGBA autoencoder.
 //! Temporal convolution caches are unused for one frame. Temporal factors in
 //! the residual shortcuts still affect channel layout and must be preserved.
-use crate::ops;
+use crate::{ops, vae_kernels};
 use candle_core::{DType, Result, Tensor};
 use candle_nn::{Module, VarBuilder};
 use serde::Deserialize;
@@ -133,56 +133,42 @@ fn conv(
     padding: usize,
     stride: usize,
 ) -> Result<Tensor> {
-    let (_, _, h, w) = x.dims4()?;
-    let oh = (h + 2 * padding - kernel) / stride + 1;
-    let ow = (w + 2 * padding - kernel) / stride + 1;
-    // Metal convolution materializes im2col. Bound it to 128 MiB without
-    // approximating the VAE with independently decoded/blended image tiles.
-    let rows =
-        (128 * 1024 * 1024 / (ow * input * kernel * kernel * x.dtype().size_in_bytes())).max(1);
-    if rows >= oh {
-        return candle_nn::conv2d(
-            input,
-            output,
-            kernel,
-            candle_nn::Conv2dConfig {
-                padding,
-                stride,
-                ..Default::default()
-            },
-            vb,
-        )?
-        .forward(x);
-    }
-    let layer = candle_nn::conv2d(
-        input,
-        output,
-        kernel,
-        candle_nn::Conv2dConfig {
-            padding: 0,
+    let (b, _, h, w) = x.dims4()?;
+    if !x.device().is_metal() || b != 1 {
+        let config = candle_nn::Conv2dConfig {
+            padding,
             stride,
             ..Default::default()
-        },
-        vb,
-    )?;
+        };
+        return candle_nn::conv2d(input, output, kernel, config, vb)?.forward(x);
+    }
+    let oh = (h + 2 * padding - kernel) / stride + 1;
+    let ow = (w + 2 * padding - kernel) / stride + 1;
+    let weight = vb
+        .get((output, input, kernel, kernel), "weight")?
+        .reshape((output, input * kernel * kernel))?;
+    let bias = vb.get(output, "bias")?.reshape((output, 1))?;
+    if kernel == 1 && stride == 1 && padding == 0 {
+        return weight
+            .matmul(&x.reshape((input, h * w))?)?
+            .broadcast_add(&bias)?
+            .reshape((1, output, h, w));
+    }
+    // weight (out, in*k*k) @ patches (in*k*k, rows*ow) is directly NCHW.
+    // Bound the patch matrix to 256 MiB by computing bands of output rows;
+    // the result is exact, not a blend of independently decoded tiles.
+    let rows =
+        (256 * 1024 * 1024 / (ow * input * kernel * kernel * x.dtype().size_in_bytes())).max(1);
     let mut parts = Vec::new();
     for start in (0..oh).step_by(rows) {
         let len = (oh - start).min(rows);
-        let first = start * stride;
-        let end = (start + len - 1) * stride + kernel;
-        let source_start = first.saturating_sub(padding);
-        let source_end = (end - padding).min(h);
-        let tile = x
-            .narrow(2, source_start, source_end - source_start)?
-            .pad_with_zeros(
-                2,
-                padding.saturating_sub(first),
-                end.saturating_sub(h + padding),
-            )?
-            .pad_with_zeros(3, padding, padding)?
-            .contiguous()?;
-        parts.push(layer.forward(&tile)?);
-        x.device().synchronize()?;
+        let patches = vae_kernels::im2col(x, kernel, stride, padding, start, len, ow)?;
+        parts.push(
+            weight
+                .matmul(&patches)?
+                .broadcast_add(&bias)?
+                .reshape((1, output, len, ow))?,
+        );
     }
     Tensor::cat(&parts, 2)
 }
@@ -194,6 +180,9 @@ fn channel_norm(x: &Tensor, vb: VarBuilder, temporal: bool) -> Result<Tensor> {
     } else {
         vb.get((c, 1, 1), "gamma")?.unsqueeze(0)?
     };
+    if x.device().is_metal() && x.dim(0)? == 1 {
+        return vae_kernels::channel_norm(x, &weight);
+    }
     let xf = x.to_dtype(DType::F32)?;
     let l2 = xf
         .sqr()?
