@@ -1,11 +1,11 @@
 use std::time::{Duration, Instant};
 
-/// Measure full steps (denoising plus preview decoding). Model loading is a
+/// Measure full automatic-preview steps, or sampling steps in manual mode. Model loading is a
 /// one-off cost: show it in elapsed time, but don't multiply it by future steps.
 pub struct GenerationTiming {
     started: Instant,
     steps_started: Option<Instant>,
-    last_preview: Option<Instant>,
+    last_completed: Option<Instant>,
     completed: usize,
     total: usize,
 }
@@ -15,7 +15,7 @@ impl GenerationTiming {
         Self {
             started: Instant::now(),
             steps_started: None,
-            last_preview: None,
+            last_completed: None,
             completed: 0,
             total,
         }
@@ -27,17 +27,17 @@ impl GenerationTiming {
 
     pub fn complete_step(&mut self, step: usize) {
         self.completed = step.min(self.total);
-        self.last_preview = Some(Instant::now());
+        self.last_completed = Some(Instant::now());
     }
 
     pub fn label(&self) -> String {
         let now = Instant::now();
         let elapsed = format_duration(now.duration_since(self.started));
-        let remaining = match (self.steps_started, self.last_preview) {
+        let remaining = match (self.steps_started, self.last_completed) {
             (Some(start), Some(last)) if self.completed > 0 => {
                 let average = last.duration_since(start).as_secs_f64() / self.completed as f64;
                 let predicted = average * (self.total - self.completed) as f64;
-                // Account for work since the last preview, without showing a
+                // Account for work since the last completed step, without showing a
                 // negative countdown when a step takes longer than the average.
                 let seconds = (predicted - now.duration_since(last).as_secs_f64()).max(0.);
                 if self.completed == self.total {

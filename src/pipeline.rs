@@ -1,16 +1,16 @@
 use crate::{
     Event, Observer, Request, Stage,
     dit::Dit,
+    noise,
+    preview::{DecoderWorker, Snapshot},
     text::{self, Encoded},
     vae::Vae,
     vision::{self, Visual},
-    weights::Weights,
+    weights::{Weights, cached_builder},
 };
 use anyhow::{Context, Result, ensure};
 use candle_core::{DType, Device, Tensor};
 use image::{RgbaImage, imageops::FilterType};
-use rand::{SeedableRng, rngs::StdRng};
-use rand_distr::{Distribution, StandardNormal};
 use std::{sync::Arc, time::Instant};
 
 pub fn validate(args: &Request) -> Result<(u32, u32)> {
@@ -25,25 +25,70 @@ pub fn validate(args: &Request) -> Result<(u32, u32)> {
     );
     ensure!(args.steps > 0, "steps must be positive");
     ensure!(
+        args.preview_control.is_none() || args.preview_every.is_none(),
+        "choose either automatic or manual previews"
+    );
+    ensure!(
         args.scale.is_finite() && args.scale > 0.0 && args.scale <= 1.0,
         "scale must be between 0 and 1"
     );
-    dimensions(
+    let (width, height) = dimensions(
         args.ratio.as_deref(),
         args.images.last().map(|i| i.dimensions()),
         args.scale,
-    )
+    )?;
+    if let Some(source) = args.noise_source_size {
+        ensure!(
+            width == height && (32..=8192).contains(&source) && source % width == 0,
+            "noise source size must be 32–8192 pixels and an integer multiple of the square output size"
+        );
+    }
+    Ok((width, height))
 }
 
 /// Results that depend only on the prompt and reference images, kept between
 /// requests so re-rolling the seed or changing steps/size skips the encoders.
-/// Tensors are held on the CPU, so no Metal device or GPU memory outlives a
-/// request. Only the latest request's references are kept (at most 10).
+/// Encoder results are held on the CPU. Model weights and their Metal device
+/// persist until the generator is dropped or its model cache is unloaded.
 #[derive(Default)]
 pub struct Cache {
     /// The prompt and encoder output for exactly `references`, in order.
     encoded: Option<(String, Encoded)>,
     references: Vec<CachedReference>,
+    device: Option<Device>,
+    denoiser: Option<candle_nn::VarBuilder<'static>>,
+    vae: Option<Vae>,
+    decoder: Option<DecoderWorker>,
+}
+
+impl Cache {
+    fn decoder(&mut self, weights: &Weights) -> Result<&DecoderWorker> {
+        if self.decoder.is_none() {
+            self.decoder = Some(DecoderWorker::new(weights.clone())?);
+        }
+        Ok(self.decoder.as_ref().unwrap())
+    }
+
+    pub fn unload_models(&mut self) {
+        self.denoiser = None;
+        self.vae = None;
+        self.decoder = None;
+        self.device = None;
+    }
+}
+
+pub(crate) fn load_vae<'a>(
+    slot: &'a mut Option<Vae>,
+    weights: &Weights,
+    device: &Device,
+) -> Result<&'a Vae> {
+    if slot.is_none() {
+        *slot = Some(Vae::new(
+            cached_builder(weights.builder("vae", DType::BF16, device)?),
+            weights.config("vae/config.json")?,
+        )?);
+    }
+    Ok(slot.as_ref().unwrap())
 }
 
 struct CachedReference {
@@ -60,6 +105,13 @@ pub fn run(
     observer: &mut Observer<'_>,
 ) -> Result<Arc<RgbaImage>> {
     let (width, height) = validate(args)?;
+    if let Some(control) = &args.preview_control {
+        observer.previews = Some(
+            cache
+                .decoder(weights)?
+                .session(control.clone(), args.steps)?,
+        );
+    }
     observer.emit(Event::Started {
         width,
         height,
@@ -75,11 +127,14 @@ pub fn run(
             image::imageops::resize(img, w, h, FilterType::Lanczos3)
         })
         .collect();
-    ensure!(
-        objc2_metal::MTLCreateSystemDefaultDevice().is_some(),
-        "no Metal GPU is visible; run on an Apple Silicon Mac with GPU access"
-    );
-    let device = Device::new_metal(0).context("could not initialize Metal")?;
+    if cache.device.is_none() {
+        ensure!(
+            objc2_metal::MTLCreateSystemDefaultDevice().is_some(),
+            "no Metal GPU is visible; run on an Apple Silicon Mac with GPU access"
+        );
+        cache.device = Some(Device::new_metal(0).context("could not initialize Metal")?);
+    }
+    let device = cache.device.as_ref().unwrap().clone();
     let config: serde_json::Value = weights.config("transformer/config.json")?;
     ensure!(
         config["_class_name"] == "QwenImage21Transformer2DModel"
@@ -140,7 +195,6 @@ pub fn run(
     device.synchronize()?;
     let mut reference_latents = Vec::new();
     let mut shapes = Vec::new();
-    let mut vae = None;
     for (i, entry) in cache.references.iter_mut().enumerate() {
         let img = &entry.image;
         let (h, w) = (img.height() as usize / 16, img.width() as usize / 16);
@@ -150,13 +204,7 @@ pub fn run(
             continue;
         }
         observer.progress(Stage::ReferenceEncoding, i, references.len())?;
-        let vae = match &mut vae {
-            Some(vae) => vae,
-            None => vae.insert(Vae::new(
-                weights.builder("vae", DType::BF16, &device)?,
-                weights.config("vae/config.json")?,
-            )?),
-        };
+        let vae = load_vae(&mut cache.vae, weights, &device)?;
         let rgba: Vec<f32> = img
             .as_raw()
             .iter()
@@ -179,20 +227,30 @@ pub fn run(
         reference_latents.push(latents);
         observer.progress(Stage::ReferenceEncoding, i + 1, references.len())?;
     }
-    drop(vae);
     device.synchronize()?;
     let (h, w) = (height as usize / 16, width as usize / 16);
-    let mut rng = StdRng::seed_from_u64(args.seed);
-    let noise: Vec<f32> = (0..64 * h * w)
-        .map(|_| StandardNormal.sample(&mut rng))
-        .collect();
+    let noise = noise::sample(
+        args.seed,
+        h,
+        w,
+        args.noise_source_size.map(|size| size as usize / 16),
+    );
     let mut latents = Tensor::from_vec(noise, (1, 64, h * w), &device)?
         .transpose(1, 2)?
         .contiguous()?
         .to_dtype(DType::BF16)?;
     observer.progress(Stage::DenoiserLoading, 0, 32)?;
+    if cache.denoiser.is_none() {
+        cache.denoiser = Some(cached_builder(weights.builder(
+            "transformer",
+            DType::BF16,
+            &device,
+        )?));
+    }
+    // Layers borrow cached immutable weights. Prefix KV and rotary state are
+    // rebuilt for this request, and never retained after cancellation or failure.
     let mut dit = Dit::load(
-        weights.builder("transformer", DType::BF16, &device)?,
+        cache.denoiser.as_ref().unwrap().clone(),
         &encoded,
         &reference_latents,
         &shapes,
@@ -207,15 +265,17 @@ pub fn run(
         observer.check()?;
         let predicted = dit.forward(&latents, pair[0], observer)?;
         // Flow matching: x_sigma = x_clean + sigma * velocity.
-        let preview =
-            if args.preview_every.is_some_and(|n| (i + 1) % n.get() == 0) && i + 1 < args.steps {
-                Some(
-                    (latents.to_dtype(DType::F32)? - (predicted.to_dtype(DType::F32)? * pair[0])?)?
-                        .to_dtype(DType::BF16)?,
-                )
-            } else {
-                None
-            };
+        let preview = if (args.preview_control.is_some()
+            || args.preview_every.is_some_and(|n| (i + 1) % n.get() == 0))
+            && i + 1 < args.steps
+        {
+            Some(
+                (latents.to_dtype(DType::F32)? - (predicted.to_dtype(DType::F32)? * pair[0])?)?
+                    .to_dtype(DType::BF16)?,
+            )
+        } else {
+            None
+        };
         latents = (latents.to_dtype(DType::F32)?
             + (predicted.to_dtype(DType::F32)? * (pair[1] - pair[0]))?)?
             .to_dtype(DType::BF16)?;
@@ -229,14 +289,35 @@ pub fn run(
             "denoiser produced non-finite latents at step {}",
             i + 1
         );
+        observer.poll_previews()?;
+        if let (Some(session), Some(clean)) = (&observer.previews, &preview) {
+            // Publish a compact, immutable CPU snapshot before announcing the
+            // completed step. The Preview button never touches the sampler queue.
+            session.publish(Snapshot {
+                latents: clean.to_device(&Device::Cpu)?,
+                step: i + 1,
+                width,
+                height,
+            })?;
+        }
         observer.emit(Event::StepFinished {
             step: i + 1,
             total: args.steps,
             duration: step_start.elapsed(),
         })?;
         observer.check()?;
-        if let Some(clean) = preview {
-            let image = decode(&clean, weights, &device, width, height)?;
+        if args.preview_control.is_none()
+            && let Some(clean) = preview
+        {
+            let image = cache.decoder(weights)?.decode(
+                Snapshot {
+                    latents: clean.to_device(&Device::Cpu)?,
+                    step: i + 1,
+                    width,
+                    height,
+                },
+                observer.cancellation,
+            )?;
             observer.emit(Event::Preview {
                 step: i + 1,
                 total: args.steps,
@@ -246,10 +327,22 @@ pub fn run(
         }
     }
     drop(dit);
+    observer.poll_previews()?;
+    // Retire the session before final decoding. Late preview replies cannot
+    // replace the final image or escape into the next generation.
+    observer.previews = None;
     observer.progress(Stage::Decoding, 0, 1)?;
-    let image = decode(&latents, weights, &device, width, height)?;
+    let image = cache.decoder(weights)?.decode(
+        Snapshot {
+            latents: latents.to_device(&Device::Cpu)?,
+            step: args.steps,
+            width,
+            height,
+        },
+        observer.cancellation,
+    )?;
     observer.progress(Stage::Decoding, 1, 1)?;
-    if args.preview_every.is_some() {
+    if args.preview_every.is_some() || args.preview_control.is_some() {
         observer.emit(Event::Preview {
             step: args.steps,
             total: args.steps,
@@ -260,18 +353,13 @@ pub fn run(
     Ok(image)
 }
 
-fn decode(
+pub(crate) fn decode(
     latents: &Tensor,
-    weights: &Weights,
-    device: &Device,
+    vae: &Vae,
     width: u32,
     height: u32,
 ) -> Result<Arc<RgbaImage>> {
     let (h, w) = (height as usize / 16, width as usize / 16);
-    let vae = Vae::new(
-        weights.builder("vae", DType::BF16, device)?,
-        weights.config("vae/config.json")?,
-    )?;
     let z = latents
         .transpose(1, 2)?
         .reshape((1, 64, h, w))?
@@ -369,6 +457,25 @@ mod tests {
         assert_eq!(dimensions(Some("16:9"), None, 0.5)?, (1376, 768));
         assert_eq!(dimensions(None, Some((1600, 900)), 1.)?, (2720, 1536));
         assert!(dimensions(None, None, 0.001).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn shared_noise_requires_a_compatible_square_grid() -> Result<()> {
+        let mut request = Request::new("test");
+        request.scale = 0.25;
+        request.noise_source_size = Some(2048);
+        assert_eq!(validate(&request)?, (512, 512));
+        request.scale = 1.;
+        assert_eq!(validate(&request)?, (2048, 2048));
+        request.noise_source_size = Some(512);
+        assert!(validate(&request).is_err());
+        request.scale = 0.25;
+        request.noise_source_size = Some(2000);
+        assert!(validate(&request).is_err());
+        request.noise_source_size = Some(2048);
+        request.ratio = Some("16:9".into());
+        assert!(validate(&request).is_err());
         Ok(())
     }
     #[test]

@@ -1,7 +1,9 @@
 use anyhow::{Context, ensure};
 use clap::Parser;
 use qwen_imager::{CancellationToken, Event, Generator, ModelOptions, Request, Stage};
-use std::{num::NonZeroUsize, path::PathBuf};
+use std::{num::NonZeroUsize, path::PathBuf, time::Instant};
+
+mod server;
 
 #[derive(Parser)]
 #[command(
@@ -10,7 +12,22 @@ use std::{num::NonZeroUsize, path::PathBuf};
 )]
 struct Args {
     /// Text prompt describing the image or edit
-    prompt: String,
+    #[arg(required_unless_present = "serve", conflicts_with = "serve")]
+    prompt: Option<String>,
+    /// Run a persistent HTTP generation service
+    #[arg(long, conflicts_with_all = ["output", "images", "ratio", "scale", "steps", "seed", "noise_source_size", "metrics", "preview_dir", "preview_every"])]
+    serve: bool,
+    /// HTTP listen address; remote access requires QWEN_IMAGER_API_TOKEN
+    #[arg(
+        long,
+        default_value = "127.0.0.1:6996",
+        requires = "serve",
+        conflicts_with = "prompt"
+    )]
+    listen: std::net::SocketAddr,
+    /// Maximum retained jobs, including queued jobs; delete finished jobs to free slots
+    #[arg(long, default_value = "32", value_parser = clap::value_parser!(u32).range(1..=128), requires = "serve", conflicts_with = "prompt")]
+    max_jobs: u32,
     /// Output PNG
     #[arg(short, long, default_value = "out.png")]
     output: PathBuf,
@@ -29,6 +46,12 @@ struct Args {
     /// Random seed (repeatable in Rust; differs from PyTorch's RNG)
     #[arg(long, default_value_t = 42)]
     seed: u64,
+    /// Experimental: pool noise from this square pixel size (e.g. 2048)
+    #[arg(long)]
+    noise_source_size: Option<u32>,
+    /// Write parameters and precise stage/step timings to a JSON sidecar
+    #[arg(long, value_name = "PATH")]
+    metrics: Option<PathBuf>,
     /// Existing Qwen Image 2.1 Diffusers snapshot directory
     #[arg(long, value_name = "PATH")]
     model_dir: Option<PathBuf>,
@@ -45,13 +68,23 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    if args.serve {
+        return server::run(
+            args.listen,
+            args.max_jobs as usize,
+            ModelOptions {
+                model_dir: args.model_dir,
+                offline: args.offline,
+            },
+        );
+    }
     ensure!(
         args.output
             .extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("png")),
         "output must be a .png file to preserve RGBA"
     );
-    let mut request = Request::new(args.prompt);
+    let mut request = Request::new(args.prompt.expect("clap requires a prompt"));
     request.images = args
         .images
         .iter()
@@ -65,6 +98,7 @@ fn main() -> anyhow::Result<()> {
     request.scale = args.scale;
     request.steps = args.steps;
     request.seed = args.seed;
+    request.noise_source_size = args.noise_source_size;
     request.preview_every = args.preview_dir.as_ref().map(|_| args.preview_every);
     request.dimensions()?;
     if let Some(dir) = &args.preview_dir {
@@ -76,7 +110,21 @@ fn main() -> anyhow::Result<()> {
     });
     let cancellation = CancellationToken::default();
     let mut preview_error = None;
-    let result = generator.generate(&request, &cancellation, |event| match event {
+    let mut metrics = Vec::new();
+    let started = Instant::now();
+    let result = generator.generate(&request, &cancellation, |event| {
+        if args.metrics.is_some() {
+            let mut record = match &event {
+                Event::Progress { stage, completed, total } => serde_json::json!({"event": "progress", "stage": format!("{stage:?}"), "completed": completed, "total": total}),
+                Event::StepFinished { step, total, duration } => serde_json::json!({"event": "step", "step": step, "total": total, "duration_s": duration.as_secs_f64()}),
+                Event::Started { .. } => serde_json::json!({"event": "started"}),
+                Event::Preview { step, .. } => serde_json::json!({"event": "preview", "step": step}),
+                Event::Finished { .. } => serde_json::json!({"event": "finished"}),
+            };
+            record["time_s"] = started.elapsed().as_secs_f64().into();
+            metrics.push(record);
+        }
+        match event {
         Event::Started {
             width,
             height,
@@ -122,6 +170,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Event::Finished { .. } => {}
+        }
     });
     if let Some(error) = preview_error {
         return Err(error);
@@ -131,10 +180,41 @@ fn main() -> anyhow::Result<()> {
         .image
         .save_with_format(&args.output, image::ImageFormat::Png)
         .with_context(|| format!("saving {}", args.output.display()))?;
+    if let Some(path) = &args.metrics {
+        let (width, height) = request.dimensions()?;
+        let report = serde_json::json!({
+            "prompt": request.prompt, "seed": request.seed, "steps": request.steps,
+            "width": width, "height": height, "noise_source_size": request.noise_source_size,
+            "model": qwen_imager::MODEL, "revision": qwen_imager::REVISION,
+            "generation_s": generated.elapsed.as_secs_f64(),
+            "generation_and_save_s": started.elapsed().as_secs_f64(),
+            "events": metrics,
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&report)?)
+            .with_context(|| format!("writing metrics {}", path.display()))?;
+    }
     eprintln!(
         "Saved {} ({:.0}s)",
         args.output.display(),
         generated.elapsed.as_secs_f32()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_mode_preserves_generation_cli_and_rejects_ignored_options() {
+        let single = Args::try_parse_from(["cli", "a teapot", "--steps", "8"]).unwrap();
+        assert!(!single.serve);
+        assert_eq!(single.prompt.as_deref(), Some("a teapot"));
+        let server = Args::try_parse_from(["cli", "--serve", "--offline"]).unwrap();
+        assert!(server.serve);
+        assert!(server.prompt.is_none());
+        assert!(Args::try_parse_from(["cli"]).is_err());
+        assert!(Args::try_parse_from(["cli", "--serve", "--steps", "8"]).is_err());
+        assert!(Args::try_parse_from(["cli", "a teapot", "--listen", "127.0.0.1:9000"]).is_err());
+    }
 }

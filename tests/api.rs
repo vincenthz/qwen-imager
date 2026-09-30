@@ -68,6 +68,71 @@ fn ui_messages_and_inputs_can_cross_threads() {
     send::<qwen_imager::Generation>();
     send::<CancellationToken>();
     send::<Generator>();
+    send::<qwen_imager::PreviewControl>();
+}
+
+#[test]
+#[ignore = "requires cached Qwen Image 2.1 checkpoint and Metal GPU"]
+fn manual_background_previews_preserve_pixels_and_do_not_leak_between_runs()
+-> qwen_imager::Result<()> {
+    let mut request = Request::new("A red ceramic teapot on a wooden table.");
+    request.scale = 0.0625;
+    request.steps = 8;
+    request.preview_every = std::num::NonZeroUsize::new(1);
+    let mut generator = generator();
+    let cancellation = CancellationToken::default();
+    let mut first_preview = None;
+    let baseline = generator.generate(&request, &cancellation, |event| {
+        if let Event::Preview { step: 1, image, .. } = event {
+            first_preview = Some(image);
+        }
+    })?;
+
+    request.preview_every = None;
+    let control = qwen_imager::PreviewControl::default();
+    request.preview_control = Some(control.clone());
+    let mut previews = Vec::new();
+    let manual = generator.generate(&request, &cancellation, |event| match event {
+        Event::StepFinished { step: 1, .. } => {
+            assert!(control.request_preview());
+            assert!(!control.request_preview());
+        }
+        Event::Preview { step, image, .. } => {
+            previews.push(step);
+            if step == 1 {
+                assert_eq!(image.as_raw(), first_preview.as_ref().unwrap().as_raw());
+            }
+        }
+        _ => {}
+    })?;
+    assert_eq!(previews, [1, request.steps]);
+    assert_eq!(manual.image.as_raw(), baseline.image.as_raw());
+    assert!(!control.request_preview());
+
+    // Cancel with a preview in flight, then rerun without clicking Preview.
+    let control = qwen_imager::PreviewControl::default();
+    request.preview_control = Some(control.clone());
+    let interrupted = CancellationToken::default();
+    let error = generator
+        .generate(&request, &interrupted, |event| {
+            if let Event::StepFinished { step: 1, .. } = event {
+                assert!(control.request_preview());
+                interrupted.cancel();
+            }
+        })
+        .unwrap_err();
+    assert!(error.is::<Cancelled>());
+    assert!(!control.request_preview());
+    request.preview_control = Some(qwen_imager::PreviewControl::default());
+    let mut previews = Vec::new();
+    let quiet = generator.generate(&request, &cancellation, |event| {
+        if let Event::Preview { step, .. } = event {
+            previews.push(step);
+        }
+    })?;
+    assert_eq!(previews, [request.steps]);
+    assert_eq!(quiet.image.as_raw(), baseline.image.as_raw());
+    Ok(())
 }
 
 #[test]
@@ -139,6 +204,38 @@ fn previews_preserve_output_and_report_ordered_progress() -> qwen_imager::Result
     assert_eq!(previews, [1, 2, 3]);
     assert_eq!(text_layers, (0..=36).collect::<Vec<_>>());
     assert_eq!(prefix_layers, (0..=32).collect::<Vec<_>>());
+    // Interrupted prefix preparation must not leak attention state into the
+    // next request. Immutable cached weights remain usable.
+    let interrupted = CancellationToken::default();
+    let error = generator
+        .generate(&request, &interrupted, |event| {
+            if matches!(
+                event,
+                Event::Progress {
+                    stage: Stage::DenoiserLoading,
+                    completed: 2,
+                    ..
+                }
+            ) {
+                interrupted.cancel();
+            }
+        })
+        .unwrap_err();
+    assert!(error.is::<Cancelled>());
+    let recovered = generator.generate(&request, &cancellation, |_| {})?;
+    assert_eq!(recovered.image.as_raw(), baseline.image.as_raw());
+    // Explicit unloading releases model resources but preserves CPU encoding.
+    generator.unload_models();
+    let reloaded = generator.generate(&request, &cancellation, |event| {
+        assert!(!matches!(
+            event,
+            Event::Progress {
+                stage: Stage::TextEncoding,
+                ..
+            }
+        ));
+    })?;
+    assert_eq!(reloaded.image.as_raw(), baseline.image.as_raw());
     // Cancellation during encoder loading must stop before denoising/Finished.
     // A fresh generator has no cached encoder output, so the encoder runs.
     let cancellation = CancellationToken::default();
@@ -207,5 +304,14 @@ fn cached_encoder_results_match_a_fresh_generator() -> qwen_imager::Result<()> {
             .iter()
             .all(|s| matches!(s, Stage::DenoiserLoading | Stage::Decoding))
     );
+    // Removing references and changing the target size must rebuild all rotary
+    // and prefix state, even though the same model tensors stay resident.
+    request.images.clear();
+    request.scale = 0.03125;
+    let cached = generator.generate(&request, &cancellation, |_| {})?;
+    generator.unload_models();
+    let fresh = self::generator().generate(&request, &cancellation, |_| {})?;
+    assert_eq!(cached.image.dimensions(), (64, 64));
+    assert_eq!(cached.image.as_raw(), fresh.image.as_raw());
     Ok(())
 }

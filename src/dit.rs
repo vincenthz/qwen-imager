@@ -268,7 +268,7 @@ impl Dit {
         &mut self,
         latents: &Tensor,
         sigma: f64,
-        observer: &crate::Observer<'_>,
+        observer: &mut crate::Observer<'_>,
     ) -> Result<Tensor> {
         let time = self.time(sigma)?;
         let activated = candle_nn::ops::silu(&time)?;
@@ -277,7 +277,7 @@ impl Dit {
         // No per-block finiteness readback: it would stall the Metal queue 32
         // times per step. The caller checks the latents once per step.
         for block in &mut self.blocks {
-            observer.check()?;
+            observer.poll_previews()?;
             x = block.forward(&x, &modulation, &self.cos, &self.sin, None)?;
         }
         let scale = (self.final_scale.forward(&activated)?.unsqueeze(1)? + 1.0)?;

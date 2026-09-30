@@ -24,8 +24,17 @@ can retry with Download. The model is approximately 32 GB; `HF_HOME` and
 
 Enter a prompt and click **Generate** to its right. **Steps** defaults to 20;
 the adjacent **Size (px)** field sets the square image's side length (default
-512, multiples of 32 from 32 to 2048). A decoded preview appears after **every
-step**. **Auto seed** chooses a new random seed below 2³⁰ for each generation and
+512, multiples of 32 from 32 to 2048). **Auto previews** (the default) decodes
+a preview after every step. Click that control before generating to switch to **Manual previews**. In manual mode,
+click **Preview** during generation to decode the latest fully completed step in
+the background while sampling continues. A click during model loading waits for
+the first completed step. Only one preview can be pending at a time; its image
+shows the source step number. The final image always appears automatically.
+A preview still running when sampling finishes is superseded by final decoding.
+The decoder has its own Metal queue and reuses its loaded weights; it shares GPU
+compute and memory bandwidth with sampling, so previews can still slow generation.
+
+**Auto seed** chooses a new random seed below 2³⁰ for each generation and
 displays it in a greyed-out field. **Manual seed** accepts the full unsigned
 64-bit range (0–18446744073709551615), so you can edit or reuse any supported seed;
 the displayed seed remains available after generation for reproducing an image.
@@ -34,8 +43,9 @@ working, stopping at the next safe boundary. The adjacent save icon (tooltip:
 **Save PNG**) opens the native save dialog for the displayed image.
 Early previews are estimates and may look rough. Decoding every step adds time.
 The status row shows elapsed time and estimated time remaining, updating every
-second. After the first preview, it extrapolates from the average time per
-completed step, including preview decoding. One-time model loading is included
+second. In automatic mode, it extrapolates from the average time per
+completed step including preview decoding. Manual mode updates the estimate at
+each sampling step, even if no previews are requested. One-time model loading is included
 in elapsed time but excluded from the per-step average. The estimate resets for
 each generation and clears when the run finishes or is cancelled.
 
@@ -118,7 +128,9 @@ inputs and determines the output size without GPU access or weight loading.
 
 Events arrive in order: `Started`, stage-local `Progress` (including encoder and
 denoiser loading layers), `StepFinished` for each denoising step, optional
-`Preview`, and `Finished` after successful final decoding. Steps are one-based;
+`Preview`, and `Finished` after successful final decoding. Background previews can arrive
+after later steps have completed; their `step` identifies the snapshot being shown.
+No previews arrive after `Finished`. Steps are one-based;
 progress counts are local to their stage, not an overall percentage. Errors and
 cancellation return from `generate` without `Finished`.
 
@@ -134,21 +146,55 @@ Preview decoding estimates the clean image as `x_sigma - sigma * velocity`.
 Early estimates may look rough. Previews use the full RGBA VAE at output resolution,
 so enabling them adds latency and peak memory while the denoiser remains loaded.
 The final preview shares the returned image's buffer and needs no extra decode.
-Previews never feed back into sampling. Keep callbacks short, and bound or
+Previews never feed back into sampling. For on-demand background previews, set
+`request.preview_control = Some(control.clone())` using a fresh
+`PreviewControl::default()`, leave `preview_every` unset, and call
+`control.request_preview()` from your UI. It returns false when inactive or a
+preview is already pending. Manual mode copies a small clean-latent snapshot to
+CPU memory after each completed step (about 2 MiB at 2048×2048); only requested
+snapshots are decoded. Callbacks still run on the inference thread. The decoder
+uses a separate Metal device/queue and shares one cache across automatic previews,
+manual previews, and final decoding. Keep callbacks short, and bound or
 coalesce queued previews so the UI doesn't retain every full-resolution buffer.
 
 Clone `CancellationToken` for a Cancel button, and create a fresh token for each
 request. Cancellation is cooperative between model layers/stages; it cannot
-interrupt a running GPU operation, VAE encode/decode, download, or callback.
+preempt GPU operations, downloads, or callbacks. A background decode already in
+flight may finish after cancellation, but its result is discarded. Dropping or
+unloading the generator waits for its decoder worker to exit.
 Use `error.is::<img_gen::Cancelled>()` to distinguish it from inference failure.
-`Generator` accepts sequential requests and releases model tensors between stages
-and requests to limit memory; it does not retain a permanently loaded checkpoint.
-It does keep the latest request's encoder output, and each reference's vision
-features and VAE latents, in CPU memory. Reusing the same `Generator` with an
+`Generator` accepts sequential requests and keeps its Metal device and loaded
+denoiser/VAE weight tensors between requests. VAE previews reuse the same decoder
+weights instead of loading them again on every step. Weights load lazily on first
+use; text/vision encoder weights are still released after encoding. Denoiser
+prefix attention and rotary state are rebuilt for each request, including after
+cancellation. `DenoiserLoading` progress therefore also appears on warm runs.
+Resident weights use approximately 14.2 GiB for the denoiser and VAE decoder
+(about 0.3 GiB more after reference encoding), plus working memory. Drop the
+generator or call `Generator::unload_models()` to release its GPU resources.
+Unloading preserves the latest request's encoder output, and each reference's
+vision features and VAE latents, in CPU memory. Reusing the same `Generator` with an
 unchanged prompt and references (a new seed, step count, or size) skips the
 text/vision encoders and reference encoding. Changing only the prompt still reuses
 the per-reference results. Cached results are bit-identical to recomputing them.
 Stages served from the cache emit no `Progress` events.
+
+## HTTP service
+
+Run a persistent generation service with the CLI:
+
+```sh
+cargo build --release --bin qwen-imager-cli
+./target/release/qwen-imager-cli --serve --offline --listen 127.0.0.1:6996
+```
+
+Submit JSON prompts to `POST /jobs`, poll `GET /jobs/{id}`, request a background
+preview with `POST /jobs/{id}/preview`, and retrieve preview/final PNGs with
+`GET /jobs/{id}/preview` and `GET /jobs/{id}/image`. Jobs run sequentially and
+reuse loaded models; HTTP stays responsive during inference. Manual previews
+are the default. The bounded queue supports cancellation and explicit cleanup.
+See the [HTTP API reference](docs/http-api.md) for parameters, curl examples,
+remote access, and lifecycle details.
 
 ## CLI
 
@@ -173,7 +219,7 @@ The first run downloads the original Hugging Face checkpoint. Existing Python
 downloads in `~/.cache/huggingface/hub` are reused. `HF_HOME` and `HF_HUB_CACHE`
 are respected. `--offline` forbids downloads; `--model-dir PATH` loads an
 existing Diffusers snapshot with `processor/`, `text_encoder/`, `transformer/`,
-and `vae/` subdirectories. Keep its files unchanged while inference runs.
+and `vae/` subdirectories. Keep its files unchanged while the generator exists.
 The checkpoint revision is pinned in `src/weights.rs`.
 
 Defaults: native 2K size, 40 steps, seed 42, `out.png`. Without `-r`, editing
@@ -182,6 +228,33 @@ multiples of 32; reference images are resized to approximately 1 megapixel.
 `--scale` accepts values greater than zero and at most one. Output is PNG only.
 Seeds are reproducible within this implementation, but do not match PyTorch's
 random-number generator or guarantee identical results across GPU/library versions.
+
+Experimental shared noise is available in the CLI with `--noise-source-size 2048`.
+For a square 512px output (`--scale 0.25`), it generates exactly the same initial
+128×128×64 FP32 noise as a native 2048px run with that seed, then pools each 4×4
+block per channel, dividing its sum by 4 to preserve unit variance. Only the
+initial noise changes; the output-resolution sampling schedule stays unchanged.
+The source size must be an integer multiple of the square output size. Omit the
+flag for the original noise sequence. This is an experiment in composition
+consistency, not a guarantee of matching images across resolutions.
+
+`--metrics PATH.json` writes the prompt, seed, dimensions, checkpoint revision,
+generation time, and precise stage/step timestamps. To reproduce the six-image
+comparison with macOS RAM and disk-I/O sampling (200ms intervals):
+
+```sh
+cargo build --release --bin qwen-imager-cli
+python3 scripts/benchmark-noise.py --output output/my-noise-comparison \
+  --prompt 'a clown at the circus, with a red teapot, and a dog on a bike' \
+  --seeds 42 12345 --steps 8
+```
+
+Each image runs in a fresh process, with previews off and locally cached weights.
+The OS file cache is not flushed. Compare sampling time separately from setup
+and final decoding; two seeds do not constitute a statistical speed benchmark.
+The script preserves PNGs, timing JSON, memory samples, process logs, and a
+summary CSV/JSON. Peak physical footprint comes from macOS's lifetime peak
+counter; RSS is a sampled peak and can include mapped checkpoint pages.
 
 For transparency, use the model's prompt convention:
 
@@ -192,9 +265,9 @@ For transparency, use the model's prompt convention:
 The implementation contains only the Qwen3-VL encoder, Qwen 2.1 single-stream
 DiT, its RGBA VAE, and the fixed flow-matching Euler schedule. There is no device
 selection, CPU/CUDA inference mode, model selection, video, LoRA, training,
-batch generation, or prompt rewriting. Encoder layers load as needed; its
-weights are released before the denoiser runs, and the denoiser is released
-before final decoding. Optional previews decode while the denoiser is resident.
+batch generation, or prompt rewriting. Encoder layers load as needed; their
+weights are released after encoding. Denoiser and VAE weights remain cached
+across previews and generations until the generator is dropped or unloaded.
 Attention runs in float32 for numerical stability; weights
 and other activations use BF16. Prefix keys/values are cached. Large VAE convolutions run in
 rows with exact overlap to bound temporary buffers.
@@ -212,7 +285,11 @@ cargo test -- --ignored --test-threads=1
 The Metal tests compare attention (including a captured Qwen regression case)
 against a dense CPU reference and the VAE
 against fixed Diffusers outputs. An end-to-end Metal test checks ordered progress,
-encoder cancellation, and identical final pixels with previews enabled/disabled.
+encoder/prefix cancellation, model unloading, and identical final pixels with
+previews enabled/disabled. Warm runs are compared with fresh generators after
+prompt, reference, seed, and size changes. Manual-preview tests verify snapshot
+selection while sampling advances, coalesced clicks, cancelled-session isolation,
+and identical pixels with concurrent Metal decoding.
 The default tests also check validation and cancellation without GPU access.
 Download tests check complete/partial local snapshots and resumed byte counts;
 an ignored loopback HTTP test verifies real file transfer progress without

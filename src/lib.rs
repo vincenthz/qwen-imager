@@ -8,8 +8,10 @@
 compile_error!("img-gen requires an Apple Silicon Mac with Metal.");
 
 mod dit;
+mod noise;
 mod ops;
 mod pipeline;
+mod preview;
 mod text;
 mod vae;
 mod vision;
@@ -27,13 +29,14 @@ use std::{
 
 pub use anyhow::Result;
 pub use image::RgbaImage;
+pub use preview::PreviewControl;
 pub use weights::{MODEL, REVISION};
 
 /// Checkpoint location and download policy. GPU resources are allocated by `generate`.
 #[derive(Clone, Debug, Default)]
 pub struct ModelOptions {
     /// Original Diffusers snapshot directory, or the Hugging Face cache when absent.
-    /// Keep checkpoint files unchanged for the duration of inference (they are mapped).
+    /// Keep checkpoint files unchanged while the generator exists (they are mapped).
     pub model_dir: Option<PathBuf>,
     pub offline: bool,
 }
@@ -59,9 +62,16 @@ pub struct Request {
     pub scale: f64,
     pub steps: usize,
     pub seed: u64,
+    /// Experimental shared noise: generate at this square pixel size, then use
+    /// non-overlapping, variance-preserving pooling to the output latent grid.
+    /// Requires square output whose side divides this size. None uses native noise.
+    pub noise_source_size: Option<u32>,
     /// Decode an estimated clean image every N steps, plus the final image.
     /// Disabled by default. Full-resolution previews add decoding time and memory.
     pub preview_every: Option<NonZeroUsize>,
+    /// On-demand background previews. Clone the control for a UI Preview button.
+    /// Use a fresh control for each request; cannot combine with `preview_every`.
+    pub preview_control: Option<PreviewControl>,
 }
 
 impl Request {
@@ -73,7 +83,9 @@ impl Request {
             scale: 1.0,
             steps: 40,
             seed: 42,
+            noise_source_size: None,
             preview_every: None,
+            preview_control: None,
         }
     }
 
@@ -92,6 +104,7 @@ pub enum Stage {
     },
     TextEncoding,
     ReferenceEncoding,
+    /// Loads weights on first use and prepares request-specific conditioning on every run.
     DenoiserLoading,
     Decoding,
 }
@@ -117,6 +130,7 @@ pub enum Event {
         duration: Duration,
     },
     /// Early previews are estimated clean images, not the noisy current latent.
+    /// Manual previews may arrive after later steps finish; `step` is the snapshot's step.
     /// The final preview is identical to `Generation::image`.
     Preview {
         step: usize,
@@ -135,8 +149,9 @@ pub struct Generation {
 }
 
 /// Cooperative cancellation. Clone for the UI; create a fresh token per request.
-/// Checked between model layers/stages. An in-flight GPU operation, VAE decode,
-/// or file download must finish before cancellation can be observed.
+/// Checked between model layers/stages. GPU operations and downloads cannot be
+/// preempted. An in-flight background decode may finish after cancellation, but
+/// its result is discarded; unloading the generator waits for its worker to exit.
 #[derive(Clone, Debug, Default)]
 pub struct CancellationToken(Arc<AtomicBool>);
 
@@ -166,8 +181,9 @@ impl std::fmt::Display for Cancelled {
 }
 impl std::error::Error for Cancelled {}
 
-/// Reusable configuration for sequential requests. Model tensors are released
-/// between stages/requests to limit memory; this is not a permanently loaded model.
+/// Reusable generator for sequential requests. The Metal device and loaded
+/// denoiser/VAE weights persist between requests. Drop it or call `unload_models`
+/// to release them. Attention state is rebuilt for each request.
 /// Encoder results for the latest prompt and references are cached in CPU memory,
 /// so reusing one generator for a new seed, step count, or size skips re-encoding.
 pub struct Generator {
@@ -181,6 +197,12 @@ impl Generator {
             weights: weights::Weights::new(options.model_dir, options.offline),
             cache: pipeline::Cache::default(),
         }
+    }
+
+    /// Release cached model weights and the Metal device, retaining CPU encoder
+    /// results. The next generation reloads weights lazily. Also safe after cancellation.
+    pub fn unload_models(&mut self) {
+        self.cache.unload_models();
     }
 
     /// Ensure all required checkpoint files are local, without allocating GPU
@@ -207,6 +229,7 @@ impl Generator {
         let mut observer = Observer {
             cancellation,
             callback: &mut on_event,
+            previews: None,
         };
         cancellation.check()?;
         let start = Instant::now();
@@ -220,9 +243,19 @@ impl Generator {
 pub(crate) struct Observer<'a> {
     cancellation: &'a CancellationToken,
     callback: &'a mut dyn FnMut(Event),
+    previews: Option<preview::PreviewSession>,
 }
 
 impl Observer<'_> {
+    fn poll_previews(&mut self) -> Result<()> {
+        self.check()?;
+        if let Some(previews) = &mut self.previews {
+            while let Some(event) = previews.poll()? {
+                (self.callback)(event);
+            }
+        }
+        self.check()
+    }
     fn check(&self) -> Result<()> {
         self.cancellation.check()
     }

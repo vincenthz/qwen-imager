@@ -1,13 +1,14 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
 use crate::{CancellationToken, DownloadProgress};
 use anyhow::{Context, Result, ensure};
-use candle_core::{DType, Device};
-use candle_nn::VarBuilder;
+use candle_core::{DType, Device, Shape, Tensor};
+use candle_nn::{VarBuilder, var_builder::SimpleBackend};
 use hf_hub::{
     Cache, Repo, RepoType,
     api::{Progress, sync::ApiBuilder},
@@ -18,6 +19,73 @@ pub const MODEL: &str = "Qwen/Qwen-Image-2.1";
 // Matches the checkpoint used by the original Python CLI. Pin architecture and weights together.
 pub const REVISION: &str = "790c92633540aa0cb11d9abf19eb46d861714758";
 
+/// Memoize actual device tensors, not just the file mappings. Builder clones
+/// share this cache; request-local layers can be dropped without reloading weights.
+pub fn cached_builder(source: VarBuilder<'static>) -> VarBuilder<'static> {
+    let dtype = source.dtype();
+    let device = source.device().clone();
+    VarBuilder::from_backend(
+        Box::new(CachedWeights {
+            source,
+            tensors: Mutex::new(HashMap::new()),
+        }),
+        dtype,
+        device,
+    )
+}
+
+struct CachedWeights {
+    source: VarBuilder<'static>,
+    tensors: Mutex<HashMap<String, Tensor>>,
+}
+
+impl SimpleBackend for CachedWeights {
+    fn get(
+        &self,
+        shape: Shape,
+        name: &str,
+        _: candle_nn::Init,
+        dtype: DType,
+        device: &Device,
+    ) -> candle_core::Result<Tensor> {
+        let tensor = self.get_unchecked(name, dtype, device)?;
+        if tensor.shape() != &shape {
+            candle_core::bail!(
+                "cached weight {name}: expected {shape:?}, got {:?}",
+                tensor.shape()
+            );
+        }
+        Ok(tensor)
+    }
+
+    fn get_unchecked(
+        &self,
+        name: &str,
+        dtype: DType,
+        device: &Device,
+    ) -> candle_core::Result<Tensor> {
+        // A cache belongs to one model's device/dtype for its entire lifetime.
+        if dtype != self.source.dtype() || !device.same_device(self.source.device()) {
+            candle_core::bail!("cached weights require their original device and dtype");
+        }
+        let mut tensors = self
+            .tensors
+            .lock()
+            .map_err(|_| candle_core::Error::Msg("weight cache lock poisoned".into()))?;
+        if let Some(tensor) = tensors.get(name) {
+            return Ok(tensor.clone());
+        }
+        let tensor = self.source.get_unchecked(name)?;
+        tensors.insert(name.to_owned(), tensor.clone());
+        Ok(tensor)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        self.source.contains_tensor(name)
+    }
+}
+
+#[derive(Clone)]
 pub struct Weights {
     local: Option<PathBuf>,
     offline: bool,
@@ -208,6 +276,67 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_weights_reuse_device_tensors_and_validate_requests() -> Result<()> {
+        // The source creates a fresh tensor on every read. Identity and read
+        // counts prove that reconstructed layers reuse the same device storage.
+        let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Source(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl SimpleBackend for Source {
+            fn get(
+                &self,
+                _: Shape,
+                name: &str,
+                _: candle_nn::Init,
+                dtype: DType,
+                dev: &Device,
+            ) -> candle_core::Result<Tensor> {
+                self.get_unchecked(name, dtype, dev)
+            }
+            fn get_unchecked(
+                &self,
+                name: &str,
+                dtype: DType,
+                dev: &Device,
+            ) -> candle_core::Result<Tensor> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if name == "missing" {
+                    candle_core::bail!("missing tensor");
+                }
+                Tensor::zeros(2, dtype, dev)
+            }
+            fn contains_tensor(&self, name: &str) -> bool {
+                name != "missing"
+            }
+        }
+        let cached = cached_builder(VarBuilder::from_backend(
+            Box::new(Source(loads.clone())),
+            DType::F32,
+            Device::Cpu,
+        ));
+        let first = cached.pp("decoder").get(2, "weight")?;
+        let id = first.id();
+        drop(first);
+        assert_eq!(cached.clone().pp("decoder").get(2, "weight")?.id(), id);
+        assert!(cached.pp("decoder").get(3, "weight").is_err());
+        assert!(
+            cached
+                .to_dtype(DType::BF16)
+                .pp("decoder")
+                .get(2, "weight")
+                .is_err()
+        );
+        assert_eq!(loads.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(cached.contains_tensor("decoder.weight"));
+        assert!(!cached.contains_tensor("missing"));
+        assert!(cached.get(2, "missing").is_err());
+        assert!(cached.get(2, "missing").is_err());
+        assert_eq!(loads.load(std::sync::atomic::Ordering::Relaxed), 3);
+        assert_ne!(cached.pp("encoder").get(2, "weight")?.id(), id);
+        assert_eq!(loads.load(std::sync::atomic::Ordering::Relaxed), 4);
+        Ok(())
+    }
 
     // Tests own their directories; never alter the user's model cache.
     struct TempDir(PathBuf);

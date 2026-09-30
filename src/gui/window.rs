@@ -25,7 +25,7 @@ use gpui_component::{
 };
 use qwen_imager::{
     CancellationToken, Cancelled, DownloadProgress, Event, Generation, Generator, ModelOptions,
-    Request, RgbaImage, Stage,
+    PreviewControl, Request, RgbaImage, Stage,
 };
 
 const MAX_REFERENCES: usize = 10;
@@ -145,6 +145,10 @@ pub struct ImageWindow {
     size: Entity<InputState>,
     seed: Entity<InputState>,
     automatic_seed: bool,
+    automatic_previews: bool,
+    preview_control: Option<PreviewControl>,
+    preview_pending: bool,
+    preview_step: Option<usize>,
     busy: bool,
     ready: bool,
     checking_model: bool,
@@ -206,6 +210,10 @@ impl ImageWindow {
             size,
             seed,
             automatic_seed: true,
+            automatic_previews: true,
+            preview_control: None,
+            preview_pending: false,
+            preview_step: None,
             busy: false,
             ready: false,
             checking_model: true,
@@ -303,7 +311,11 @@ impl ImageWindow {
             };
             request.seed = seed;
         }
-        request.preview_every = NonZeroUsize::new(1);
+        if self.automatic_previews {
+            request.preview_every = NonZeroUsize::new(1);
+        } else {
+            request.preview_control = Some(PreviewControl::default());
+        }
         if let Err(error) = request.dimensions() {
             self.status = error.to_string();
             cx.notify();
@@ -313,6 +325,9 @@ impl ImageWindow {
             request.seed = self.randomize_seed(window, cx);
         }
         self.busy = true;
+        self.preview_control = request.preview_control.clone();
+        self.preview_pending = false;
+        self.preview_step = None;
         self.progress = 0.;
         self.status = "Preparing generation…".into();
         self.timing = Some(GenerationTiming::new(request.steps));
@@ -360,6 +375,20 @@ impl ImageWindow {
             let _ = sender.send_blocking(Message::Complete(result));
         });
         cx.notify();
+    }
+
+    fn request_preview(&mut self, cx: &mut Context<Self>) {
+        if self.busy
+            && !self.cancellation.is_cancelled()
+            && !self.preview_pending
+            && self
+                .preview_control
+                .as_ref()
+                .is_some_and(PreviewControl::request_preview)
+        {
+            self.preview_pending = true;
+            cx.notify();
+        }
     }
 
     fn load_image(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -656,6 +685,10 @@ impl ImageWindow {
                     completed,
                     total,
                 } => {
+                    if stage == Stage::Decoding {
+                        self.preview_control = None;
+                        self.preview_pending = false;
+                    }
                     if stage == Stage::DenoiserLoading
                         && completed == total
                         && let Some(timing) = &mut self.timing
@@ -676,19 +709,32 @@ impl ImageWindow {
                 }
                 Event::StepFinished { step, total, .. } => {
                     self.progress = step as f32 / total as f32;
-                    self.status = format!("Step {step}/{total} — decoding preview…");
+                    self.status = if self.automatic_previews {
+                        format!("Step {step}/{total} — decoding preview…")
+                    } else {
+                        if let Some(timing) = &mut self.timing {
+                            timing.complete_step(step);
+                        }
+                        format!("Step {step}/{total}")
+                    };
                 }
                 Event::Preview { step, total, image } => {
                     self.set_image(image, window);
-                    if let Some(timing) = &mut self.timing {
-                        timing.complete_step(step);
+                    self.preview_pending = false;
+                    self.preview_step = Some(step);
+                    if self.automatic_previews {
+                        if let Some(timing) = &mut self.timing {
+                            timing.complete_step(step);
+                        }
+                        self.status = format!("Step {step}/{total}");
                     }
-                    self.status = format!("Step {step}/{total}");
                 }
                 _ => {}
             },
             Message::Complete(result) => {
                 self.busy = false;
+                self.preview_control = None;
+                self.preview_pending = false;
                 self.timing = None;
                 self.ticker = None;
                 match result {
@@ -707,6 +753,7 @@ impl ImageWindow {
     }
 
     fn clear_image(&mut self, window: &mut Window) {
+        self.preview_step = None;
         if let Some(old) = self.rendered.take() {
             let _ = window.drop_image(old);
         }
@@ -893,7 +940,22 @@ impl Render for ImageWindow {
                         } else { "Use this seed each generation. Click to switch to automatic random seeds." })
                         .disabled(self.busy)
                         .on_click(cx.listener(|view, _, window, cx| view.toggle_seed(window, cx))))
-                    .child(Input::new(&self.seed).w(px(200.)).disabled(self.busy || self.automatic_seed))))
+                    .child(Input::new(&self.seed).w(px(200.)).disabled(self.busy || self.automatic_seed)))
+                .child(div().flex().items_center().gap_2()
+                    .child(Button::new("preview-mode")
+                        .label(if self.automatic_previews { "Auto previews" } else { "Manual previews" })
+                        .selected(self.automatic_previews)
+                        .disabled(self.busy)
+                        .tooltip("Switch between a preview every step and previews only when requested")
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            if !view.busy { view.automatic_previews = !view.automatic_previews; cx.notify(); }
+                        })))
+                    .when(!self.automatic_previews, |row| row.child(
+                        Button::new("preview-now")
+                            .label(if self.preview_pending { "Preparing preview…" } else { "Preview" })
+                            .tooltip("Preview the latest completed step while generation continues")
+                            .disabled(!self.busy || self.preview_control.is_none() || self.preview_pending || self.cancellation.is_cancelled())
+                            .on_click(cx.listener(|view, _, _, cx| view.request_preview(cx)))))))
             .child(div().id("reference-images").flex().items_center().gap_2()
                 .flex_shrink_0().overflow_x_scroll().py_1()
                 .children(self.references.iter().enumerate().map(|(index, reference)| {
@@ -1040,7 +1102,13 @@ impl Render for ImageWindow {
                     .when(self.before.is_some() && self.painting.is_none(), |container| container.child(
                         div().absolute().top_2().left_2().px_2().py_1().rounded_md().text_xs()
                             .bg(rgb(0x15171b)).text_color(rgb(0xe4e7ec))
-                            .child(if self.showing_before { "Before" } else { "After" }))),
+                            .child(if self.showing_before { "Before" } else { "After" })))
+                    .when(!self.completed && self.painting.is_none() && self.rendered.is_some(), |container| {
+                        container.when_some(self.preview_step, |container, step| container.child(
+                            div().absolute().top_2().left_2().px_2().py_1().rounded_md().text_xs()
+                                .bg(rgb(0x15171b)).text_color(rgb(0xe4e7ec))
+                                .child(format!("Preview · step {step}"))))
+                    }),
             )
     }
 }
