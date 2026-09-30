@@ -69,6 +69,7 @@ fn ui_messages_and_inputs_can_cross_threads() {
     send::<CancellationToken>();
     send::<Generator>();
     send::<qwen_imager::PreviewControl>();
+    send::<qwen_imager::PauseControl>();
 }
 
 #[test]
@@ -132,6 +133,64 @@ fn manual_background_previews_preserve_pixels_and_do_not_leak_between_runs()
     })?;
     assert_eq!(previews, [request.steps]);
     assert_eq!(quiet.image.as_raw(), baseline.image.as_raw());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires cached Qwen Image 2.1 checkpoint and Metal GPU"]
+fn blocking_previews_and_pause_hold_sampling() -> qwen_imager::Result<()> {
+    use std::time::{Duration, Instant};
+    let mut request = Request::new("A red ceramic teapot on a wooden table.");
+    request.scale = 0.0625;
+    request.steps = 6;
+    let mut generator = generator();
+    let cancellation = CancellationToken::default();
+    let baseline = generator.generate(&request, &cancellation, |_| {})?;
+
+    let control = qwen_imager::PreviewControl::default();
+    let pause = qwen_imager::PauseControl::default();
+    request.preview_control = Some(control.clone());
+    request.pause = Some(pause.clone());
+    let mut order = Vec::new();
+    let mut resumed_at = None;
+    let mut worker = None;
+    let result = generator.generate(&request, &cancellation, |event| match event {
+        Event::StepFinished { step, .. } => {
+            order.push(format!("step {step}"));
+            if step == 2 {
+                assert!(control.request_blocking_preview());
+                assert!(!control.request_blocking_preview());
+            }
+            if step == 4 {
+                pause.pause();
+                resumed_at = Some(Instant::now());
+                let pause = pause.clone();
+                worker = Some(std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(300));
+                    pause.resume();
+                }));
+            }
+        }
+        Event::Preview { step, .. } => order.push(format!("preview {step}")),
+        _ => {}
+    })?;
+    worker.unwrap().join().unwrap();
+    assert!(resumed_at.unwrap().elapsed() >= Duration::from_millis(300));
+    // The step-2 preview arrives before sampling continues to step 3.
+    assert_eq!(
+        order,
+        [
+            "step 1",
+            "step 2",
+            "preview 2",
+            "step 3",
+            "step 4",
+            "step 5",
+            "step 6",
+            "preview 6"
+        ]
+    );
+    assert_eq!(result.image.as_raw(), baseline.image.as_raw());
     Ok(())
 }
 

@@ -9,7 +9,8 @@ use std::{
 };
 
 /// Thread-safe Preview button. Requests use the latest completed step, or wait
-/// for the first step if none has completed. At most one preview is outstanding.
+/// for the first step if none has completed. At most one preview is outstanding,
+/// except that a blocking request may queue behind a background decode.
 /// Create a fresh control for each generation and put a clone in `Request`.
 #[derive(Clone, Default)]
 pub struct PreviewControl(Arc<Mutex<Option<Active>>>);
@@ -28,6 +29,9 @@ struct Active {
     requested: bool,
     pending: Option<Snapshot>,
     busy: bool,
+    // The requested preview, or the one decoding, pauses sampling until it arrives.
+    blocking: bool,
+    busy_blocking: bool,
 }
 
 #[derive(Clone)]
@@ -67,6 +71,7 @@ impl Active {
                     self.requested = false;
                     self.pending = None;
                     self.busy = true;
+                    self.busy_blocking = std::mem::take(&mut self.blocking);
                 }
                 // A cancelled run's job can briefly occupy the queue. Retry on
                 // the next snapshot; never block the UI or accumulate snapshots.
@@ -77,6 +82,10 @@ impl Active {
             }
         }
         Ok(())
+    }
+
+    fn holds_sampling(&self) -> bool {
+        (self.requested && self.blocking) || (self.busy && self.busy_blocking)
     }
 }
 
@@ -93,6 +102,24 @@ impl PreviewControl {
         }
         active.requested = true;
         // The inference thread also checks dispatch errors when publishing.
+        let _ = active.dispatch();
+        true
+    }
+
+    /// Like `request_preview`, but sampling pauses after its current step until
+    /// this preview is decoded. Queues behind a background decode already in
+    /// progress (sampling then waits for both). Returns false when inactive or a
+    /// blocking preview is already outstanding.
+    pub fn request_blocking_preview(&self) -> bool {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(active) = state.as_mut() else {
+            return false;
+        };
+        if active.holds_sampling() {
+            return false;
+        }
+        active.requested = true;
+        active.blocking = true;
         let _ = active.dispatch();
         true
     }
@@ -114,25 +141,52 @@ impl PreviewSession {
 
     pub fn poll(&mut self) -> Result<Option<Event>> {
         match self.replies.try_recv() {
-            Ok(reply) => {
-                if let Some(active) = self
-                    .control
-                    .0
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .as_mut()
-                {
-                    active.busy = false;
-                }
-                Ok(Some(Event::Preview {
-                    step: reply.step,
-                    total: self.total,
-                    image: reply.image?,
-                }))
-            }
+            Ok(reply) => self.received(reply),
             Err(mpsc::TryRecvError::Empty) => Ok(None),
             Err(mpsc::TryRecvError::Disconnected) => anyhow::bail!("preview decoder disconnected"),
         }
+    }
+
+    /// True while a blocking preview is requested or decoding.
+    pub fn holds_sampling(&self) -> bool {
+        let mut state = self.control.0.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(active) = state.as_mut() else {
+            return false;
+        };
+        // Retry a dispatch that found the decoder queue briefly occupied.
+        let _ = active.dispatch();
+        active.holds_sampling()
+    }
+
+    /// Waits briefly for a decoded preview.
+    pub fn wait(&mut self, timeout: Duration) -> Result<Option<Event>> {
+        match self.replies.recv_timeout(timeout) {
+            Ok(reply) => self.received(reply),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("preview decoder disconnected")
+            }
+        }
+    }
+
+    fn received(&mut self, reply: Reply) -> Result<Option<Event>> {
+        if let Some(active) = self
+            .control
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            active.busy = false;
+            active.busy_blocking = false;
+            // A blocking request may be queued behind the decode that just finished.
+            active.dispatch()?;
+        }
+        Ok(Some(Event::Preview {
+            step: reply.step,
+            total: self.total,
+            image: reply.image?,
+        }))
     }
 }
 
@@ -217,6 +271,8 @@ impl DecoderWorker {
                 requested: false,
                 pending: None,
                 busy: false,
+                blocking: false,
+                busy_blocking: false,
             });
         }
         Ok(PreviewSession {
@@ -382,6 +438,44 @@ mod tests {
                 .get_pixel(0, 0)[0],
             10
         );
+        Ok(())
+    }
+
+    #[test]
+    fn blocking_previews_hold_sampling_and_queue_behind_background_decodes() -> Result<()> {
+        let (started, started_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let worker = DecoderWorker::spawn(move |snapshot| {
+            started.send(snapshot.step)?;
+            release_rx.recv_timeout(Duration::from_secs(5))?;
+            rendered(snapshot)
+        })?;
+        let control = PreviewControl::default();
+        assert!(!control.request_blocking_preview());
+        let mut session = worker.session(control.clone(), 10)?;
+        session.publish(snapshot(1))?;
+        assert!(control.request_preview()); // Background decode of step 1.
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(5))?, 1);
+        assert!(!session.holds_sampling());
+        session.publish(snapshot(2))?;
+        // A checkpoint queues behind the background decode and holds sampling.
+        assert!(control.request_blocking_preview());
+        assert!(!control.request_blocking_preview());
+        assert!(!control.request_preview());
+        assert!(session.holds_sampling());
+        release.send(())?;
+        assert!(matches!(
+            next(&mut session)?,
+            Event::Preview { step: 1, .. }
+        ));
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(5))?, 2);
+        assert!(session.holds_sampling());
+        release.send(())?;
+        assert!(matches!(
+            session.wait(Duration::from_secs(5))?,
+            Some(Event::Preview { step: 2, .. })
+        ));
+        assert!(!session.holds_sampling());
         Ok(())
     }
 

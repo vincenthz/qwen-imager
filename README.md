@@ -44,7 +44,8 @@ fully cached models open it directly. Download errors remain visible and you
 can retry with Download. The model is approximately 32 GB; `HF_HOME` and
 `HF_HUB_CACHE` work as they do in the CLI.
 
-The top bar contains **Workspace 1**, followed by any additional workspaces.
+The top bar starts with a **gear** icon that opens **Settings**, followed by
+**Workspace 1** and any additional workspaces.
 Click **+** to create and select a new workspace. Each workspace retains its own
 prompt, settings, reference images and drawings, preview, and finished result.
 Switching tabs keeps background generation running. A **bell** appears on a
@@ -59,19 +60,28 @@ Concurrent runs share GPU time and each needs its own working memory; starting
 more runs does not multiply GPU capacity. Workspaces live for the current app session;
 closing the app cancels their work. Save images you want to keep before quitting.
 
-Enter a prompt and click **Generate** to its right. **Steps** defaults to 20;
-the adjacent **Size (px)** field sets the square image's side length (default
-512, multiples of 32 from 32 to 2048). **Auto previews** (the default) decodes
-a preview after every step. Click that control before generating to switch to
-**Manual previews**, which automatically requests previews after step 5 and
-halfway through sampling (rounded up for odd step counts). Matching milestones
-produce one preview; the final step uses the normal final decode. If a preview
-is already being decoded, milestones are combined and retried with the latest
-completed snapshot when the decoder is free. You can also click **Preview**
-during generation to decode the latest fully completed step in
-the background while sampling continues. A click during model loading waits for
-the first completed step. Only one preview can be pending at a time; its image
-shows the source step number. The final image always appears automatically.
+Settings are saved in `~/Library/Application Support/QwenImager/settings.json`:
+
+- **Steps** and **Size (px)** for new workspaces (defaults 20 and 512). Idle
+  workspaces still showing the previous defaults adopt the new ones.
+- **Output directory**, where the Save dialog opens (default `~/Pictures`).
+- **Previews**: **Automatic** (the default) or **Manual**, and **Sequential**
+  (the default) or **Parallel** decoding. Changes apply from the next generation.
+
+Enter a prompt and click **Generate** to its right. **Steps** and the adjacent
+**Size (px)** field (the square image's side length, multiples of 32 from 32 to
+2048) start from the settings. Automatic previews decode a preview after every
+step. Sequential decoding pauses sampling for each decode; parallel decoding
+runs in the background while sampling continues, skipping steps while the
+decoder is busy. Manual previews automatically request previews after step 5 and
+halfway through sampling (rounded up for odd step counts); these two checkpoints
+always pause sampling until decoded, waiting for any background preview first.
+Matching milestones produce one preview; the final step uses the normal final
+decode. You can also click **Preview** during generation to decode the latest
+fully completed step: in parallel mode sampling continues, in sequential mode it
+pauses after the current step until the preview is ready. A click during model
+loading waits for the first completed step. Only one preview can be pending at a
+time; its image shows the source step number. The final image always appears automatically.
 A preview still running when sampling finishes is superseded by final decoding.
 The decoder has its own Metal queue and reuses its loaded weights; it shares GPU
 compute and memory bandwidth with sampling, so previews can still slow generation.
@@ -81,13 +91,16 @@ displays it in a greyed-out field. **Manual seed** accepts the full unsigned
 64-bit range (0–18446744073709551615), so you can edit or reuse any supported seed;
 the displayed seed remains available after generation for reproducing an image.
 The latest preview replaces the previous one. Generate becomes **Cancel** while
-working, stopping at the next safe boundary. The adjacent save icon (tooltip:
+working, stopping at the next safe boundary. The **pause** icon next to it pauses
+generation between model layers and becomes **resume**; a paused workspace keeps
+its GPU memory, and can still be cancelled. Paused time is excluded from the
+elapsed time and estimate. The adjacent save icon (tooltip:
 **Save PNG**) opens the native save dialog for the displayed image.
 Early previews are estimates and may look rough. Decoding every step adds time.
 The status row shows elapsed time and estimated time remaining, updating every
-second. In automatic mode, it extrapolates from the average time per
-completed step including preview decoding. Manual mode updates the estimate at
-each sampling step, even if no previews are requested. One-time model loading is included
+second. With automatic sequential previews, it extrapolates from the average time
+per completed step including preview decoding. Otherwise it updates the estimate
+at each sampling step, even if no previews are requested. One-time model loading is included
 in elapsed time but excluded from the per-step average. The estimate resets for
 each generation and clears when the run finishes or is cancelled.
 
@@ -192,7 +205,11 @@ Previews never feed back into sampling. For on-demand background previews, set
 `request.preview_control = Some(control.clone())` using a fresh
 `PreviewControl::default()`, leave `preview_every` unset, and call
 `control.request_preview()` from your UI. It returns false when inactive or a
-preview is already pending. Manual mode copies a small clean-latent snapshot to
+preview is already pending. `control.request_blocking_preview()` instead pauses
+sampling after its current step until that preview is decoded, queueing behind a
+background decode if one is running. Set `request.pause = Some(pause.clone())`
+with a `PauseControl` to pause and resume a generation cooperatively between
+model layers. Manual mode copies a small clean-latent snapshot to
 CPU memory after each completed step (about 2 MiB at 2048×2048); only requested
 snapshots are decoded. Callbacks still run on the inference thread. The decoder
 uses a separate Metal device/queue and shares one cache across automatic previews,

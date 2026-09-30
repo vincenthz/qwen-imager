@@ -2,6 +2,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{Root, Theme, ThemeMode};
 use std::borrow::Cow;
 
+mod settings;
 mod timing;
 mod window;
 mod workspaces;
@@ -16,22 +17,33 @@ impl AssetSource for Assets {
             "icons/save.svg" => Some(Cow::Borrowed(include_bytes!("assets/save.svg"))),
             "icons/image.svg" => Some(Cow::Borrowed(include_bytes!("assets/image.svg"))),
             "icons/bell.svg" => Some(Cow::Borrowed(include_bytes!("assets/bell.svg"))),
+            "icons/settings.svg" => Some(Cow::Borrowed(include_bytes!("assets/settings.svg"))),
+            "icons/pause.svg" => Some(Cow::Borrowed(include_bytes!("assets/pause.svg"))),
+            "icons/play.svg" => Some(Cow::Borrowed(include_bytes!("assets/play.svg"))),
             _ => None,
         })
     }
 
     fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
-        Ok(["icons/save.svg", "icons/image.svg", "icons/bell.svg"]
-            .into_iter()
-            .filter(|asset| asset.starts_with(path))
-            .map(Into::into)
-            .collect())
+        Ok([
+            "icons/save.svg",
+            "icons/image.svg",
+            "icons/bell.svg",
+            "icons/settings.svg",
+            "icons/pause.svg",
+            "icons/play.svg",
+        ]
+        .into_iter()
+        .filter(|asset| asset.starts_with(path))
+        .map(Into::into)
+        .collect())
     }
 }
 
 fn main() {
     Application::new().with_assets(Assets).run(|cx: &mut App| {
         gpui_component::init(cx);
+        cx.set_global(settings::Settings::load());
         Theme::change(ThemeMode::Dark, None, cx);
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.on_action(|_: &Quit, cx| cx.quit());

@@ -306,6 +306,10 @@ pub fn run(
             duration: step_start.elapsed(),
         })?;
         observer.check()?;
+        // The final decode supersedes a preview requested during the last step.
+        if i + 1 < args.steps {
+            observer.wait_previews()?;
+        }
         if args.preview_control.is_none()
             && let Some(clean) = preview
         {

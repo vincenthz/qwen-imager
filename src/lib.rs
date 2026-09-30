@@ -23,7 +23,7 @@ use std::{
     num::NonZeroUsize,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -74,6 +74,8 @@ pub struct Request {
     /// On-demand background previews. Clone the control for a UI Preview button.
     /// Use a fresh control for each request; cannot combine with `preview_every`.
     pub preview_control: Option<PreviewControl>,
+    /// Cooperative pause. Clone the control for a UI Pause button.
+    pub pause: Option<PauseControl>,
 }
 
 impl Request {
@@ -88,6 +90,7 @@ impl Request {
             noise_source_size: None,
             preview_every: None,
             preview_control: None,
+            pause: None,
         }
     }
 
@@ -170,6 +173,38 @@ impl CancellationToken {
         } else {
             Ok(())
         }
+    }
+}
+
+/// Cooperative pause, checked with cancellation between model layers and steps.
+/// Clone for the UI. A paused generation keeps its thread and GPU memory; it can
+/// still be cancelled. A background preview decode already started continues.
+#[derive(Clone, Debug, Default)]
+pub struct PauseControl(Arc<(Mutex<bool>, Condvar)>);
+
+impl PauseControl {
+    pub fn pause(&self) {
+        *self.0.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+    pub fn resume(&self) {
+        *self.0.0.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.0.1.notify_all();
+    }
+    pub fn is_paused(&self) -> bool {
+        *self.0.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn wait(&self, cancellation: &CancellationToken) -> Result<()> {
+        let (paused, resumed) = &*self.0;
+        let mut paused = paused.lock().unwrap_or_else(|e| e.into_inner());
+        while *paused {
+            cancellation.check()?;
+            // Cancellation does not notify; re-check it periodically.
+            paused = resumed
+                .wait_timeout(paused, Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        Ok(())
     }
 }
 
@@ -257,6 +292,7 @@ impl Generator {
     ) -> Result<Generation> {
         let mut observer = Observer {
             cancellation,
+            pause: request.pause.as_ref(),
             callback: &mut on_event,
             previews: None,
         };
@@ -271,6 +307,7 @@ impl Generator {
 
 pub(crate) struct Observer<'a> {
     cancellation: &'a CancellationToken,
+    pause: Option<&'a PauseControl>,
     callback: &'a mut dyn FnMut(Event),
     previews: Option<preview::PreviewSession>,
 }
@@ -285,8 +322,27 @@ impl Observer<'_> {
         }
         self.check()
     }
+    /// Emits blocking previews as they arrive, holding sampling until none remain.
+    fn wait_previews(&mut self) -> Result<()> {
+        while self
+            .previews
+            .as_ref()
+            .is_some_and(preview::PreviewSession::holds_sampling)
+        {
+            self.check()?;
+            let previews = self.previews.as_mut().unwrap();
+            if let Some(event) = previews.wait(Duration::from_millis(25))? {
+                (self.callback)(event);
+            }
+        }
+        self.check()
+    }
     fn check(&self) -> Result<()> {
-        self.cancellation.check()
+        self.cancellation.check()?;
+        if let Some(pause) = self.pause {
+            pause.wait(self.cancellation)?;
+        }
+        Ok(())
     }
     fn emit(&mut self, event: Event) -> Result<()> {
         self.check()?;
@@ -301,5 +357,30 @@ impl Observer<'_> {
             total,
         })?;
         self.check()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pause_blocks_until_resumed_or_cancelled() {
+        let pause = PauseControl::default();
+        let cancellation = CancellationToken::default();
+        assert!(pause.wait(&cancellation).is_ok());
+        pause.pause();
+        let resumer = pause.clone();
+        let started = Instant::now();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            resumer.resume();
+        });
+        assert!(pause.wait(&cancellation).is_ok());
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        worker.join().unwrap();
+        pause.pause();
+        cancellation.cancel();
+        assert!(pause.wait(&cancellation).unwrap_err().is::<Cancelled>());
     }
 }

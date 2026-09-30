@@ -3,11 +3,17 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use gpui::{Context, Entity, ScrollHandle, Subscription, Window, div, prelude::*, px, rgb};
+use gpui::{
+    Context, Entity, MouseButton, ScrollHandle, Subscription, Window, div, prelude::*, px, rgb,
+    rgba,
+};
 use gpui_component::{Icon, Selectable, button::Button};
 use qwen_imager::{ModelOptions, SharedModel};
 
-use crate::window::{ImageWindow, WorkspaceActivity};
+use crate::{
+    settings::{SettingsEvent, SettingsPanel},
+    window::{ImageWindow, WorkspaceActivity},
+};
 
 #[derive(Default)]
 struct TabActivity {
@@ -38,6 +44,7 @@ pub struct Workspaces {
     activity: TabActivity,
     tab_scroll: ScrollHandle,
     model: SharedModel,
+    settings: Option<(Entity<SettingsPanel>, Subscription)>,
 }
 
 impl Workspaces {
@@ -46,6 +53,7 @@ impl Workspaces {
             tabs: Vec::new(),
             activity: TabActivity::default(),
             tab_scroll: ScrollHandle::new(),
+            settings: None,
             model: SharedModel::new(ModelOptions {
                 offline: true,
                 ..Default::default()
@@ -70,6 +78,36 @@ impl Workspaces {
         self.select(index, window, cx);
     }
 
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            return;
+        }
+        // The hidden workspace inputs must not receive keyboard events.
+        window.blur();
+        let panel = cx.new(|cx| SettingsPanel::new(window, cx));
+        let subscription = cx.subscribe_in(&panel, window, |workspaces, _, event, window, cx| {
+            if let SettingsEvent::Saved(previous) = event {
+                for tab in &workspaces.tabs {
+                    tab.view
+                        .update(cx, |view, cx| view.apply_defaults(previous, window, cx));
+                }
+            }
+            workspaces.close_settings(window, cx);
+        });
+        self.settings = Some((panel, subscription));
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.take().is_some() {
+            window.blur();
+            self.tabs[self.activity.active]
+                .view
+                .update(cx, |view, cx| view.activate(window, cx));
+            cx.notify();
+        }
+    }
+
     fn select(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.tabs.len() {
             return;
@@ -92,6 +130,7 @@ impl Render for Workspaces {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(rgb(0x15171b))
@@ -106,6 +145,20 @@ impl Render for Workspaces {
                     .flex_shrink_0()
                     .border_b_1()
                     .border_color(rgb(0x303640))
+                    .child(
+                        Button::new("settings")
+                            .flex_shrink_0()
+                            .icon(Icon::default().path("icons/settings.svg"))
+                            .selected(self.settings.is_some())
+                            .tooltip("Settings")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                if view.settings.is_some() {
+                                    view.close_settings(window, cx);
+                                } else {
+                                    view.open_settings(window, cx);
+                                }
+                            })),
+                    )
                     .child(
                         div()
                             .id("workspace-tabs")
@@ -152,6 +205,33 @@ impl Render for Workspaces {
                     .w_full()
                     .child(self.tabs[self.activity.active].view.clone()),
             )
+            .when_some(self.settings.as_ref(), |root, (panel, _)| {
+                // Below the tab bar so the gear stays clickable; clicking outside closes.
+                root.child(
+                    div()
+                        .id("settings-backdrop")
+                        .absolute()
+                        .top(px(48.))
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .p_3()
+                        .bg(rgba(0x0000_0080))
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|view, _, window, cx| view.close_settings(window, cx)),
+                        )
+                        .child(
+                            div()
+                                .id("settings-panel")
+                                .max_h_full()
+                                .overflow_y_scroll()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(panel.clone()),
+                        ),
+                )
+            })
     }
 }
 

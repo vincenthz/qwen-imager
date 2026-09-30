@@ -10,7 +10,10 @@ use std::{
 
 use anyhow::Context as _;
 
-use crate::timing::{GenerationTiming, format_duration};
+use crate::{
+    settings::{Settings, digits_input, parse_size, parse_steps},
+    timing::{GenerationTiming, format_duration},
+};
 
 use gpui::{
     Bounds, Context, CursorStyle, DevicePixels, Entity, MouseButton, MouseDownEvent,
@@ -24,10 +27,11 @@ use gpui_component::{
 };
 use qwen_imager::{
     CancellationToken, Cancelled, DownloadProgress, Event, Generation, Generator, ModelOptions,
-    PreviewControl, Request, RgbaImage, Stage,
+    PauseControl, PreviewControl, Request, RgbaImage, Stage,
 };
 
 const MAX_REFERENCES: usize = 10;
+const DECODING_PREVIEW: &str = " — decoding preview…";
 
 /// A newly available image or a completed generation, for the workspace tab.
 pub struct WorkspaceActivity;
@@ -57,6 +61,27 @@ impl ManualPreviewSchedule {
         // Coalesce milestones while a decode is busy. Retry with the latest
         // completed snapshot as soon as the decoder becomes available.
         self.due_step.is_some() && request()
+    }
+}
+
+/// Preview settings captured when a generation starts.
+#[derive(Clone, Copy)]
+struct PreviewMode {
+    automatic: bool,
+    sequential: bool,
+}
+
+impl PreviewMode {
+    fn from_settings(settings: &Settings) -> Self {
+        Self {
+            automatic: settings.automatic_previews,
+            sequential: settings.sequential_previews,
+        }
+    }
+
+    /// Every step decodes its preview before sampling continues.
+    fn inline(self) -> bool {
+        self.automatic && self.sequential
     }
 }
 
@@ -167,8 +192,10 @@ pub struct ImageWindow {
     size: Entity<InputState>,
     seed: Entity<InputState>,
     automatic_seed: bool,
-    automatic_previews: bool,
+    previews: PreviewMode,
     preview_control: Option<PreviewControl>,
+    pause: Option<PauseControl>,
+    paused: bool,
     preview_pending: bool,
     preview_step: Option<usize>,
     busy: bool,
@@ -217,20 +244,11 @@ impl ImageWindow {
                 .rows(3)
                 .placeholder("Describe the image or the changes you want…")
         });
-        let steps = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value("20")
-                .validate(|text, _| text.bytes().all(|c| c.is_ascii_digit()))
-        });
-        let size = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value("512")
-                .validate(|text, _| text.bytes().all(|c| c.is_ascii_digit()))
-        });
+        let settings = cx.global::<Settings>().clone();
+        let steps = cx.new(|cx| digits_input(window, cx, settings.steps.to_string()));
+        let size = cx.new(|cx| digits_input(window, cx, settings.size.to_string()));
         let seed = cx.new(|cx| {
-            InputState::new(window, cx)
-                .default_value(rand::random_range(0..(1_u64 << 30)).to_string())
-                .validate(|text, _| text.bytes().all(|c| c.is_ascii_digit()))
+            digits_input(window, cx, rand::random_range(0..(1_u64 << 30)).to_string())
         });
         let mut view = Self {
             prompt,
@@ -238,8 +256,10 @@ impl ImageWindow {
             size,
             seed,
             automatic_seed: true,
-            automatic_previews: true,
+            previews: PreviewMode::from_settings(&settings),
             preview_control: None,
+            pause: None,
+            paused: false,
             preview_pending: false,
             preview_step: None,
             busy: false,
@@ -286,6 +306,29 @@ impl ImageWindow {
         self.drawing = false;
     }
 
+    /// Adopts new default steps and size where the old defaults are unchanged.
+    pub fn apply_defaults(
+        &mut self,
+        previous: &Settings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy {
+            cx.notify();
+            return;
+        }
+        let settings = cx.global::<Settings>().clone();
+        for (input, old, new) in [
+            (&self.steps, previous.steps.to_string(), settings.steps.to_string()),
+            (&self.size, previous.size.to_string(), settings.size.to_string()),
+        ] {
+            if input.read(cx).value().as_ref() == old.as_str() {
+                input.update(cx, |input, cx| input.set_value(new, window, cx));
+            }
+        }
+        cx.notify();
+    }
+
     fn check_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.busy = true;
         let cancellation = self.cancellation.clone();
@@ -329,22 +372,25 @@ impl ImageWindow {
             return;
         }
         let mut request = Request::new(self.prompt.read(cx).value().to_string());
-        let size = self.size.read(cx).value().parse::<u32>().ok();
-        let Some(size) = size.filter(|size| (32..=2048).contains(size) && size % 32 == 0) else {
-            self.status =
-                "Size must be a multiple of 32 between 32 and 2048 pixels (square image).".into();
-            cx.notify();
-            return;
+        let size = match parse_size(&self.size.read(cx).value()) {
+            Ok(size) => size,
+            Err(error) => {
+                self.status = error.into();
+                cx.notify();
+                return;
+            }
         };
         request.scale = f64::from(size) / 2048.;
         // Keep the Size control's square output dimensions when editing a reference.
         request.ratio = Some("1:1".into());
-        let Ok(steps) = self.steps.read(cx).value().parse::<usize>() else {
-            self.status = "Enter a positive whole number of steps.".into();
-            cx.notify();
-            return;
+        request.steps = match parse_steps(&self.steps.read(cx).value()) {
+            Ok(steps) => steps,
+            Err(error) => {
+                self.status = error.into();
+                cx.notify();
+                return;
+            }
         };
-        request.steps = steps;
         if !self.automatic_seed {
             let Ok(seed) = self.seed.read(cx).value().parse::<u64>() else {
                 self.status = "Enter a seed from 0 to 18446744073709551615.".into();
@@ -353,11 +399,13 @@ impl ImageWindow {
             };
             request.seed = seed;
         }
-        if self.automatic_previews {
+        let previews = PreviewMode::from_settings(cx.global::<Settings>());
+        if previews.inline() {
             request.preview_every = NonZeroUsize::new(1);
         } else {
             request.preview_control = Some(PreviewControl::default());
         }
+        request.pause = Some(PauseControl::default());
         if let Err(error) = request.dimensions() {
             self.status = error.to_string();
             cx.notify();
@@ -367,7 +415,10 @@ impl ImageWindow {
             request.seed = self.randomize_seed(window, cx);
         }
         self.busy = true;
+        self.previews = previews;
         self.preview_control = request.preview_control.clone();
+        self.pause = request.pause.clone();
+        self.paused = false;
         self.preview_pending = false;
         self.preview_step = None;
         self.progress = 0.;
@@ -412,7 +463,20 @@ impl ImageWindow {
                 generator.generate(&request, &cancellation, |event| {
                     let requested = !cancellation.is_cancelled()
                         && request.preview_control.as_ref().is_some_and(|control| {
-                            preview_schedule.on_event(&event, || control.request_preview())
+                            if previews.automatic {
+                                // Parallel automatic previews decode the latest step
+                                // whenever the decoder is idle, skipping steps otherwise.
+                                if let Event::StepFinished { step, total, .. } = event
+                                    && step < total
+                                {
+                                    control.request_preview();
+                                }
+                                false
+                            } else {
+                                // Manual checkpoints always pause sampling until decoded.
+                                preview_schedule
+                                    .on_event(&event, || control.request_blocking_preview())
+                            }
                         });
                     if sender.send_blocking(Message::Inference(event)).is_err()
                         || (requested && sender.send_blocking(Message::PreviewRequested).is_err())
@@ -430,10 +494,13 @@ impl ImageWindow {
         if self.busy
             && !self.cancellation.is_cancelled()
             && !self.preview_pending
-            && self
-                .preview_control
-                .as_ref()
-                .is_some_and(PreviewControl::request_preview)
+            && self.preview_control.as_ref().is_some_and(|control| {
+                if self.previews.sequential {
+                    control.request_blocking_preview()
+                } else {
+                    control.request_preview()
+                }
+            })
         {
             self.preview_pending = true;
             cx.notify();
@@ -703,7 +770,13 @@ impl ImageWindow {
             Message::Inference(Event::Preview { .. }) | Message::Complete(_)
         );
         match message {
-            Message::PreviewRequested => self.preview_pending = true,
+            Message::PreviewRequested => {
+                self.preview_pending = true;
+                // Checkpoint previews pause sampling while they decode.
+                if !self.status.ends_with(DECODING_PREVIEW) {
+                    self.status.push_str(DECODING_PREVIEW);
+                }
+            }
             Message::Checked(result) => {
                 self.checking_model = false;
                 self.busy = false;
@@ -741,7 +814,9 @@ impl ImageWindow {
             }
             Message::Inference(event) => match event {
                 Event::Started { steps, .. } => {
-                    self.timing = Some(GenerationTiming::new(steps));
+                    let mut timing = GenerationTiming::new(steps);
+                    timing.set_paused(self.paused);
+                    self.timing = Some(timing);
                 }
                 Event::Progress {
                     stage,
@@ -772,30 +847,38 @@ impl ImageWindow {
                 }
                 Event::StepFinished { step, total, .. } => {
                     self.progress = step as f32 / total as f32;
-                    self.status = if self.automatic_previews {
-                        format!("Step {step}/{total} — decoding preview…")
-                    } else {
-                        if let Some(timing) = &mut self.timing {
-                            timing.complete_step(step);
-                        }
-                        format!("Step {step}/{total}")
-                    };
+                    if !self.previews.inline()
+                        && let Some(timing) = &mut self.timing
+                    {
+                        timing.complete_step(step);
+                    }
+                    let decoding = step < total
+                        && (self.previews.inline()
+                            || (self.preview_pending && self.previews.sequential));
+                    self.status = format!(
+                        "Step {step}/{total}{}",
+                        if decoding { DECODING_PREVIEW } else { "" }
+                    );
                 }
                 Event::Preview { step, total, image } => {
                     self.set_image(image, window);
                     self.preview_pending = false;
                     self.preview_step = Some(step);
-                    if self.automatic_previews {
+                    if self.previews.inline() {
                         if let Some(timing) = &mut self.timing {
                             timing.complete_step(step);
                         }
                         self.status = format!("Step {step}/{total}");
+                    } else if let Some(status) = self.status.strip_suffix(DECODING_PREVIEW) {
+                        self.status = status.into();
                     }
                 }
                 _ => {}
             },
             Message::Complete(result) => {
                 self.busy = false;
+                self.pause = None;
+                self.paused = false;
                 self.preview_control = None;
                 self.preview_pending = false;
                 self.timing = None;
@@ -860,6 +943,10 @@ impl ImageWindow {
             return;
         }
         self.cancellation.cancel();
+        if let Some(pause) = &self.pause {
+            pause.resume();
+        }
+        self.paused = false;
         self.timing = None;
         self.ticker = None;
         self.status = if self.ready {
@@ -871,11 +958,30 @@ impl ImageWindow {
         cx.notify();
     }
 
+    fn toggle_pause(&mut self, cx: &mut Context<Self>) {
+        let Some(pause) = &self.pause else {
+            return;
+        };
+        if self.cancellation.is_cancelled() {
+            return;
+        }
+        self.paused = !self.paused;
+        if self.paused {
+            pause.pause();
+        } else {
+            pause.resume();
+        }
+        if let Some(timing) = &mut self.timing {
+            timing.set_paused(self.paused);
+        }
+        cx.notify();
+    }
+
     fn save(&mut self, cx: &mut Context<Self>) {
         let Some(image) = self.image.clone() else {
             return;
         };
-        let directory = std::env::current_dir().unwrap_or_default();
+        let directory = cx.global::<Settings>().save_directory();
         let answer = cx.prompt_for_new_path(&directory, Some("qwen-image.png"));
         cx.spawn(async move |view, cx| {
             let result = async {
@@ -953,6 +1059,13 @@ impl Render for ImageWindow {
                         }),
                 );
         }
+        // A running generation keeps the preview settings it started with.
+        let previews = if self.busy {
+            self.previews
+        } else {
+            PreviewMode::from_settings(cx.global::<Settings>())
+        };
+        let manual_previews = !previews.automatic;
         div()
             .size_full()
             .flex()
@@ -981,6 +1094,15 @@ impl Render for ImageWindow {
                                 if view.busy { view.cancel(cx); } else { view.generate(window, cx); }
                             })),
                     )
+                    .when(self.busy && self.pause.is_some(), |row| row.child(
+                        Button::new("pause")
+                            .flex_shrink_0()
+                            .icon(Icon::default().path(if self.paused { "icons/play.svg" } else { "icons/pause.svg" }))
+                            .selected(self.paused)
+                            .tooltip(if self.paused { "Resume generation" } else { "Pause generation after the current layer" })
+                            .disabled(self.cancellation.is_cancelled())
+                            .on_click(cx.listener(|view, _, _, cx| view.toggle_pause(cx))),
+                    ))
                     .child(
                         Button::new("save")
                             .flex_shrink_0()
@@ -1007,21 +1129,14 @@ impl Render for ImageWindow {
                         .disabled(self.busy)
                         .on_click(cx.listener(|view, _, window, cx| view.toggle_seed(window, cx))))
                     .child(Input::new(&self.seed).w(px(200.)).disabled(self.busy || self.automatic_seed)))
-                .child(div().flex().items_center().gap_2()
-                    .child(Button::new("preview-mode")
-                        .label(if self.automatic_previews { "Auto previews" } else { "Manual previews" })
-                        .selected(self.automatic_previews)
-                        .disabled(self.busy)
-                        .tooltip("Switch between every-step previews and manual previews with automatic previews at step 5 and halfway")
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            if !view.busy { view.automatic_previews = !view.automatic_previews; cx.notify(); }
-                        })))
-                    .when(!self.automatic_previews, |row| row.child(
-                        Button::new("preview-now")
-                            .label(if self.preview_pending { "Preparing preview…" } else { "Preview" })
-                            .tooltip("Preview the latest completed step while generation continues")
-                            .disabled(!self.busy || self.preview_control.is_none() || self.preview_pending || self.cancellation.is_cancelled())
-                            .on_click(cx.listener(|view, _, _, cx| view.request_preview(cx)))))))
+                .when(manual_previews, |row| row.child(
+                    Button::new("preview-now")
+                        .label(if self.preview_pending { "Preparing preview…" } else { "Preview" })
+                        .tooltip(if previews.sequential {
+                            "Preview the latest completed step, pausing sampling while it decodes"
+                        } else { "Preview the latest completed step while generation continues" })
+                        .disabled(!self.busy || self.preview_control.is_none() || self.preview_pending || self.cancellation.is_cancelled())
+                        .on_click(cx.listener(|view, _, _, cx| view.request_preview(cx))))))
             .child(div().id("reference-images").flex().items_center().gap_2()
                 .flex_shrink_0().overflow_x_scroll().py_1()
                 .children(self.references.iter().enumerate().map(|(index, reference)| {
@@ -1068,7 +1183,7 @@ impl Render for ImageWindow {
                     ),
             )
             .child(div().flex().flex_wrap().items_center().justify_between().gap_2().text_sm()
-                .child(self.status.clone())
+                .child(if self.paused { format!("Paused · {}", self.status) } else { self.status.clone() })
                 .map(|row| match &self.timing {
                     Some(timing) => row.child(div().text_color(rgb(0x9da6b5)).child(timing.label())),
                     None => row,
