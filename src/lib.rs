@@ -77,6 +77,21 @@ pub struct Request {
     pub preview_control: Option<PreviewControl>,
     /// Cooperative pause. Clone the control for a UI Pause button.
     pub pause: Option<PauseControl>,
+    /// Numeric precision of the denoiser's per-step attention.
+    pub attention: AttentionPrecision,
+}
+
+/// Precision of the denoiser's attention during sampling. Encoders always
+/// use float32 attention.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AttentionPrecision {
+    /// Float32 attention, the reference path.
+    #[default]
+    Float32,
+    /// BF16 attention: faster, with slightly different pixels. A step that
+    /// produces non-finite latents is recomputed in float32, and the rest of
+    /// the generation stays in float32.
+    BFloat16,
 }
 
 impl Request {
@@ -92,6 +107,7 @@ impl Request {
             preview_every: None,
             preview_control: None,
             pause: None,
+            attention: AttentionPrecision::Float32,
         }
     }
 

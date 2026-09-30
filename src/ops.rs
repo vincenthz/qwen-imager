@@ -57,6 +57,18 @@ pub fn rope(x: &Tensor, cos: &Tensor, sin: &Tensor, interleaved: bool) -> Result
 /// Fused Metal attention for encoder/DiT heads. VAE heads exceed the Metal
 /// kernel's supported size; split query rows to bound its score-buffer memory.
 pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Result<Tensor> {
+    attention_in(q, k, v, causal, DType::F32)
+}
+
+/// As [`attention`], computing the fused kernel in `precision`. The small
+/// unfused path always uses float32.
+pub fn attention_in(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    causal: bool,
+    precision: DType,
+) -> Result<Tensor> {
     let d = q.dim(3)?;
     let scale = (d as f32).sqrt().recip();
     // Candle's vector kernel ignores causal masking, and the partial-tile
@@ -64,12 +76,13 @@ pub fn attention(q: &Tensor, k: &Tensor, v: &Tensor, causal: bool) -> Result<Ten
     // matrices are cheap to compute directly (also used between references).
     if q.device().is_metal() && q.dim(2)? > 32 && [32, 64, 72, 80, 96, 128, 256].contains(&d) {
         // Real Qwen3-VL keys can reach magnitudes above 200. The BF16 fused
-        // kernel produces NaNs for some such inputs; use FP32 attention and
-        // cast its output back, retaining BF16 model weights and activations.
+        // kernel produces NaNs for some such inputs; the default uses FP32
+        // attention and casts its output back, retaining BF16 model weights
+        // and activations.
         return candle_nn::ops::sdpa(
-            &q.to_dtype(DType::F32)?.contiguous()?,
-            &k.to_dtype(DType::F32)?.contiguous()?,
-            &v.to_dtype(DType::F32)?.contiguous()?,
+            &q.to_dtype(precision)?.contiguous()?,
+            &k.to_dtype(precision)?.contiguous()?,
+            &v.to_dtype(precision)?.contiguous()?,
             None,
             causal,
             scale,

@@ -67,6 +67,11 @@ Settings are saved in `~/Library/Application Support/QwenImager/settings.json`:
 - **Output directory**, where the Save dialog opens (default `~/Pictures`).
 - **Previews**: **Automatic** (the default) or **Manual**, and **Sequential**
   (the default) or **Parallel** decoding. Changes apply from the next generation.
+- **Attention precision**: **Float32** (the default, the reference path) or
+  **BF16**, which makes each denoising step about 5% faster with slightly
+  different pixels. If a BF16 step produces non-finite latents, it is redone in
+  Float32 and the rest of that generation stays in Float32. Applies from the
+  next generation.
 
 Enter a prompt and click **Generate** to its right. **Steps** and the adjacent
 **Size (px)** field (the square image's side length, multiples of 32 from 32 to
@@ -207,7 +212,10 @@ Previews never feed back into sampling. For on-demand background previews, set
 `control.request_preview()` from your UI. It returns false when inactive or a
 preview is already pending. `control.request_blocking_preview()` instead pauses
 sampling after its current step until that preview is decoded, queueing behind a
-background decode if one is running. Set `request.pause = Some(pause.clone())`
+background decode if one is running. Set `request.attention = AttentionPrecision::BFloat16` for faster
+reduced-precision denoiser attention (the default is `Float32`); encoders
+always use float32 attention, and a step that overflows in BF16 is recomputed
+in float32, which the rest of the generation keeps. Set `request.pause = Some(pause.clone())`
 with a `PauseControl` to pause and resume a generation cooperatively between
 model layers. Manual mode copies a small clean-latent snapshot to
 CPU memory after each completed step (about 2 MiB at 2048×2048); only requested
@@ -278,6 +286,7 @@ cargo build --release
 ./target/release/img-gen "Change the background to a sunset beach" -i ../edit.png -o edited.png
 ./target/release/img-gen "These characters sit around a campfire" -i a.png -i b.png
 ./target/release/img-gen "a red teapot" --scale 0.25 --preview-dir previews --preview-every 5
+./target/release/img-gen "a red teapot" --scale 0.5 --attention bf16
 ```
 
 Requires an Apple Silicon Mac with Metal access, Rust, and Xcode command line
@@ -347,7 +356,7 @@ selection, CPU/CUDA inference mode, model selection, video, LoRA, training,
 batch generation, or prompt rewriting. Encoder layers load as needed; their
 weights are released after encoding. Denoiser and VAE weights remain cached
 across previews and generations until the generator is dropped or unloaded.
-Attention runs in float32 for numerical stability; weights
+Attention runs in float32 by default for numerical stability; weights
 and other activations use BF16. Prefix keys/values are cached. Large VAE convolutions run in
 rows with exact overlap to bound temporary buffers.
 

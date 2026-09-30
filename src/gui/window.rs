@@ -26,8 +26,8 @@ use gpui_component::{
     input::{Input, InputState},
 };
 use qwen_imager::{
-    CancellationToken, Cancelled, DownloadProgress, Event, Generation, Generator, ModelOptions,
-    PauseControl, PreviewControl, Request, RgbaImage, Stage,
+    AttentionPrecision, CancellationToken, Cancelled, DownloadProgress, Event, Generation,
+    Generator, ModelOptions, PauseControl, PreviewControl, Request, RgbaImage, Stage,
 };
 
 const MAX_REFERENCES: usize = 10;
@@ -406,6 +406,11 @@ impl ImageWindow {
             request.preview_control = Some(PreviewControl::default());
         }
         request.pause = Some(PauseControl::default());
+        request.attention = if cx.global::<Settings>().bf16_attention {
+            AttentionPrecision::BFloat16
+        } else {
+            AttentionPrecision::Float32
+        };
         if let Err(error) = request.dimensions() {
             self.status = error.to_string();
             cx.notify();

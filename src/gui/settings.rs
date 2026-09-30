@@ -22,6 +22,8 @@ pub struct Settings {
     pub automatic_previews: bool,
     /// Pause sampling while a preview decodes, rather than decoding in the background.
     pub sequential_previews: bool,
+    /// Compute the denoiser's attention in BF16 rather than float32.
+    pub bf16_attention: bool,
 }
 
 impl Default for Settings {
@@ -32,6 +34,7 @@ impl Default for Settings {
             output_directory: None,
             automatic_previews: true,
             sequential_previews: true,
+            bf16_attention: false,
         }
     }
 }
@@ -113,6 +116,7 @@ pub struct SettingsPanel {
     output_directory: Option<PathBuf>,
     automatic_previews: bool,
     sequential_previews: bool,
+    bf16_attention: bool,
     choosing_directory: bool,
     error: Option<String>,
 }
@@ -128,6 +132,7 @@ impl SettingsPanel {
             output_directory: settings.output_directory,
             automatic_previews: settings.automatic_previews,
             sequential_previews: settings.sequential_previews,
+            bf16_attention: settings.bf16_attention,
             choosing_directory: false,
             error: None,
         }
@@ -174,6 +179,7 @@ impl SettingsPanel {
             output_directory: self.output_directory.clone(),
             automatic_previews: self.automatic_previews,
             sequential_previews: self.sequential_previews,
+            bf16_attention: self.bf16_attention,
         };
         if let Err(error) = settings.save() {
             self.error = Some(format!("Could not save settings: {error:#}"));
@@ -335,6 +341,37 @@ impl Render for SettingsPanel {
                         "Previews decode in the background while sampling continues, skipping steps when the decoder is busy. The step-5 and halfway previews always pause sampling."
                     })),
             )
+            .child(
+                section("Attention precision")
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                Button::new("attention-f32")
+                                    .label("Float32")
+                                    .selected(!self.bf16_attention)
+                                    .on_click(cx.listener(|panel, _, _, cx| {
+                                        panel.bf16_attention = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("attention-bf16")
+                                    .label("BF16")
+                                    .selected(self.bf16_attention)
+                                    .on_click(cx.listener(|panel, _, _, cx| {
+                                        panel.bf16_attention = true;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(hint(if self.bf16_attention {
+                        "Faster sampling with slightly different pixels. A step that overflows is redone in Float32, which the rest of that generation then uses."
+                    } else {
+                        "The reference path: the denoiser computes attention in Float32."
+                    })),
+            )
             .when_some(self.error.clone(), |panel, error| {
                 panel.child(div().text_sm().text_color(rgb(0xff8a8a)).child(error))
             })
@@ -355,7 +392,7 @@ impl Render for SettingsPanel {
                             .on_click(cx.listener(|panel, _, _, cx| panel.save(cx))),
                     ),
             )
-            .child(hint("Preview settings apply from the next generation."))
+            .child(hint("Preview and precision settings apply from the next generation."))
     }
 }
 
@@ -371,6 +408,7 @@ mod tests {
             output_directory: Some("/tmp/out".into()),
             automatic_previews: false,
             sequential_previews: false,
+            bf16_attention: true,
         };
         let json = serde_json::to_vec(&settings).unwrap();
         assert_eq!(serde_json::from_slice::<Settings>(&json).unwrap(), settings);

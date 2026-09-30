@@ -40,6 +40,7 @@ impl Block {
         cos: &Tensor,
         sin: &Tensor,
         segments: Option<&[Segment]>,
+        attention: DType,
     ) -> candle_core::Result<Tensor> {
         let scale1 = (modulation.narrow(2, 0, 4096)? + 1.0)?;
         let gate1 = modulation.narrow(2, 4096, 4096)?.tanh()?;
@@ -76,11 +77,12 @@ impl Block {
                 .cache
                 .as_ref()
                 .ok_or_else(|| candle_core::Error::Msg("prefix was not encoded".into()))?;
-            ops::attention(
+            ops::attention_in(
                 &q,
                 &Tensor::cat(&[pk, &k], 2)?,
                 &Tensor::cat(&[pv, &v], 2)?,
                 false,
+                attention,
             )?
         };
         let x = (x + self
@@ -232,7 +234,7 @@ impl Dit {
             .unsqueeze(1)?;
         for i in 0..32 {
             let mut block = Block::load(vb.pp(format!("transformer_blocks.{i}")))?;
-            x = block.forward(&x, &modulation, &pc, &ps, Some(&segments))?;
+            x = block.forward(&x, &modulation, &pc, &ps, Some(&segments), DType::F32)?;
             ensure!(
                 x.to_dtype(DType::F32)?
                     .sum_all()?
@@ -264,10 +266,12 @@ impl Dit {
             .forward(&candle_nn::ops::silu(&self.time1.forward(&sinusoidal)?)?)
     }
 
+    /// One denoising step; `attention` is the per-step attention precision.
     pub fn forward(
         &mut self,
         latents: &Tensor,
         sigma: f64,
+        attention: DType,
         observer: &mut crate::Observer<'_>,
     ) -> Result<Tensor> {
         let time = self.time(sigma)?;
@@ -278,7 +282,7 @@ impl Dit {
         // times per step. The caller checks the latents once per step.
         for block in &mut self.blocks {
             observer.poll_previews()?;
-            x = block.forward(&x, &modulation, &self.cos, &self.sin, None)?;
+            x = block.forward(&x, &modulation, &self.cos, &self.sin, None, attention)?;
         }
         let scale = (self.final_scale.forward(&activated)?.unsqueeze(1)? + 1.0)?;
         Ok(self.out.forward(&ops::norm(&x)?.broadcast_mul(&scale)?)?)

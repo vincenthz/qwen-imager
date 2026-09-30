@@ -1,5 +1,5 @@
 use crate::{
-    Event, Observer, Request, Stage,
+    AttentionPrecision, Event, Observer, Request, Stage,
     dit::Dit,
     noise,
     preview::{DecoderWorker, Snapshot},
@@ -260,35 +260,30 @@ pub fn run(
     drop(encoded);
     drop(reference_latents);
     let sigmas = schedule(args.steps, h * w);
+    let mut attention = match args.attention {
+        AttentionPrecision::Float32 => DType::F32,
+        AttentionPrecision::BFloat16 => DType::BF16,
+    };
     for (i, pair) in sigmas.windows(2).enumerate() {
         let step_start = Instant::now();
         observer.check()?;
-        let predicted = dit.forward(&latents, pair[0], observer)?;
-        // Flow matching: x_sigma = x_clean + sigma * velocity.
-        let preview = if (args.preview_control.is_some()
+        let want_preview = (args.preview_control.is_some()
             || args.preview_every.is_some_and(|n| (i + 1) % n.get() == 0))
-            && i + 1 < args.steps
-        {
-            Some(
-                (latents.to_dtype(DType::F32)? - (predicted.to_dtype(DType::F32)? * pair[0])?)?
-                    .to_dtype(DType::BF16)?,
-            )
-        } else {
-            None
-        };
-        latents = (latents.to_dtype(DType::F32)?
-            + (predicted.to_dtype(DType::F32)? * (pair[1] - pair[0]))?)?
-            .to_dtype(DType::BF16)?;
-        device.synchronize()?;
+            && i + 1 < args.steps;
+        let mut step = sample(&mut dit, &latents, pair, want_preview, attention, observer)?;
+        if !step.finite && attention != DType::F32 {
+            // Reduced-precision attention overflowed: redo this step, and the
+            // rest of the generation, on the float32 reference path.
+            attention = DType::F32;
+            step = sample(&mut dit, &latents, pair, want_preview, attention, observer)?;
+        }
         ensure!(
-            latents
-                .to_dtype(DType::F32)?
-                .sum_all()?
-                .to_scalar::<f32>()?
-                .is_finite(),
+            step.finite,
             "denoiser produced non-finite latents at step {}",
             i + 1
         );
+        latents = step.latents;
+        let preview = step.preview;
         observer.poll_previews()?;
         if let (Some(session), Some(clean)) = (&observer.previews, &preview) {
             // Publish a compact, immutable CPU snapshot before announcing the
@@ -432,6 +427,48 @@ fn reference_dimensions(w: u32, h: u32) -> (u32, u32) {
 }
 
 /// Fixed FlowMatchEulerDiscreteScheduler settings from the pinned checkpoint.
+struct Sampled {
+    latents: Tensor,
+    /// Estimated clean latents for a preview, when requested.
+    preview: Option<Tensor>,
+    finite: bool,
+}
+
+/// One Euler step from `sigma[0]` to `sigma[1]`.
+fn sample(
+    dit: &mut Dit,
+    latents: &Tensor,
+    sigma: &[f64],
+    preview: bool,
+    attention: DType,
+    observer: &mut Observer<'_>,
+) -> Result<Sampled> {
+    let predicted = dit.forward(latents, sigma[0], attention, observer)?;
+    // Flow matching: x_sigma = x_clean + sigma * velocity.
+    let preview = if preview {
+        Some(
+            (latents.to_dtype(DType::F32)? - (predicted.to_dtype(DType::F32)? * sigma[0])?)?
+                .to_dtype(DType::BF16)?,
+        )
+    } else {
+        None
+    };
+    let latents = (latents.to_dtype(DType::F32)?
+        + (predicted.to_dtype(DType::F32)? * (sigma[1] - sigma[0]))?)?
+        .to_dtype(DType::BF16)?;
+    latents.device().synchronize()?;
+    let finite = latents
+        .to_dtype(DType::F32)?
+        .sum_all()?
+        .to_scalar::<f32>()?
+        .is_finite();
+    Ok(Sampled {
+        latents,
+        preview,
+        finite,
+    })
+}
+
 fn schedule(steps: usize, tokens: usize) -> Vec<f64> {
     if steps == 1 {
         return vec![1., 0.];
