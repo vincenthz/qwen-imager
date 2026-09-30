@@ -21,7 +21,7 @@ required-features = ["gui"]
 
 [dependencies]
 anyhow = "1"
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"], optional = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "multipart"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "sync"], optional = true }
 async-channel = { version = "2", optional = true }
 gpui = { version = "0.2.2", default-features = false, features = ["runtime_shaders"], optional = true }

@@ -188,7 +188,8 @@ cargo build --release --bin qwen-imager-cli
 ./target/release/qwen-imager-cli --serve --offline --listen 127.0.0.1:6996
 ```
 
-Submit JSON prompts to `POST /jobs`, poll `GET /jobs/{id}`, request a background
+Submit JSON prompts or multipart reference images with JSON parameters to
+`POST /jobs`, poll `GET /jobs/{id}`, request a background
 preview with `POST /jobs/{id}/preview`, and retrieve preview/final PNGs with
 `GET /jobs/{id}/preview` and `GET /jobs/{id}/image`. Jobs run sequentially and
 reuse loaded models; HTTP stays responsive during inference. Manual previews

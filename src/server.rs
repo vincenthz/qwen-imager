@@ -3,12 +3,13 @@
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, State, rejection::JsonRejection},
+    extract::{DefaultBodyLimit, FromRequest, Multipart, Path, State},
     http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use image::ImageDecoder;
 use qwen_imager::{
     CancellationToken, Event, Generator, ModelOptions, PreviewControl, Request, RgbaImage, Stage,
 };
@@ -21,7 +22,33 @@ use std::{
     sync::{Arc, Condvar, Mutex},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
+
+const JSON_LIMIT: usize = 64 * 1024;
+const UPLOAD_LIMIT: usize = 64 * 1024 * 1024;
+const IMAGE_PIXEL_LIMIT: u64 = 16_000_000;
+const JOB_PIXEL_LIMIT: u64 = 32_000_000;
+const REFERENCE_MEMORY_UNIT: usize = 64 * 1024;
+const REFERENCE_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
+
+// Permits follow the actual request buffers through upload, queueing, and
+// generation. Dropping a rejected/cancelled/completed request releases them.
+struct QueuedRequest {
+    request: Request,
+    _reference_memory: Vec<OwnedSemaphorePermit>,
+}
+impl std::ops::Deref for QueuedRequest {
+    type Target = Request;
+    fn deref(&self) -> &Request {
+        &self.request
+    }
+}
+
+#[derive(Serialize)]
+struct ReferenceInfo {
+    width: u32,
+    height: u32,
+}
 
 type ApiResult<T> = Result<T, ApiError>;
 #[derive(Debug)]
@@ -71,7 +98,7 @@ impl Default for Parameters {
     }
 }
 impl Parameters {
-    fn request(&self) -> anyhow::Result<Request> {
+    fn request(&self, images: Vec<RgbaImage>) -> anyhow::Result<Request> {
         anyhow::ensure!(
             self.prompt.len() <= 16_384,
             "prompt must be at most 16384 UTF-8 bytes"
@@ -79,6 +106,7 @@ impl Parameters {
         anyhow::ensure!(self.steps <= 1000, "steps must be at most 1000");
         anyhow::ensure!(self.preview_every > 0, "preview_every must be positive");
         let mut request = Request::new(&self.prompt);
+        request.images = images;
         request.ratio = self.ratio.clone();
         request.scale = self.scale;
         request.steps = self.steps;
@@ -153,11 +181,13 @@ impl Image {
 struct Job {
     id: u64,
     parameters: Parameters,
+    references: Vec<ReferenceInfo>,
     width: u32,
     height: u32,
     created_ms: u64,
     status: Status,
     stage: &'static str,
+    reference_index: Option<usize>,
     stage_completed: usize,
     stage_total: usize,
     completed_steps: usize,
@@ -175,8 +205,10 @@ impl Job {
     fn view(&self) -> serde_json::Value {
         serde_json::json!({
             "id": self.id.to_string(), "status": self.status, "parameters": self.parameters,
+            "references": self.references,
             "width": self.width, "height": self.height, "created_unix_ms": self.created_ms,
             "stage": self.stage, "stage_completed": self.stage_completed, "stage_total": self.stage_total,
+            "reference_index": self.reference_index,
             "completed_steps": self.completed_steps, "total_steps": self.parameters.steps,
             "last_step_s": self.last_step_s,
             "elapsed_s": self.elapsed_s.or_else(|| self.started.map(|s| s.elapsed().as_secs_f64())),
@@ -195,6 +227,10 @@ impl Job {
                 completed,
                 total,
             } => {
+                self.reference_index = match stage {
+                    Stage::ReferenceVision { index } => Some(index),
+                    _ => None,
+                };
                 self.stage = match stage {
                     Stage::Loading => "loading",
                     Stage::ReferenceVision { .. } => "reference_vision",
@@ -211,6 +247,7 @@ impl Job {
                 total,
                 duration,
             } => {
+                self.reference_index = None;
                 self.stage = "sampling";
                 self.stage_completed = step;
                 self.stage_total = total;
@@ -226,6 +263,7 @@ impl Job {
     }
     fn finish(&mut self, result: anyhow::Result<qwen_imager::Generation>) {
         self.preview_pending = false;
+        self.reference_index = None;
         self.elapsed_s = self.started.map(|s| s.elapsed().as_secs_f64());
         match result {
             Ok(result) => {
@@ -257,7 +295,7 @@ impl Job {
 type SharedJob = Arc<Mutex<Job>>;
 struct Store {
     jobs: BTreeMap<u64, SharedJob>,
-    queue: VecDeque<(u64, Request)>,
+    queue: VecDeque<(u64, QueuedRequest)>,
     next_id: u64,
     stopping: bool,
 }
@@ -266,6 +304,8 @@ struct Service {
     wake: Condvar,
     max_jobs: usize,
     authorization: Option<HeaderValue>,
+    reference_memory: Arc<Semaphore>,
+    uploads: Arc<Semaphore>,
 }
 impl Service {
     fn new(max_jobs: usize, authorization: Option<HeaderValue>) -> Arc<Self> {
@@ -279,6 +319,10 @@ impl Service {
             wake: Condvar::new(),
             max_jobs,
             authorization,
+            reference_memory: Arc::new(Semaphore::new(
+                REFERENCE_MEMORY_LIMIT / REFERENCE_MEMORY_UNIT,
+            )),
+            uploads: Arc::new(Semaphore::new(2)),
         })
     }
     fn job(&self, id: u64) -> ApiResult<SharedJob> {
@@ -291,8 +335,23 @@ impl Service {
             .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "job not found".into()))
     }
     fn submit(&self, parameters: Parameters) -> ApiResult<serde_json::Value> {
+        self.submit_images(parameters, Vec::new(), Vec::new())
+    }
+    fn submit_images(
+        &self,
+        parameters: Parameters,
+        images: Vec<RgbaImage>,
+        reference_memory: Vec<OwnedSemaphorePermit>,
+    ) -> ApiResult<serde_json::Value> {
+        let references = images
+            .iter()
+            .map(|i| ReferenceInfo {
+                width: i.width(),
+                height: i.height(),
+            })
+            .collect();
         let request = parameters
-            .request()
+            .request(images)
             .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?;
         let (width, height) = request.dimensions().unwrap();
         let mut store = self.store.lock().unwrap();
@@ -313,6 +372,7 @@ impl Service {
         let job = Job {
             id,
             parameters,
+            references,
             width,
             height,
             created_ms: SystemTime::now()
@@ -321,6 +381,7 @@ impl Service {
                 .as_millis() as u64,
             status: Status::Queued,
             stage: "queued",
+            reference_index: None,
             stage_completed: 0,
             stage_total: 0,
             completed_steps: 0,
@@ -336,11 +397,17 @@ impl Service {
         };
         let view = job.view();
         store.jobs.insert(id, Arc::new(Mutex::new(job)));
-        store.queue.push_back((id, request));
+        store.queue.push_back((
+            id,
+            QueuedRequest {
+                request,
+                _reference_memory: reference_memory,
+            },
+        ));
         self.wake.notify_one();
         Ok(view)
     }
-    fn next(&self) -> Option<(SharedJob, Request)> {
+    fn next(&self) -> Option<(SharedJob, QueuedRequest)> {
         let mut store = self.store.lock().unwrap();
         loop {
             if store.stopping {
@@ -448,12 +515,169 @@ async fn health(State(service): State<Arc<Service>>) -> Json<serde_json::Value> 
         "model": qwen_imager::MODEL, "retained_jobs": store.jobs.len(), "queued_jobs": store.queue.len(), "max_jobs": service.max_jobs}),
     )
 }
+fn decode_references(
+    files: Vec<Bytes>,
+    budget: Arc<Semaphore>,
+) -> ApiResult<(Vec<RgbaImage>, Vec<OwnedSemaphorePermit>)> {
+    let mut images = Vec::new();
+    let mut permits = Vec::new();
+    let mut total_pixels = 0;
+    for (index, bytes) in files.into_iter().enumerate() {
+        let invalid = |error: image::ImageError| {
+            let status = if matches!(error, image::ImageError::Limits(_)) {
+                StatusCode::PAYLOAD_TOO_LARGE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            ApiError(status, format!("reference image {}: {error}", index + 1))
+        };
+        let format = image::guess_format(&bytes).map_err(|_| {
+            ApiError(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "reference images must be PNG, JPEG, or WebP".into(),
+            )
+        })?;
+        if !matches!(
+            format,
+            image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP
+        ) {
+            return Err(ApiError(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "reference images must be PNG, JPEG, or WebP".into(),
+            ));
+        }
+        let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(8192);
+        limits.max_image_height = Some(8192);
+        limits.max_alloc = Some(128 * 1024 * 1024);
+        reader.limits(limits);
+        let decoder = reader.into_decoder().map_err(invalid)?;
+        let (width, height) = decoder.dimensions();
+        let pixels = u64::from(width) * u64::from(height);
+        total_pixels += pixels;
+        if pixels == 0 || pixels > IMAGE_PIXEL_LIMIT || total_pixels > JOB_PIXEL_LIMIT {
+            return Err(ApiError(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "references exceed the 16-megapixel per-image or 32-megapixel per-job limit".into(),
+            ));
+        }
+        let units = (pixels as usize * 4).div_ceil(REFERENCE_MEMORY_UNIT) as u32;
+        let permit = budget.clone().try_acquire_many_owned(units).map_err(|_| {
+            ApiError(
+                StatusCode::TOO_MANY_REQUESTS,
+                "reference-image memory capacity reached; retry after queued jobs finish".into(),
+            )
+        })?;
+        // Reserve RGBA memory before decompression, even for a tiny compressed file.
+        let decoded = image::DynamicImage::from_decoder(decoder)
+            .map_err(invalid)?
+            .to_rgba8();
+        images.push(decoded);
+        permits.push(permit);
+    }
+    Ok((images, permits))
+}
+
 async fn submit(
     State(service): State<Arc<Service>>,
-    body: Result<Json<Parameters>, JsonRejection>,
+    mut request: axum::extract::Request,
 ) -> ApiResult<Response> {
-    let Json(parameters) = body.map_err(|e| ApiError(e.status(), e.body_text()))?;
-    let view = service.submit(parameters)?;
+    let multipart = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("multipart/form-data"));
+    let view = if multipart {
+        let upload = service.uploads.clone().try_acquire_owned().map_err(|_| {
+            ApiError(
+                StatusCode::TOO_MANY_REQUESTS,
+                "two reference uploads are already in progress; retry shortly".into(),
+            )
+        })?;
+        request
+            .extensions_mut()
+            .insert(DefaultBodyLimit::max(UPLOAD_LIMIT));
+        let mut form = Multipart::from_request(request, &())
+            .await
+            .map_err(|e| ApiError(e.status(), e.body_text()))?;
+        let mut parameters = None;
+        let mut files = Vec::new();
+        while let Some(mut field) = form
+            .next_field()
+            .await
+            .map_err(|e| ApiError(e.status(), e.body_text()))?
+        {
+            match field.name() {
+                Some("parameters") => {
+                    if parameters.is_some() {
+                        return Err(ApiError(
+                            StatusCode::BAD_REQUEST,
+                            "parameters must appear exactly once".into(),
+                        ));
+                    }
+                    let mut data = Vec::new();
+                    while let Some(chunk) = field
+                        .chunk()
+                        .await
+                        .map_err(|e| ApiError(e.status(), e.body_text()))?
+                    {
+                        if data.len() + chunk.len() > JSON_LIMIT {
+                            return Err(ApiError(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "parameters exceed 64 KiB".into(),
+                            ));
+                        }
+                        data.extend_from_slice(&chunk);
+                    }
+                    parameters =
+                        Some(serde_json::from_slice::<Parameters>(&data).map_err(|e| {
+                            ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+                        })?);
+                }
+                Some("images") => {
+                    if files.len() >= 10 {
+                        return Err(ApiError(
+                            StatusCode::BAD_REQUEST,
+                            "at most 10 reference images are supported".into(),
+                        ));
+                    }
+                    files.push(
+                        field
+                            .bytes()
+                            .await
+                            .map_err(|e| ApiError(e.status(), e.body_text()))?,
+                    );
+                }
+                _ => {
+                    return Err(ApiError(
+                        StatusCode::BAD_REQUEST,
+                        "multipart fields must be parameters or images".into(),
+                    ));
+                }
+            }
+        }
+        let parameters = parameters.ok_or_else(|| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                "missing parameters JSON field".into(),
+            )
+        })?;
+        // Parsing/decompression and conversion must not occupy an HTTP runtime thread.
+        tokio::task::spawn_blocking(move || {
+            let _upload = upload;
+            let (images, permits) = decode_references(files, service.reference_memory.clone())?;
+            service.submit_images(parameters, images, permits)
+        })
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??
+    } else {
+        let Json(parameters) = Json::<Parameters>::from_request(request, &())
+            .await
+            .map_err(|e| ApiError(e.status(), e.body_text()))?;
+        service.submit(parameters)?
+    };
     let location = view["status_url"].as_str().unwrap().to_owned();
     Ok((
         StatusCode::ACCEPTED,
@@ -544,7 +768,7 @@ fn router(service: Arc<Service>) -> Router {
         .route("/jobs/{id}/preview", post(request_preview).get(preview))
         .route("/jobs/{id}/image", get(image))
         .fallback(|| async { ApiError(StatusCode::NOT_FOUND, "endpoint not found".into()) })
-        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(DefaultBodyLimit::max(JSON_LIMIT))
         .layer(middleware::from_fn_with_state(service.clone(), guard))
         .with_state(service)
 }
@@ -720,6 +944,15 @@ mod tests {
                 2,
                 Some(HeaderValue::from_static("Bearer test-secret")),
             ));
+            assert_eq!(
+                multipart(
+                    &app,
+                    &[("parameters", Bytes::from_static(br#"{"prompt":"test"}"#))]
+                )
+                .await
+                .0,
+                StatusCode::UNAUTHORIZED
+            );
             for path in [
                 "/health",
                 "/jobs",
@@ -880,5 +1113,250 @@ mod tests {
         service.shutdown();
         assert!(third.lock().unwrap().cancel.is_cancelled());
         assert!(service.next().is_none());
+    }
+    fn encoded(pixels: &RgbaImage, format: image::ImageFormat) -> Bytes {
+        let mut out = Cursor::new(Vec::new());
+        if format == image::ImageFormat::Jpeg {
+            image::DynamicImage::ImageRgba8(pixels.clone())
+                .to_rgb8()
+                .write_to(&mut out, format)
+                .unwrap();
+        } else {
+            pixels.write_to(&mut out, format).unwrap();
+        }
+        Bytes::from(out.into_inner())
+    }
+
+    async fn multipart(app: &Router, fields: &[(&str, Bytes)]) -> (StatusCode, serde_json::Value) {
+        let mut body = Vec::new();
+        for (name, data) in fields {
+            body.extend_from_slice(
+                format!(
+                    "--test-boundary\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(data);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(b"--test-boundary--\r\n");
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/jobs")
+                    .header(
+                        header::CONTENT_TYPE,
+                        "multipart/form-data; boundary=test-boundary",
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[test]
+    fn multipart_preserves_reference_order_alpha_and_last_image_aspect() {
+        runtime().block_on(async {
+            let service = Service::new(3, None);
+            let app = router(service.clone());
+            let landscape = RgbaImage::from_pixel(48, 32, image::Rgba([12, 34, 56, 78]));
+            let portrait = RgbaImage::from_pixel(32, 48, image::Rgba([90, 80, 70, 60]));
+            let first = encoded(&landscape, image::ImageFormat::Png);
+            let second = encoded(&portrait, image::ImageFormat::WebP);
+            // Field order is unrestricted; image order has model semantics.
+            let fields = [
+                ("images", first),
+                (
+                    "parameters",
+                    Bytes::from_static(br#"{"prompt":"edit","scale":0.25}"#),
+                ),
+                ("images", second),
+            ];
+            let (code, view) = multipart(&app, &fields).await;
+            assert_eq!(code, StatusCode::ACCEPTED, "{view}");
+            assert_eq!(
+                view["references"],
+                serde_json::json!([{"width":48,"height":32},{"width":32,"height":48}])
+            );
+            assert!(view["height"].as_u64().unwrap() > view["width"].as_u64().unwrap());
+            let total = REFERENCE_MEMORY_LIMIT / REFERENCE_MEMORY_UNIT;
+            assert_eq!(service.reference_memory.available_permits(), total - 2);
+            let (job, request) = service.next().unwrap();
+            assert_eq!(request.images, [landscape, portrait]);
+            assert_eq!(
+                request.dimensions().unwrap(),
+                (
+                    view["width"].as_u64().unwrap() as u32,
+                    view["height"].as_u64().unwrap() as u32
+                )
+            );
+            job.lock().unwrap().event(Event::Progress {
+                stage: Stage::ReferenceVision { index: 1 },
+                completed: 1,
+                total: 27,
+            });
+            assert_eq!(job.lock().unwrap().view()["reference_index"], 1);
+            job.lock().unwrap().event(Event::Progress {
+                stage: Stage::TextEncoding,
+                completed: 1,
+                total: 36,
+            });
+            assert!(job.lock().unwrap().view()["reference_index"].is_null());
+            service.cancel(1).unwrap();
+            job.lock()
+                .unwrap()
+                .finish(Err(qwen_imager::Cancelled.into()));
+            drop(request);
+            assert_eq!(service.reference_memory.available_permits(), total);
+
+            let mut fields = fields.clone();
+            fields[1].1 = Bytes::from_static(br#"{"prompt":"edit","scale":0.25,"ratio":"1:1"}"#);
+            let (code, view) = multipart(&app, &fields).await;
+            assert_eq!(code, StatusCode::ACCEPTED);
+            assert_eq!(view["width"], 512);
+            assert_eq!(view["height"], 512);
+            service.cancel(2).unwrap();
+            assert_eq!(service.reference_memory.available_permits(), total);
+            assert!(service.store.lock().unwrap().queue.is_empty());
+        });
+    }
+
+    #[test]
+    fn multipart_rejects_bad_forms_files_and_limits_without_queueing() {
+        runtime().block_on(async {
+            let service = Service::new(1, None);
+            let app = router(service.clone());
+            let params = ("parameters", Bytes::from_static(br#"{"prompt":"edit"}"#));
+            let pixel = encoded(&RgbaImage::new(1, 1), image::ImageFormat::Png);
+            for (fields, expected) in [
+                (vec![("images", pixel.clone())], StatusCode::BAD_REQUEST),
+                (
+                    vec![params.clone(), params.clone()],
+                    StatusCode::BAD_REQUEST,
+                ),
+                (
+                    vec![params.clone(), ("image", pixel.clone())],
+                    StatusCode::BAD_REQUEST,
+                ),
+                (
+                    vec![("parameters", Bytes::from_static(b"invalid"))],
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                ),
+                (
+                    vec![params.clone(), ("images", Bytes::from_static(b"GIF89a"))],
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                ),
+                (
+                    vec![
+                        params.clone(),
+                        ("images", Bytes::from_static(b"\x89PNG\r\n\x1a\n")),
+                    ],
+                    StatusCode::BAD_REQUEST,
+                ),
+                (
+                    vec![("parameters", Bytes::from(vec![b' '; JSON_LIMIT + 1]))],
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                ),
+                (
+                    std::iter::once(params.clone())
+                        .chain((0..11).map(|_| ("images", pixel.clone())))
+                        .collect(),
+                    StatusCode::BAD_REQUEST,
+                ),
+                (
+                    vec![
+                        params.clone(),
+                        (
+                            "images",
+                            encoded(&RgbaImage::new(8193, 1), image::ImageFormat::Png),
+                        ),
+                    ],
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                ),
+                (
+                    vec![
+                        params.clone(),
+                        ("images", Bytes::from(vec![0; UPLOAD_LIMIT])),
+                    ],
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                ),
+            ] {
+                let (code, view) = multipart(&app, &fields).await;
+                assert_eq!(code, expected, "{view}");
+                assert!(view["error"].is_string());
+                assert!(service.store.lock().unwrap().queue.is_empty());
+                assert_eq!(
+                    service.reference_memory.available_permits(),
+                    REFERENCE_MEMORY_LIMIT / REFERENCE_MEMORY_UNIT
+                );
+                assert_eq!(service.uploads.available_permits(), 2);
+            }
+        });
+    }
+
+    #[test]
+    fn upload_budget_and_failed_admission_release_reference_buffers() {
+        runtime().block_on(async {
+            let service = Service::new(1, None);
+            let app = router(service.clone());
+            let fields = [
+                ("parameters", Bytes::from_static(br#"{"prompt":"edit"}"#)),
+                (
+                    "images",
+                    encoded(&RgbaImage::new(32, 32), image::ImageFormat::Jpeg),
+                ),
+            ];
+            let all_memory = service
+                .reference_memory
+                .clone()
+                .try_acquire_many_owned((REFERENCE_MEMORY_LIMIT / REFERENCE_MEMORY_UNIT) as u32)
+                .unwrap();
+            assert_eq!(
+                multipart(&app, &fields).await.0,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+            drop(all_memory);
+            let upload_slots = service.uploads.clone().try_acquire_many_owned(2).unwrap();
+            assert_eq!(
+                multipart(&app, &fields).await.0,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+            drop(upload_slots);
+            assert_eq!(multipart(&app, &fields).await.0, StatusCode::ACCEPTED);
+            let available = service.reference_memory.available_permits();
+            assert_eq!(
+                multipart(&app, &fields).await.0,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+            assert_eq!(service.reference_memory.available_permits(), available);
+            service.shutdown();
+            assert_eq!(
+                service.reference_memory.available_permits(),
+                REFERENCE_MEMORY_LIMIT / REFERENCE_MEMORY_UNIT
+            );
+            assert_eq!(
+                multipart(&app, &fields).await.0,
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert_eq!(
+                service.reference_memory.available_permits(),
+                REFERENCE_MEMORY_LIMIT / REFERENCE_MEMORY_UNIT
+            );
+        });
+        let budget = Arc::new(Semaphore::new(1));
+        let pixel = encoded(&RgbaImage::new(1, 1), image::ImageFormat::Png);
+        assert_eq!(
+            decode_references(vec![pixel.clone(), pixel], budget.clone())
+                .unwrap_err()
+                .0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(budget.available_permits(), 1);
     }
 }
