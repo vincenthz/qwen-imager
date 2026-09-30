@@ -8,10 +8,32 @@ The library takes and returns in-memory RGBA images.
 
 ## Desktop window
 
+From the repository root:
+
 ```sh
-cd rust
 cargo run --release --no-default-features --features gui --bin QwenImager
 ```
+
+To build the macOS app bundle, install
+[cargo-bundle](https://github.com/burtonageo/cargo-bundle) once, then run:
+
+```sh
+cargo install cargo-bundle --version 0.11.0 --locked
+cargo bundle-app
+open target/release/bundle/osx/QwenImager.app
+```
+
+`cargo bundle-app` is an alias for
+`cargo bundle --release --format osx --no-default-features --features gui --bin QwenImager`.
+The resulting `QwenImager.app` includes the photo-assembly icon and can be copied
+to Applications. Model weights stay in the Hugging Face cache and are downloaded
+through the app when needed. This produces a local app bundle; distribution
+signing and notarization are separate steps.
+
+The icon's transparent master is `assets/app-icon.png`; its generation prompt is
+in `assets/app-icon-prompt.txt`. To rebuild the bundled `assets/app-icon.icns`
+with all standard and Retina sizes, run `sh scripts/build-app-icon.sh` on macOS,
+then `cargo bundle-app` again.
 
 The window checks the Hugging Face cache at startup without network access. If
 the model is missing or incomplete, it shows an explanation and a **Download**

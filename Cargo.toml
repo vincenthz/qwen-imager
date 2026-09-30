@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2024"
 description = "Qwen Image 2.1 inference on Apple Metal"
 
+[package.metadata.bundle.bin.QwenImager]
+name = "QwenImager"
+identifier = "app.qwen-imager.desktop"
+icon = ["assets/app-icon.icns"]
+category = "Photography"
+short_description = "Create and edit photos locally with generative AI."
+osx_minimum_system_version = "11.0"
+
 [features]
 default = ["cli"]
 cli = ["dep:clap", "dep:axum", "dep:tokio"]
