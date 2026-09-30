@@ -10,12 +10,13 @@ pub fn rms(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
     candle_nn::ops::rms_norm(&x.contiguous()?, weight, eps as f32)
 }
 
+/// Unscaled LayerNorm, computed in float32 by the fused kernel.
 pub fn norm(x: &Tensor) -> Result<Tensor> {
-    let xf = x.to_dtype(DType::F32)?;
-    let centered = xf.broadcast_sub(&xf.mean_keepdim(D::Minus1)?)?;
-    centered
-        .broadcast_div(&(centered.sqr()?.mean_keepdim(D::Minus1)? + 1e-6)?.sqrt()?)?
-        .to_dtype(x.dtype())
+    let n = x.dim(D::Minus1)?;
+    let xf = x.to_dtype(DType::F32)?.contiguous()?;
+    let ones = Tensor::ones(n, DType::F32, x.device())?;
+    let zeros = Tensor::zeros(n, DType::F32, x.device())?;
+    candle_nn::ops::layer_norm(&xf, &ones, &zeros, 1e-6)?.to_dtype(x.dtype())
 }
 
 pub fn affine_norm(x: &Tensor, vb: VarBuilder) -> Result<Tensor> {
@@ -41,25 +42,14 @@ pub fn unheads(x: &Tensor) -> Result<Tensor> {
 /// Angles contain half a head's dimensions. DiT uses adjacent complex pairs;
 /// Qwen3-VL rotates the first and second half of a head against each other.
 pub fn rope(x: &Tensor, cos: &Tensor, sin: &Tensor, interleaved: bool) -> Result<Tensor> {
-    let (b, h, s, d) = x.dims4()?;
-    let xf = x.to_dtype(DType::F32)?;
-    let (a, z) = if interleaved {
-        let pairs = xf.reshape((b, h, s, d / 2, 2))?;
-        (
-            pairs.narrow(4, 0, 1)?.squeeze(4)?,
-            pairs.narrow(4, 1, 1)?.squeeze(4)?,
-        )
-    } else {
-        (xf.narrow(3, 0, d / 2)?, xf.narrow(3, d / 2, d / 2)?)
-    };
-    let cos = cos.reshape((1, 1, s, d / 2))?;
-    let sin = sin.reshape((1, 1, s, d / 2))?;
-    let re = (a.broadcast_mul(&cos)? - z.broadcast_mul(&sin)?)?;
-    let im = (z.broadcast_mul(&cos)? + a.broadcast_mul(&sin)?)?;
+    let (_, _, s, d) = x.dims4()?;
+    let xf = x.to_dtype(DType::F32)?.contiguous()?;
+    let cos = cos.reshape((s, d / 2))?.to_dtype(DType::F32)?.contiguous()?;
+    let sin = sin.reshape((s, d / 2))?.to_dtype(DType::F32)?.contiguous()?;
     let out = if interleaved {
-        Tensor::stack(&[re, im], 4)?.flatten_from(3)?
+        candle_nn::rotary_emb::rope_i(&xf, &cos, &sin)?
     } else {
-        Tensor::cat(&[re, im], 3)?
+        candle_nn::rotary_emb::rope(&xf, &cos, &sin)?
     };
     out.to_dtype(x.dtype())
 }
@@ -145,10 +135,11 @@ impl SwiGlu {
         })
     }
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Chunk MLP activations at 2K resolutions; token-wise operations are independent.
+        // Chunk MLP activations at 2K resolutions; token-wise operations are
+        // independent. Small chunks underutilise the GPU's matmul kernels.
         let mut chunks = Vec::new();
-        for start in (0..x.dim(1)?).step_by(256) {
-            let xx = x.narrow(1, start, (x.dim(1)? - start).min(256))?;
+        for start in (0..x.dim(1)?).step_by(4096) {
+            let xx = x.narrow(1, start, (x.dim(1)? - start).min(4096))?;
             chunks.push(self.down.forward(
                 &(candle_nn::ops::silu(&self.gate.forward(&xx)?)? * self.up.forward(&xx)?)?,
             )?);
