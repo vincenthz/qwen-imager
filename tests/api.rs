@@ -315,3 +315,119 @@ fn cached_encoder_results_match_a_fresh_generator() -> qwen_imager::Result<()> {
     assert_eq!(cached.image.as_raw(), fresh.image.as_raw());
     Ok(())
 }
+
+#[test]
+#[ignore = "requires cached Qwen Image 2.1 checkpoint and Metal GPU"]
+fn shared_model_sessions_run_concurrently_and_cancel_independently() -> qwen_imager::Result<()> {
+    use qwen_imager::{PreviewControl, SharedModel};
+    use std::{sync::mpsc, thread, time::Duration};
+
+    let mut first = Request::new("A red ceramic teapot on a wooden table.");
+    first.scale = 0.0625;
+    first.steps = 6;
+    let mut second = Request::new("Turn the square in the reference image blue.");
+    second.scale = 0.0625;
+    second.steps = 6;
+    second.seed = 12345;
+    second.images.push(RgbaImage::from_pixel(
+        32,
+        32,
+        image::Rgba([220, 40, 30, 255]),
+    ));
+    let requests = [first, second];
+    let mut baseline = generator();
+    let expected: Vec<_> = requests
+        .iter()
+        .map(|request| {
+            baseline
+                .generate(request, &CancellationToken::default(), |_| {})
+                .map(|g| g.image)
+        })
+        .collect::<qwen_imager::Result<_>>()?;
+    drop(baseline);
+
+    let model = SharedModel::new(ModelOptions {
+        offline: true,
+        ..Default::default()
+    });
+    let mut sessions = vec![model.generator(), model.generator()];
+    for cancel_first in [false, true] {
+        let (ready, receiver) = mpsc::channel();
+        let mut release = Vec::new();
+        let mut workers = Vec::new();
+        for (index, mut session) in sessions.drain(..).enumerate() {
+            let mut request = requests[index].clone();
+            let control = PreviewControl::default();
+            request.preview_control = Some(control.clone());
+            let ready = ready.clone();
+            let (sender, start) = mpsc::channel();
+            release.push(sender);
+            workers.push(thread::spawn(move || {
+                let cancel = CancellationToken::default();
+                let mut previews = Vec::new();
+                let mut requested = false;
+                let result = session.generate(&request, &cancel, |event| match event {
+                    Event::StepFinished { step: 1, .. } => {
+                        requested = control.request_preview();
+                        let _ = ready.send((index, true));
+                        // Neither session can pass step 1 until BOTH reach it.
+                        // A whole-generation lock would fail this handshake.
+                        if start.recv_timeout(Duration::from_secs(180)).is_err() {
+                            cancel.cancel();
+                        }
+                    }
+                    Event::StepFinished { step: 2, .. } if cancel_first && index == 0 => {
+                        cancel.cancel()
+                    }
+                    Event::Preview { step, .. } => previews.push(step),
+                    _ => {}
+                });
+                let _ = ready.send((index, false));
+                (session, result, requested, previews, control)
+            }));
+        }
+        drop(ready);
+        let reached = (|| -> qwen_imager::Result<()> {
+            let a = receiver.recv_timeout(Duration::from_secs(180))?;
+            let b = receiver.recv_timeout(Duration::from_secs(180))?;
+            anyhow::ensure!(
+                a.1 && b.1 && a.0 != b.0,
+                "both independent sessions must reach step 1: {a:?}, {b:?}"
+            );
+            Ok(())
+        })();
+        for sender in release {
+            let _ = sender.send(());
+        }
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("inference thread panicked"))
+            .collect();
+        reached?;
+        for (index, (session, result, requested, previews, control)) in
+            results.into_iter().enumerate()
+        {
+            assert!(requested);
+            assert!(
+                !control.request_preview(),
+                "finished/cancelled session retained a preview control"
+            );
+            if cancel_first && index == 0 {
+                assert!(result.unwrap_err().is::<Cancelled>());
+            } else {
+                assert_eq!(result?.image.as_raw(), expected[index].as_raw());
+                assert!(
+                    previews.contains(&1),
+                    "missing independent intermediate preview: {previews:?}"
+                );
+                assert_eq!(previews.last(), Some(&requests[index].steps));
+            }
+            sessions.push(session);
+        }
+    }
+    // Unloading one session must not invalidate the other session's shared buffers.
+    sessions[0].unload_models();
+    let recovered = sessions[1].generate(&requests[1], &CancellationToken::default(), |_| {})?;
+    assert_eq!(recovered.image.as_raw(), expected[1].as_raw());
+    Ok(())
+}

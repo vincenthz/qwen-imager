@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -89,11 +89,24 @@ impl SimpleBackend for CachedWeights {
 pub struct Weights {
     local: Option<PathBuf>,
     offline: bool,
+    shared: Option<Arc<crate::shared::SharedWeights>>,
 }
 
 impl Weights {
     pub fn new(local: Option<PathBuf>, offline: bool) -> Self {
-        Self { local, offline }
+        Self {
+            local,
+            offline,
+            shared: None,
+        }
+    }
+
+    pub fn shared(local: Option<PathBuf>, offline: bool) -> Self {
+        Self {
+            local,
+            offline,
+            shared: Some(Arc::default()),
+        }
     }
 
     pub fn file(&self, name: &str) -> Result<PathBuf> {
@@ -187,6 +200,18 @@ impl Weights {
     }
 
     pub fn builder(
+        &self,
+        component: &str,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<VarBuilder<'static>> {
+        if let Some(shared) = &self.shared {
+            return shared.builder(self, component, dtype, device);
+        }
+        self.uncached_builder(component, dtype, device)
+    }
+
+    pub(crate) fn uncached_builder(
         &self,
         component: &str,
         dtype: DType,

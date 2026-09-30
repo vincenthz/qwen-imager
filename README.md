@@ -22,6 +22,21 @@ fully cached models open it directly. Download errors remain visible and you
 can retry with Download. The model is approximately 32 GB; `HF_HOME` and
 `HF_HUB_CACHE` work as they do in the CLI.
 
+The top bar contains **Workspace 1**, followed by any additional workspaces.
+Click **+** to create and select a new workspace. Each workspace retains its own
+prompt, settings, reference images and drawings, preview, and finished result.
+Switching tabs keeps background generation running. A **bell** appears on a
+background tab when a preview arrives or generation ends (including an error or
+cancellation); selecting that tab clears the bell. Foreground updates do not
+add a bell. The tab strip scrolls when necessary, with **+** always accessible.
+
+Workspaces generate concurrently using independent Metal queues, sampling state,
+conditioning caches, previews, and cancellation. They share one pool of immutable
+denoiser and VAE weight buffers. Cancelling one workspace does not stop another.
+Concurrent runs share GPU time and each needs its own working memory; starting
+more runs does not multiply GPU capacity. Workspaces live for the current app session;
+closing the app cancels their work. Save images you want to keep before quitting.
+
 Enter a prompt and click **Generate** to its right. **Steps** defaults to 20;
 the adjacent **Size (px)** field sets the square image's side length (default
 512, multiples of 32 from 32 to 2048). **Auto previews** (the default) decodes
@@ -168,6 +183,17 @@ preempt GPU operations, downloads, or callbacks. A background decode already in
 flight may finish after cancellation, but its result is discarded. Dropping or
 unloading the generator waits for its decoder worker to exit.
 Use `error.is::<img_gen::Cancelled>()` to distinguish it from inference failure.
+Use `SharedModel::new(options).generator()` to create independent sessions that
+can run on separate threads. Keep one session per workspace to preserve its
+prompt/reference cache. Denoiser and VAE weights are loaded once into immutable
+Metal buffers shared across all sessions and their preview workers. Loading has
+separate queues; each session's computation uses its own queue and allocator.
+Text/vision weights are shared while encoders overlap, then released when no
+encoder uses them. `unload_models()` on a shared session releases its local
+resources; the common weights remain until the shared model and its sessions
+are dropped. The desktop tabs use this API. The HTTP service still schedules
+one job at a time.
+
 `Generator` accepts sequential requests and keeps its Metal device and loaded
 denoiser/VAE weight tensors between requests. VAE previews reuse the same decoder
 weights instead of loading them again on every step. Weights load lazily on first

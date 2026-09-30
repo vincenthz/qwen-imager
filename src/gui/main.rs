@@ -4,6 +4,7 @@ use std::borrow::Cow;
 
 mod timing;
 mod window;
+mod workspaces;
 
 actions!(img_gen_gui, [Quit]);
 
@@ -14,12 +15,13 @@ impl AssetSource for Assets {
         Ok(match path {
             "icons/save.svg" => Some(Cow::Borrowed(include_bytes!("assets/save.svg"))),
             "icons/image.svg" => Some(Cow::Borrowed(include_bytes!("assets/image.svg"))),
+            "icons/bell.svg" => Some(Cow::Borrowed(include_bytes!("assets/bell.svg"))),
             _ => None,
         })
     }
 
     fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
-        Ok(["icons/save.svg", "icons/image.svg"]
+        Ok(["icons/save.svg", "icons/image.svg", "icons/bell.svg"]
             .into_iter()
             .filter(|asset| asset.starts_with(path))
             .map(Into::into)
@@ -51,7 +53,7 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
-                let view = cx.new(|cx| window::ImageWindow::new(window, cx));
+                let view = cx.new(|cx| workspaces::Workspaces::new(window, cx));
                 cx.new(|cx| Root::new(view, window, cx))
             },
         )

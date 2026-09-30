@@ -30,6 +30,9 @@ use qwen_imager::{
 
 const MAX_REFERENCES: usize = 10;
 
+/// A newly available image or a completed generation, for the workspace tab.
+pub struct WorkspaceActivity;
+
 #[derive(Default)]
 struct ManualPreviewSchedule {
     due_step: Option<usize>,
@@ -205,13 +208,19 @@ pub struct ImageWindow {
     receiver: Option<Task<()>>,
     timing: Option<GenerationTiming>,
     ticker: Option<Task<()>>,
-    // One generator for the window's lifetime, so reruns with the same prompt
-    // or references reuse its cached encoder results. Only one run holds it.
+    // This workspace owns its generation state and queues. Its immutable model
+    // buffers are shared with the other workspaces through SharedModel.
     generator: Arc<Mutex<Generator>>,
 }
 
+impl gpui::EventEmitter<WorkspaceActivity> for ImageWindow {}
+
 impl ImageWindow {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        generator: Arc<Mutex<Generator>>,
+    ) -> Self {
         let prompt = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -264,13 +273,27 @@ impl ImageWindow {
             receiver: None,
             timing: None,
             ticker: None,
-            generator: Arc::new(Mutex::new(Generator::new(ModelOptions {
-                offline: true,
-                ..Default::default()
-            }))),
+            generator,
         };
         view.check_model(window, cx);
         view
+    }
+
+    pub fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A different workspace may have downloaded the model in the meantime.
+        if !self.ready && !self.busy {
+            self.checking_model = true;
+            self.cancellation = CancellationToken::default();
+            self.check_model(window, cx);
+        }
+        if self.ready && !self.busy {
+            self.prompt.update(cx, |input, cx| input.focus(window, cx));
+        }
+        cx.notify();
+    }
+
+    pub fn deactivate(&mut self) {
+        self.drawing = false;
     }
 
     fn check_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -389,25 +412,25 @@ impl ImageWindow {
             .map(|reference| reference.image.clone())
             .collect();
         thread::spawn(move || {
-            request.images = references
-                .into_iter()
-                .map(|reference| (*reference).clone())
-                .collect();
-            // A panicked run leaves the cache consistent: entries are only
-            // stored once complete.
-            let mut generator = generator.lock().unwrap_or_else(|e| e.into_inner());
-            let mut preview_schedule = ManualPreviewSchedule::default();
-            let result = generator.generate(&request, &cancellation, |event| {
-                let requested = !cancellation.is_cancelled()
-                    && request.preview_control.as_ref().is_some_and(|control| {
-                        preview_schedule.on_event(&event, || control.request_preview())
-                    });
-                if sender.send_blocking(Message::Inference(event)).is_err()
-                    || (requested && sender.send_blocking(Message::PreviewRequested).is_err())
-                {
-                    cancellation.cancel();
-                }
-            });
+            let result = {
+                let mut generator = generator.lock().unwrap_or_else(|error| error.into_inner());
+                request.images = references
+                    .into_iter()
+                    .map(|reference| (*reference).clone())
+                    .collect();
+                let mut preview_schedule = ManualPreviewSchedule::default();
+                generator.generate(&request, &cancellation, |event| {
+                    let requested = !cancellation.is_cancelled()
+                        && request.preview_control.as_ref().is_some_and(|control| {
+                            preview_schedule.on_event(&event, || control.request_preview())
+                        });
+                    if sender.send_blocking(Message::Inference(event)).is_err()
+                        || (requested && sender.send_blocking(Message::PreviewRequested).is_err())
+                    {
+                        cancellation.cancel();
+                    }
+                })
+            };
             let _ = sender.send_blocking(Message::Complete(result));
         });
         cx.notify();
@@ -660,7 +683,7 @@ impl ImageWindow {
             while let Ok(message) = receiver.recv().await {
                 if view
                     .update_in(cx, |view, window, cx| {
-                        view.receive(message, window);
+                        view.receive(message, window, cx);
                         cx.notify();
                     })
                     .is_err()
@@ -672,7 +695,7 @@ impl ImageWindow {
         sender
     }
 
-    fn receive(&mut self, message: Message, window: &mut Window) {
+    fn receive(&mut self, message: Message, window: &mut Window, cx: &mut Context<Self>) {
         // Keep the cancellation message visible until the worker has stopped.
         if self.cancellation.is_cancelled()
             && matches!(
@@ -682,6 +705,10 @@ impl ImageWindow {
         {
             return;
         }
+        let activity = matches!(
+            &message,
+            Message::Inference(Event::Preview { .. }) | Message::Complete(_)
+        );
         match message {
             Message::PreviewRequested => self.preview_pending = true,
             Message::Checked(result) => {
@@ -720,6 +747,9 @@ impl ImageWindow {
                 self.progress = if self.ready { 1. } else { 0. };
             }
             Message::Inference(event) => match event {
+                Event::Started { steps, .. } => {
+                    self.timing = Some(GenerationTiming::new(steps));
+                }
                 Event::Progress {
                     stage,
                     completed,
@@ -789,6 +819,9 @@ impl ImageWindow {
                     Err(error) => self.status = error_status(error),
                 }
             }
+        }
+        if activity {
+            cx.emit(WorkspaceActivity);
         }
     }
 
@@ -1280,6 +1313,7 @@ fn render_image(rgba: &RgbaImage) -> Arc<RenderImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn step_event(step: usize, total: usize) -> Event {
         Event::StepFinished {
             step,

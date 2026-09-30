@@ -12,6 +12,7 @@ mod noise;
 mod ops;
 mod pipeline;
 mod preview;
+mod shared;
 mod text;
 mod vae;
 mod vision;
@@ -191,6 +192,31 @@ pub struct Generator {
     cache: pipeline::Cache,
 }
 
+/// One lazy model-weight pool for concurrent, independent generation sessions.
+/// Sessions use separate Metal queues, latents, conditioning and preview workers.
+/// Immutable denoiser/VAE buffers are loaded once and shared without copying.
+#[derive(Clone)]
+pub struct SharedModel {
+    weights: weights::Weights,
+}
+
+impl SharedModel {
+    pub fn new(options: ModelOptions) -> Self {
+        Self {
+            weights: weights::Weights::shared(options.model_dir, options.offline),
+        }
+    }
+
+    /// Create a session for one workspace. Keep it for prompt/reference caching;
+    /// run separate sessions on separate threads to generate concurrently.
+    pub fn generator(&self) -> Generator {
+        Generator {
+            weights: self.weights.clone(),
+            cache: pipeline::Cache::default(),
+        }
+    }
+}
+
 impl Generator {
     pub fn new(options: ModelOptions) -> Self {
         Self {
@@ -201,6 +227,8 @@ impl Generator {
 
     /// Release cached model weights and the Metal device, retaining CPU encoder
     /// results. The next generation reloads weights lazily. Also safe after cancellation.
+    /// SharedModel sessions release their own queue/working state; shared weights
+    /// stay resident until the model and all its sessions are dropped.
     pub fn unload_models(&mut self) {
         self.cache.unload_models();
     }
