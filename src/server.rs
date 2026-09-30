@@ -9,7 +9,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use image::ImageDecoder;
 use qwen_imager::{
     CancellationToken, Event, Generator, ModelOptions, PreviewControl, Request, RgbaImage, Stage,
 };
@@ -526,33 +525,18 @@ fn decode_references(
         let invalid = |error: image::ImageError| {
             let status = if matches!(error, image::ImageError::Limits(_)) {
                 StatusCode::PAYLOAD_TOO_LARGE
+            } else if matches!(error, image::ImageError::Unsupported(_)) {
+                StatusCode::UNSUPPORTED_MEDIA_TYPE
             } else {
                 StatusCode::BAD_REQUEST
             };
             ApiError(status, format!("reference image {}: {error}", index + 1))
         };
-        let format = image::guess_format(&bytes).map_err(|_| {
-            ApiError(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "reference images must be PNG, JPEG, or WebP".into(),
-            )
-        })?;
-        if !matches!(
-            format,
-            image::ImageFormat::Png | image::ImageFormat::Jpeg | image::ImageFormat::WebP
-        ) {
-            return Err(ApiError(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "reference images must be PNG, JPEG, or WebP".into(),
-            ));
-        }
-        let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
         let mut limits = image::Limits::default();
         limits.max_image_width = Some(8192);
         limits.max_image_height = Some(8192);
         limits.max_alloc = Some(128 * 1024 * 1024);
-        reader.limits(limits);
-        let decoder = reader.into_decoder().map_err(invalid)?;
+        let decoder = qwen_imager::image_input::ImageInput::new(&bytes, limits).map_err(invalid)?;
         let (width, height) = decoder.dimensions();
         let pixels = u64::from(width) * u64::from(height);
         total_pixels += pixels;
@@ -570,9 +554,7 @@ fn decode_references(
             )
         })?;
         // Reserve RGBA memory before decompression, even for a tiny compressed file.
-        let decoded = image::DynamicImage::from_decoder(decoder)
-            .map_err(invalid)?
-            .to_rgba8();
+        let decoded = decoder.decode().map_err(invalid)?;
         images.push(decoded);
         permits.push(permit);
     }
@@ -1225,6 +1207,51 @@ mod tests {
             assert_eq!(service.reference_memory.available_permits(), total);
             assert!(service.store.lock().unwrap().queue.is_empty());
         });
+    }
+
+    #[test]
+    fn multipart_accepts_jpeg_and_heic_and_applies_orientation() {
+        runtime().block_on(async {
+            let service = Service::new(1, None);
+            let app = router(service.clone());
+            let fields = [
+                (
+                    "parameters",
+                    Bytes::from_static(br#"{"prompt":"edit","scale":0.25}"#),
+                ),
+                (
+                    "images",
+                    Bytes::from_static(include_bytes!("../tests/fixtures/oriented.jpg")),
+                ),
+                (
+                    "images",
+                    Bytes::from_static(include_bytes!("../tests/fixtures/oriented.heic")),
+                ),
+            ];
+            let (code, view) = multipart(&app, &fields).await;
+            assert_eq!(code, StatusCode::ACCEPTED, "{view}");
+            assert_eq!(
+                view["references"],
+                serde_json::json!([
+                    {"width": 32, "height": 64}, {"width": 32, "height": 64}
+                ])
+            );
+            let (_, request) = service.next().unwrap();
+            assert_eq!(request.images.len(), 2);
+            assert!(request.dimensions().unwrap().1 > request.dimensions().unwrap().0);
+        });
+        let budget = Arc::new(Semaphore::new(0));
+        assert_eq!(
+            decode_references(
+                vec![Bytes::from_static(include_bytes!(
+                    "../tests/fixtures/oriented.heic"
+                ))],
+                budget,
+            )
+            .unwrap_err()
+            .0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
     }
 
     #[test]

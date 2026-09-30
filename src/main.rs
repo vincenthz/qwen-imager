@@ -31,7 +31,7 @@ struct Args {
     /// Output PNG
     #[arg(short, long, default_value = "out.png")]
     output: PathBuf,
-    /// Reference image; repeat up to 10 times
+    /// Reference image (PNG, JPEG, WebP, or HEIC/HEIF); repeat up to 10 times
     #[arg(short = 'i', long = "image", value_name = "PATH")]
     images: Vec<PathBuf>,
     /// Output aspect ratio; defaults to the last reference's ratio, or 1:1
@@ -89,9 +89,8 @@ fn main() -> anyhow::Result<()> {
         .images
         .iter()
         .map(|p| {
-            image::open(p)
+            qwen_imager::image_input::open(p)
                 .with_context(|| format!("opening {}", p.display()))
-                .map(|i| i.to_rgba8())
         })
         .collect::<anyhow::Result<_>>()?;
     request.ratio = args.ratio;

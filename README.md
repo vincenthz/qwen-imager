@@ -91,7 +91,7 @@ each sampling step, even if no previews are requested. One-time model loading is
 in elapsed time but excluded from the per-step average. The estimate resets for
 each generation and clears when the run finishes or is cancelled.
 
-Use the **image +** tile to add references (including PNG, JPEG, or WebP) through
+Use the **image +** tile to add references (PNG, JPEG/JPG, WebP, or HEIC/HEIF) through
 the native file picker. You can select several files at once, up to 10 images in
 total. Each image appears as a numbered thumbnail with a **−** button to remove
 it; another add tile stays to the right. The row scrolls horizontally when needed.
@@ -279,7 +279,15 @@ The checkpoint revision is pinned in `src/weights.rs`.
 Defaults: native 2K size, 40 steps, seed 42, `out.png`. Without `-r`, editing
 follows the last reference's aspect ratio. Dimensions are rounded down to
 multiples of 32; reference images are resized to approximately 1 megapixel.
-`--scale` accepts values greater than zero and at most one. Output is PNG only.
+`--scale` accepts values greater than zero and at most one. Reference images may
+be PNG, JPEG/JPG, WebP, or HEIC/HEIF; formats are detected from the file contents
+and photo orientation is applied. Output is PNG only.
+
+Image loading uses portable Rust decoders (`image` and `heic-rs`), with no
+installed HEIC codecs or conversion commands required. HEIC support targets
+still photos, including tiled images and HEIF rotation/mirroring. Some HEVC
+variants (including lossless files from some encoders) may fail to decode.
+The application and inference engine still require Apple Silicon and Metal.
 Seeds are reproducible within this implementation, but do not match PyTorch's
 random-number generator or guarantee identical results across GPU/library versions.
 

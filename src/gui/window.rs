@@ -9,13 +9,12 @@ use std::{
 };
 
 use anyhow::Context as _;
-use image::ImageDecoder;
 
 use crate::timing::{GenerationTiming, format_duration};
 
 use gpui::{
     Bounds, Context, CursorStyle, DevicePixels, Entity, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ObjectFit, PathBuilder, PathPromptOptions, Pixels, Point, RenderImage, Task,
+    MouseMoveEvent, ObjectFit, PathBuilder, Pixels, Point, RenderImage, Task,
     Window, canvas, div, img, point, prelude::*, px, relative, rgb, size,
 };
 use gpui_component::{
@@ -127,22 +126,13 @@ struct ReferenceImage {
 
 impl ReferenceImage {
     fn load(path: &Path) -> anyhow::Result<Self> {
-        let mut decoder = image::ImageReader::open(path)?
-            .with_guessed_format()?
-            .into_decoder()?;
-        let orientation = decoder.orientation()?;
-        let mut image = image::DynamicImage::from_decoder(decoder)?;
-        image.apply_orientation(orientation);
-        anyhow::ensure!(
-            image.width() > 0 && image.height() > 0,
-            "image must not be empty"
-        );
+        let image = qwen_imager::image_input::open(path)?;
         let name = path
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
-        Ok(Self::new(name, Arc::new(image.to_rgba8())))
+        Ok(Self::new(name, Arc::new(image)))
     }
 
     fn new(name: String, image: Arc<RgbaImage>) -> Self {
@@ -457,17 +447,20 @@ impl ImageWindow {
         }
         self.loading_image = true;
         let available = MAX_REFERENCES - self.references.len();
-        let answer = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: true,
-            prompt: Some("Add reference images".into()),
-        });
+        let answer = rfd::AsyncFileDialog::new()
+            .set_parent(window)
+            .set_title("Add reference images")
+            .add_filter(
+                "Images (PNG, JPEG, WebP, HEIC)",
+                qwen_imager::image_input::EXTENSIONS,
+            )
+            .pick_files();
         cx.spawn_in(window, async move |view, cx| {
             let result = async {
-                let Some(paths) = answer.await?? else {
+                let Some(files) = answer.await else {
                     return Ok(None);
                 };
+                let paths: Vec<_> = files.into_iter().map(|file| file.path().to_owned()).collect();
                 if paths.is_empty() {
                     return Ok(None);
                 }

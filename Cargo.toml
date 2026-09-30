@@ -15,7 +15,7 @@ osx_minimum_system_version = "11.0"
 [features]
 default = ["cli"]
 cli = ["dep:clap", "dep:axum", "dep:tokio"]
-gui = ["dep:gpui", "dep:gpui-component", "dep:async-channel"]
+gui = ["dep:gpui", "dep:gpui-component", "dep:async-channel", "dep:rfd"]
 
 [[bin]]
 name = "qwen-imager-cli"
@@ -39,6 +39,8 @@ candle-nn = { version = "0.9", features = ["metal"] }
 clap = { version = "4", features = ["derive"], optional = true }
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+heic-rs = "0.1.1"
+rfd = { version = "0.17.2", optional = true }
 objc2-metal = { version = "0.3", default-features = false, features = ["MTLDevice"] }
 rand = "0.9"
 rand_distr = "0.5"

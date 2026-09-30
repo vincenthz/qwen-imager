@@ -8,6 +8,7 @@
 compile_error!("img-gen requires an Apple Silicon Mac with Metal.");
 
 mod dit;
+pub mod image_input;
 mod noise;
 mod ops;
 mod pipeline;

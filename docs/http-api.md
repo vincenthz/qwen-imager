@@ -70,13 +70,13 @@ curl --fail-with-body http://127.0.0.1:6996/jobs \
 ```
 
 Let curl set the multipart Content-Type and boundary. Authenticated workers
-require the same Bearer header used for JSON requests. PNG, JPEG, and WebP are
+require the same Bearer header used for JSON requests. PNG, JPEG, WebP, and HEIC/HEIF are
 accepted, detected from the uploaded bytes. Alpha is preserved where the format
-supports it. The filenames are not used as server paths, and uploads are not
+supports it, and photo orientation is applied. The filenames are not used as server paths, and uploads are not
 written to disk.
 
 The response is the usual `202` job object. Use the existing status, preview,
-image, and cancellation endpoints. `references` lists each input's original
+image, and cancellation endpoints. `references` lists each input's oriented
 `width` and `height` in upload order. Without `ratio`, the output follows the
 last reference's aspect ratio; an explicit ratio overrides it. References are
 resized by the inference pipeline in the same way as local CLI/GUI inputs.
