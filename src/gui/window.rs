@@ -30,6 +30,11 @@ use qwen_imager::{
     Generator, ModelOptions, PauseControl, PreviewControl, Request, RgbaImage, Stage,
 };
 
+gpui::actions!(image_window, [Generate]);
+
+/// Key context of the prompt. Enter inserts a newline; Cmd-Enter generates.
+pub const PROMPT_CONTEXT: &str = "Prompt";
+
 const MAX_REFERENCES: usize = 10;
 const DECODING_PREVIEW: &str = " — decoding preview…";
 
@@ -275,9 +280,8 @@ impl ImageWindow {
     ) -> Self {
         let prompt = cx.new(|cx| {
             InputState::new(window, cx)
-                .multi_line(true)
-                .rows(3)
-                .placeholder("Describe the image or the changes you want…")
+                .auto_grow(3, 12)
+                .placeholder("Describe the image or the changes you want… (⌘↩ to generate)")
         });
         let settings = cx.global::<Settings>().clone();
         let steps = cx.new(|cx| digits_input(window, cx, settings.steps.to_string()));
@@ -441,7 +445,8 @@ impl ImageWindow {
         if self.busy || self.loading_image || !self.ready {
             return;
         }
-        let mut request = Request::new(self.prompt.read(cx).value().to_string());
+        // Trailing blank lines would otherwise change the prompt's encoding.
+        let mut request = Request::new(self.prompt.read(cx).value().trim());
         let size = match parse_size(&self.size.read(cx).value()) {
             Ok(size) => size,
             Err(error) => {
@@ -1240,12 +1245,14 @@ impl Render for ImageWindow {
             .p_5()
             .bg(rgb(0x15171b))
             .text_color(rgb(0xe4e7ec))
+            .on_action(cx.listener(|view, _: &Generate, window, cx| view.generate(window, cx)))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().flex_1().min_w_0().child(Input::new(&self.prompt).disabled(self.busy)))
+                    .child(div().flex_1().min_w_0().key_context(PROMPT_CONTEXT)
+                        .child(Input::new(&self.prompt).disabled(self.busy)))
                     .child(
                         Button::new("generate")
                             .primary()
@@ -1255,6 +1262,7 @@ impl Render for ImageWindow {
                             } else {
                                 "Generate"
                             })
+                            .when(!self.busy, |button| button.tooltip("Generate (⌘↩)"))
                             .disabled(self.loading_image || (self.busy && self.cancellation.is_cancelled()))
                             .on_click(cx.listener(|view, _, window, cx| {
                                 if view.busy { view.cancel(cx); } else { view.generate(window, cx); }

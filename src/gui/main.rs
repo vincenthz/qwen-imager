@@ -45,7 +45,16 @@ fn main() {
         gpui_component::init(cx);
         cx.set_global(settings::Settings::load());
         Theme::change(ThemeMode::Dark, None, cx);
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        // Bound after gpui_component so Cmd-Enter in the prompt generates
+        // instead of inserting a newline like Enter.
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new(
+                "cmd-enter",
+                window::Generate,
+                Some(&format!("{} > Input", window::PROMPT_CONTEXT)),
+            ),
+        ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {

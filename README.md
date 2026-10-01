@@ -81,7 +81,9 @@ Settings are saved in `~/Library/Application Support/QwenImager/settings.json`:
   workspace's cached prompt and reference encodings. If the selected model is
   not fully downloaded, the workspace shows the Download screen.
 
-Enter a prompt and click **Generate** to its right. **Steps** and the adjacent
+Enter a prompt and click **Generate** to its right, or press ⌘↩. Enter starts a
+new line; the prompt grows to 12 lines, then scrolls, and leading and trailing
+blank space is ignored. **Steps** and the adjacent
 **Size (px)** field (the square image's side length, multiples of 32 from 32 to
 2048) start from the settings. Automatic previews decode a preview after every
 step. Sequential decoding pauses sampling for each decode; parallel decoding
