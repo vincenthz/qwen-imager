@@ -13,6 +13,7 @@ mod noise;
 mod ops;
 mod pipeline;
 mod preview;
+mod quant;
 mod shared;
 mod text;
 mod vae;
@@ -33,15 +34,17 @@ use std::{
 pub use anyhow::Result;
 pub use image::RgbaImage;
 pub use preview::PreviewControl;
-pub use weights::{MODEL, REVISION};
+pub use weights::Checkpoint;
 
 /// Checkpoint location and download policy. GPU resources are allocated by `generate`.
 #[derive(Clone, Debug, Default)]
 pub struct ModelOptions {
-    /// Original Diffusers snapshot directory, or the Hugging Face cache when absent.
+    /// Diffusers snapshot directory of `checkpoint`, or the Hugging Face cache when absent.
     /// Keep checkpoint files unchanged while the generator exists (they are mapped).
     pub model_dir: Option<PathBuf>,
     pub offline: bool,
+    /// Original BF16 weights (the default) or an MLX-quantized pack.
+    pub checkpoint: Checkpoint,
 }
 
 /// Download progress for one missing checkpoint file. Existing cached files do
@@ -256,7 +259,11 @@ pub struct SharedModel {
 impl SharedModel {
     pub fn new(options: ModelOptions) -> Self {
         Self {
-            weights: weights::Weights::shared(options.model_dir, options.offline),
+            weights: weights::Weights::shared(
+                options.model_dir,
+                options.offline,
+                options.checkpoint,
+            ),
         }
     }
 
@@ -273,7 +280,7 @@ impl SharedModel {
 impl Generator {
     pub fn new(options: ModelOptions) -> Self {
         Self {
-            weights: weights::Weights::new(options.model_dir, options.offline),
+            weights: weights::Weights::new(options.model_dir, options.offline, options.checkpoint),
             cache: pipeline::Cache::default(),
         }
     }

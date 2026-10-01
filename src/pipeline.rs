@@ -141,7 +141,7 @@ pub fn run(
             && config["num_layers"] == 32
             && config["causal_condition"] == true
             && config["in_channels"] == 64,
-        "checkpoint must be the original Qwen/Qwen-Image-2.1 architecture"
+        "checkpoint must have the Qwen/Qwen-Image-2.1 architecture"
     );
     observer.progress(Stage::Loading, 1, 1)?;
     let cpu = Device::Cpu;

@@ -7,6 +7,7 @@ use gpui_component::{
     button::*,
     input::{Input, InputState},
 };
+use qwen_imager::Checkpoint;
 use serde::{Deserialize, Serialize};
 
 /// Application-wide preferences, persisted between launches.
@@ -24,6 +25,8 @@ pub struct Settings {
     pub sequential_previews: bool,
     /// Compute the denoiser's attention in BF16 rather than float32.
     pub bf16_attention: bool,
+    /// Checkpoint that workspaces load; changes apply as each workspace becomes idle.
+    pub model: Checkpoint,
 }
 
 impl Default for Settings {
@@ -35,6 +38,7 @@ impl Default for Settings {
             automatic_previews: true,
             sequential_previews: true,
             bf16_attention: false,
+            model: Checkpoint::Original,
         }
     }
 }
@@ -117,6 +121,7 @@ pub struct SettingsPanel {
     automatic_previews: bool,
     sequential_previews: bool,
     bf16_attention: bool,
+    model: Checkpoint,
     choosing_directory: bool,
     error: Option<String>,
 }
@@ -133,6 +138,7 @@ impl SettingsPanel {
             automatic_previews: settings.automatic_previews,
             sequential_previews: settings.sequential_previews,
             bf16_attention: settings.bf16_attention,
+            model: settings.model,
             choosing_directory: false,
             error: None,
         }
@@ -180,6 +186,7 @@ impl SettingsPanel {
             automatic_previews: self.automatic_previews,
             sequential_previews: self.sequential_previews,
             bf16_attention: self.bf16_attention,
+            model: self.model,
         };
         if let Err(error) = settings.save() {
             self.error = Some(format!("Could not save settings: {error:#}"));
@@ -188,6 +195,14 @@ impl SettingsPanel {
         }
         let previous = std::mem::replace(cx.global_mut::<Settings>(), settings);
         cx.emit(SettingsEvent::Saved(previous));
+    }
+}
+
+pub fn model_label(model: Checkpoint) -> &'static str {
+    match model {
+        Checkpoint::Original => "BF16",
+        Checkpoint::Mlx8Bit => "MLX 8-bit",
+        Checkpoint::Mlx4Bit => "MLX 4-bit",
     }
 }
 
@@ -372,6 +387,24 @@ impl Render for SettingsPanel {
                         "The reference path: the denoiser computes attention in Float32."
                     })),
             )
+            .child(
+                section("Model")
+                    .child(div().flex().gap_2().children(Checkpoint::ALL.map(|model| {
+                        Button::new(model.name())
+                            .label(model_label(model))
+                            .selected(self.model == model)
+                            .on_click(cx.listener(move |panel, _, _, cx| {
+                                panel.model = model;
+                                cx.notify();
+                            }))
+                    })))
+                    .child(hint(match self.model {
+                        Checkpoint::Original => "The original BF16 weights, about 32 GB. The reference for image quality.",
+                        Checkpoint::Mlx8Bit => "8-bit denoiser and text encoder, about 18 GB. Close to the original, with less memory.",
+                        Checkpoint::Mlx4Bit => "4-bit denoiser and text encoder, about 11 GB. The least memory; details can differ from the original.",
+                    }))
+                    .child(hint("Each workspace switches once idle, and offers a download if the model is missing.")),
+            )
             .when_some(self.error.clone(), |panel, error| {
                 panel.child(div().text_sm().text_color(rgb(0xff8a8a)).child(error))
             })
@@ -409,8 +442,10 @@ mod tests {
             automatic_previews: false,
             sequential_previews: false,
             bf16_attention: true,
+            model: Checkpoint::Mlx4Bit,
         };
         let json = serde_json::to_vec(&settings).unwrap();
+        assert!(String::from_utf8_lossy(&json).contains(r#""model":"mlx-4bit""#));
         assert_eq!(serde_json::from_slice::<Settings>(&json).unwrap(), settings);
         let partial: Settings = serde_json::from_str(r#"{"steps": 8}"#).unwrap();
         assert_eq!(

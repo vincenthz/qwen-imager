@@ -1,11 +1,11 @@
 //! Qwen Image 2.1's 32-layer single-stream diffusion transformer.
 use crate::{
-    ops::{self, SwiGlu},
+    ops::{self, Linear, SwiGlu},
     text::Encoded,
 };
 use anyhow::{Result, ensure};
 use candle_core::{DType, Tensor};
-use candle_nn::{Linear, Module, VarBuilder};
+use candle_nn::{Module, VarBuilder};
 
 struct Block {
     q: Linear,
@@ -250,18 +250,18 @@ impl Dit {
     }
 
     fn time(&self, sigma: f64) -> candle_core::Result<Tensor> {
-        let w = self.time1.weight();
-        let t = Tensor::new(&[sigma as f32], w.device())?
-            .to_dtype(w.dtype())?
+        let (device, dtype) = (self.time1.device(), self.time1.dtype());
+        let t = Tensor::new(&[sigma as f32], device)?
+            .to_dtype(dtype)?
             .to_dtype(DType::F32)?;
         let freqs: Vec<f32> = (0..128)
             .map(|i| (-10000_f32.ln() * i as f32 / 128.0).exp())
             .collect();
-        let args =
-            (t.unsqueeze(1)?
-                .broadcast_mul(&Tensor::from_vec(freqs, (1, 128), w.device())?)?
-                * 1000.0)?;
-        let sinusoidal = Tensor::cat(&[args.cos()?, args.sin()?], 1)?.to_dtype(w.dtype())?;
+        let args = (t
+            .unsqueeze(1)?
+            .broadcast_mul(&Tensor::from_vec(freqs, (1, 128), device)?)?
+            * 1000.0)?;
+        let sinusoidal = Tensor::cat(&[args.cos()?, args.sin()?], 1)?.to_dtype(dtype)?;
         self.time2
             .forward(&candle_nn::ops::silu(&self.time1.forward(&sinusoidal)?)?)
     }

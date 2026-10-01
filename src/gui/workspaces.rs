@@ -8,10 +8,10 @@ use gpui::{
     rgba,
 };
 use gpui_component::{Icon, Selectable, button::Button};
-use qwen_imager::{ModelOptions, SharedModel};
+use qwen_imager::{Checkpoint, ModelOptions, SharedModel};
 
 use crate::{
-    settings::{SettingsEvent, SettingsPanel},
+    settings::{Settings, SettingsEvent, SettingsPanel},
     window::{ImageWindow, WorkspaceActivity},
 };
 
@@ -47,6 +47,14 @@ pub struct Workspaces {
     settings: Option<(Entity<SettingsPanel>, Subscription)>,
 }
 
+fn shared_model(checkpoint: Checkpoint) -> SharedModel {
+    SharedModel::new(ModelOptions {
+        offline: true,
+        checkpoint,
+        ..Default::default()
+    })
+}
+
 impl Workspaces {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut workspaces = Self {
@@ -54,10 +62,7 @@ impl Workspaces {
             activity: TabActivity::default(),
             tab_scroll: ScrollHandle::new(),
             settings: None,
-            model: SharedModel::new(ModelOptions {
-                offline: true,
-                ..Default::default()
-            }),
+            model: shared_model(cx.global::<Settings>().model),
         };
         workspaces.add(window, cx);
         workspaces
@@ -87,9 +92,20 @@ impl Workspaces {
         let panel = cx.new(|cx| SettingsPanel::new(window, cx));
         let subscription = cx.subscribe_in(&panel, window, |workspaces, _, event, window, cx| {
             if let SettingsEvent::Saved(previous) = event {
+                let model = cx.global::<Settings>().model;
+                if model != previous.model {
+                    // Running generations keep the previous weights until they finish.
+                    workspaces.model = shared_model(model);
+                }
                 for tab in &workspaces.tabs {
-                    tab.view
-                        .update(cx, |view, cx| view.apply_defaults(previous, window, cx));
+                    let generator = (model != previous.model)
+                        .then(|| Arc::new(Mutex::new(workspaces.model.generator())));
+                    tab.view.update(cx, |view, cx| {
+                        if let Some(generator) = generator {
+                            view.set_generator(generator, window, cx);
+                        }
+                        view.apply_defaults(previous, window, cx)
+                    });
                 }
             }
             workspaces.close_settings(window, cx);

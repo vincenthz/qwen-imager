@@ -23,3 +23,12 @@ of a red ceramic teapot on a white table, soft natural lighting, highly
 detailed”. It reproduces non-finite output in Candle 0.9.2's BF16 fused Metal
 attention kernel. The test compares the FP32 Metal attention path against
 an independent dense CPU softmax implementation, including a finite-value check.
+
+`quantized.safetensors` contains a small synthetic linear layer quantized by
+MLX 0.32.3 (`mlx.core.quantize`, group size 64) at 4 and 8 bits, not model
+weights. The dense BF16 weight is `sin(arange(96*192) * 0.37) * 0.05`, shaped
+`[96,192]`, and the input `x` is `cos(arange(5*192) * 0.11)`, shaped `[5,192]`,
+both in BF16. For each `q4`/`q8` prefix it stores the packed `u32` `weight`,
+BF16 `scales` and `biases` as MLX writes them, MLX's `dequantized` weight, and
+`y = quantized_matmul(x, weight, scales, biases, transpose=True)`. Tests check
+the Metal and CPU dequantization against both.

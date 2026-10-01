@@ -1,7 +1,8 @@
 use anyhow::{Context, ensure};
 use clap::Parser;
 use qwen_imager::{
-    AttentionPrecision, CancellationToken, Event, Generator, ModelOptions, Request, Stage,
+    AttentionPrecision, CancellationToken, Checkpoint, Event, Generator, ModelOptions, Request,
+    Stage,
 };
 use std::{num::NonZeroUsize, path::PathBuf, time::Instant};
 
@@ -57,7 +58,10 @@ struct Args {
     /// Write parameters and precise stage/step timings to a JSON sidecar
     #[arg(long, value_name = "PATH")]
     metrics: Option<PathBuf>,
-    /// Existing Qwen Image 2.1 Diffusers snapshot directory
+    /// Checkpoint: original BF16 weights, or an MLX-quantized pack
+    #[arg(long, value_enum, default_value_t = Model::Bf16)]
+    model: Model,
+    /// Existing Diffusers snapshot directory of the selected --model
     #[arg(long, value_name = "PATH")]
     model_dir: Option<PathBuf>,
     /// Use cached files only
@@ -72,6 +76,25 @@ struct Args {
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
+enum Model {
+    Bf16,
+    #[value(name = "mlx-4bit")]
+    Mlx4bit,
+    #[value(name = "mlx-8bit")]
+    Mlx8bit,
+}
+
+impl From<Model> for Checkpoint {
+    fn from(model: Model) -> Self {
+        match model {
+            Model::Bf16 => Checkpoint::Original,
+            Model::Mlx4bit => Checkpoint::Mlx4Bit,
+            Model::Mlx8bit => Checkpoint::Mlx8Bit,
+        }
+    }
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
 enum Attention {
     F32,
     Bf16,
@@ -79,6 +102,7 @@ enum Attention {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    let checkpoint = Checkpoint::from(args.model);
     if args.serve {
         return server::run(
             args.listen,
@@ -86,6 +110,7 @@ fn main() -> anyhow::Result<()> {
             ModelOptions {
                 model_dir: args.model_dir,
                 offline: args.offline,
+                checkpoint,
             },
         );
     }
@@ -121,6 +146,7 @@ fn main() -> anyhow::Result<()> {
     let mut generator = Generator::new(ModelOptions {
         model_dir: args.model_dir,
         offline: args.offline,
+        checkpoint,
     });
     let cancellation = CancellationToken::default();
     let mut preview_error = None;
@@ -145,8 +171,7 @@ fn main() -> anyhow::Result<()> {
             steps,
             seed,
         } => eprintln!(
-            "{} · Metal · {width}x{height} · {steps} steps · seed {seed}",
-            qwen_imager::MODEL
+            "{checkpoint} · Metal · {width}x{height} · {steps} steps · seed {seed}"
         ),
         Event::Progress {
             stage,
@@ -200,7 +225,7 @@ fn main() -> anyhow::Result<()> {
             "prompt": request.prompt, "seed": request.seed, "steps": request.steps,
             "width": width, "height": height, "noise_source_size": request.noise_source_size,
             "attention": format!("{:?}", request.attention),
-            "model": qwen_imager::MODEL, "revision": qwen_imager::REVISION,
+            "model": checkpoint.repo(), "revision": checkpoint.revision(),
             "generation_s": generated.elapsed.as_secs_f64(),
             "generation_and_save_s": started.elapsed().as_secs_f64(),
             "events": metrics,
@@ -231,5 +256,11 @@ mod tests {
         assert!(Args::try_parse_from(["cli"]).is_err());
         assert!(Args::try_parse_from(["cli", "--serve", "--steps", "8"]).is_err());
         assert!(Args::try_parse_from(["cli", "a teapot", "--listen", "127.0.0.1:9000"]).is_err());
+        let quantized = Args::try_parse_from(["cli", "a teapot", "--model", "mlx-4bit"]).unwrap();
+        assert_eq!(Checkpoint::from(quantized.model), Checkpoint::Mlx4Bit);
+        for model in Checkpoint::ALL {
+            let args = Args::try_parse_from(["cli", "--serve", "--model", model.name()]).unwrap();
+            assert_eq!(Checkpoint::from(args.model), model);
+        }
     }
 }

@@ -13,11 +13,87 @@ use hf_hub::{
     Cache, Repo, RepoType,
     api::{Progress, sync::ApiBuilder},
 };
-use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const MODEL: &str = "Qwen/Qwen-Image-2.1";
-// Matches the checkpoint used by the original Python CLI. Pin architecture and weights together.
-pub const REVISION: &str = "790c92633540aa0cb11d9abf19eb46d861714758";
+/// A published Qwen Image 2.1 checkpoint. All use the Diffusers layout and key
+/// names; the MLX packs store most large linear layers affine-quantized.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Checkpoint {
+    /// The original BF16 weights, about 32 GB.
+    #[default]
+    #[serde(rename = "bf16")]
+    Original,
+    /// MLX 4-bit denoiser blocks and text encoder, about 11 GB.
+    #[serde(rename = "mlx-4bit")]
+    Mlx4Bit,
+    /// MLX 8-bit denoiser blocks and text encoder, about 18 GB.
+    #[serde(rename = "mlx-8bit")]
+    Mlx8Bit,
+}
+
+impl Checkpoint {
+    pub const ALL: [Self; 3] = [Self::Original, Self::Mlx4Bit, Self::Mlx8Bit];
+
+    pub fn repo(self) -> &'static str {
+        match self {
+            Self::Original => "Qwen/Qwen-Image-2.1",
+            Self::Mlx4Bit => "ddalcu/Qwen-Image-2.1-MLX-Serve-4bit",
+            Self::Mlx8Bit => "ddalcu/Qwen-Image-2.1-MLX-Serve-8bit",
+        }
+    }
+
+    /// Pinned commit. Architecture and weights are validated together.
+    pub fn revision(self) -> &'static str {
+        match self {
+            // Matches the checkpoint used by the original Python CLI.
+            Self::Original => "790c92633540aa0cb11d9abf19eb46d861714758",
+            Self::Mlx4Bit => "1cdbb51e8f9269ea9f81d76b7190547f9eb3c512",
+            Self::Mlx8Bit => "dc21b8d3441eef8f50ee5915dd5ea74679bcf338",
+        }
+    }
+
+    /// Short name, as used by the CLI's `--model` and the desktop settings file.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Original => "bf16",
+            Self::Mlx4Bit => "mlx-4bit",
+            Self::Mlx8Bit => "mlx-8bit",
+        }
+    }
+
+    /// Approximate download size in GB.
+    pub fn download_gb(self) -> u32 {
+        match self {
+            Self::Original => 32,
+            Self::Mlx4Bit => 11,
+            Self::Mlx8Bit => 18,
+        }
+    }
+
+    /// The MLX packs publish no shard index; their shards are fixed per revision.
+    fn shards(self, component: &str) -> Option<&'static [&'static str]> {
+        match (self, component) {
+            (Self::Original, _) => None,
+            (_, "text_encoder") => Some(&[
+                "model-00001-of-00004.safetensors",
+                "model-00002-of-00004.safetensors",
+                "model-00003-of-00004.safetensors",
+                "model-00004-of-00004.safetensors",
+            ]),
+            (_, "transformer") => Some(&[
+                "diffusion_pytorch_model-00001-of-00002.safetensors",
+                "diffusion_pytorch_model-00002-of-00002.safetensors",
+            ]),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Checkpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.repo())
+    }
+}
 
 /// Memoize actual device tensors, not just the file mappings. Builder clones
 /// share this cache; request-local layers can be dropped without reloading weights.
@@ -65,7 +141,7 @@ impl SimpleBackend for CachedWeights {
         device: &Device,
     ) -> candle_core::Result<Tensor> {
         // A cache belongs to one model's device/dtype for its entire lifetime.
-        if dtype != self.source.dtype() || !device.same_device(self.source.device()) {
+        if !stored_dtype(dtype, self.source.dtype()) || !device.same_device(self.source.device()) {
             candle_core::bail!("cached weights require their original device and dtype");
         }
         let mut tensors = self
@@ -75,7 +151,7 @@ impl SimpleBackend for CachedWeights {
         if let Some(tensor) = tensors.get(name) {
             return Ok(tensor.clone());
         }
-        let tensor = self.source.get_unchecked(name)?;
+        let tensor = self.source.get_unchecked_dtype(name, dtype)?;
         tensors.insert(name.to_owned(), tensor.clone());
         Ok(tensor)
     }
@@ -85,27 +161,34 @@ impl SimpleBackend for CachedWeights {
     }
 }
 
+/// Weights load in the builder's float dtype, except MLX-packed quantized
+/// values, which are read as unconverted `u32` words.
+pub(crate) fn stored_dtype(requested: DType, builder: DType) -> bool {
+    requested == builder || requested == DType::U32
+}
+
 #[derive(Clone)]
 pub struct Weights {
     local: Option<PathBuf>,
     offline: bool,
+    checkpoint: Checkpoint,
     shared: Option<Arc<crate::shared::SharedWeights>>,
 }
 
 impl Weights {
-    pub fn new(local: Option<PathBuf>, offline: bool) -> Self {
+    pub fn new(local: Option<PathBuf>, offline: bool, checkpoint: Checkpoint) -> Self {
         Self {
             local,
             offline,
+            checkpoint,
             shared: None,
         }
     }
 
-    pub fn shared(local: Option<PathBuf>, offline: bool) -> Self {
+    pub fn shared(local: Option<PathBuf>, offline: bool, checkpoint: Checkpoint) -> Self {
         Self {
-            local,
-            offline,
             shared: Some(Arc::default()),
+            ..Self::new(local, offline, checkpoint)
         }
     }
 
@@ -127,7 +210,8 @@ impl Weights {
             );
             return Ok(path);
         }
-        let repo = Repo::with_revision(MODEL.into(), RepoType::Model, REVISION.into());
+        let (model, revision) = (self.checkpoint.repo(), self.checkpoint.revision());
+        let repo = Repo::with_revision(model.into(), RepoType::Model, revision.into());
         let cache = std::env::var_os("HF_HUB_CACHE")
             .map(|p| Cache::new(p.into()))
             .unwrap_or_else(Cache::from_env);
@@ -136,7 +220,7 @@ impl Weights {
             .path()
             .join(repo.folder_name())
             .join("snapshots")
-            .join(REVISION)
+            .join(revision)
             .join(name);
         if snapshot.is_file() {
             return Ok(snapshot);
@@ -159,7 +243,7 @@ impl Weights {
             .build()?
             .repo(repo)
             .download_with_progress(name, DownloadReporter::new(on_progress))
-            .with_context(|| format!("downloading {MODEL}/{name}"))
+            .with_context(|| format!("downloading {model}/{name}"))
     }
 
     pub fn prepare(
@@ -180,19 +264,61 @@ impl Weights {
         ] {
             fetch(name)?;
         }
-        for (component, base) in [
-            ("text_encoder", "model"),
-            ("transformer", "diffusion_pytorch_model"),
-        ] {
-            let index: serde_json::Value = read_json(&fetch(&format!(
-                "{component}/{base}.safetensors.index.json"
-            ))?)?;
-            for name in shard_names(&index)? {
-                fetch(&format!("{component}/{name}"))?;
+        for component in ["text_encoder", "transformer", "vae"] {
+            for name in self.shard_files(component, &mut fetch)? {
+                fetch(&name)?;
             }
         }
-        fetch("vae/diffusion_pytorch_model.safetensors")?;
         Ok(())
+    }
+
+    /// Checkpoint-relative paths of a component's safetensors files, read from
+    /// the shard index when the checkpoint has one. Local directories without an
+    /// index use every `.safetensors` file in the component's directory.
+    fn shard_files(
+        &self,
+        component: &str,
+        fetch: &mut dyn FnMut(&str) -> Result<PathBuf>,
+    ) -> Result<Vec<String>> {
+        if component == "vae" {
+            return Ok(vec!["vae/diffusion_pytorch_model.safetensors".into()]);
+        }
+        let base = if component == "text_encoder" {
+            "model"
+        } else {
+            "diffusion_pytorch_model"
+        };
+        let index = format!("{component}/{base}.safetensors.index.json");
+        let names = match (&self.local, self.checkpoint.shards(component)) {
+            (Some(root), _) if !root.join(&index).is_file() => {
+                let mut names = Vec::new();
+                let dir = root.join(component);
+                for entry in
+                    std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?
+                {
+                    let name = entry?.file_name().to_string_lossy().into_owned();
+                    if name.ends_with(".safetensors") {
+                        names.push(name);
+                    }
+                }
+                ensure!(
+                    !names.is_empty(),
+                    "no {component} safetensors files in {}",
+                    dir.display()
+                );
+                names.sort();
+                names
+            }
+            (None, Some(shards)) => shards.iter().map(|&s| s.to_owned()).collect(),
+            _ => shard_names(&read_json(&fetch(&index)?)?)?
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        };
+        Ok(names
+            .into_iter()
+            .map(|name| format!("{component}/{name}"))
+            .collect())
     }
 
     pub fn config<T: DeserializeOwned>(&self, name: &str) -> Result<T> {
@@ -217,21 +343,11 @@ impl Weights {
         dtype: DType,
         device: &Device,
     ) -> Result<VarBuilder<'static>> {
-        let files = if component == "vae" {
-            vec![self.file("vae/diffusion_pytorch_model.safetensors")?]
-        } else {
-            let base = if component == "text_encoder" {
-                "model"
-            } else {
-                "diffusion_pytorch_model"
-            };
-            let index: serde_json::Value =
-                self.config(&format!("{component}/{base}.safetensors.index.json"))?;
-            shard_names(&index)?
-                .into_iter()
-                .map(|name| self.file(&format!("{component}/{name}")))
-                .collect::<Result<Vec<_>>>()?
-        };
+        let files = self
+            .shard_files(component, &mut |name| self.file(name))?
+            .iter()
+            .map(|name| self.file(name))
+            .collect::<Result<Vec<_>>>()?;
         // SAFETY: checkpoint files are read-only for the lifetime of this process. Do not modify
         // files in --model-dir while inference is running. The builder owns its mmap handles.
         unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device) }
@@ -360,6 +476,17 @@ mod tests {
         assert_eq!(loads.load(std::sync::atomic::Ordering::Relaxed), 3);
         assert_ne!(cached.pp("encoder").get(2, "weight")?.id(), id);
         assert_eq!(loads.load(std::sync::atomic::Ordering::Relaxed), 4);
+        // MLX-packed weights are read as u32, without conversion to the float dtype.
+        let packed = cached.get_unchecked_dtype("packed.weight", DType::U32)?;
+        assert_eq!(packed.dtype(), DType::U32);
+        let id = packed.id();
+        assert_eq!(
+            cached
+                .get_unchecked_dtype("packed.weight", DType::U32)?
+                .id(),
+            id
+        );
+        assert!(cached.get_unchecked_dtype("other", DType::F16).is_err());
         Ok(())
     }
 
@@ -382,7 +509,7 @@ mod tests {
     #[test]
     fn prepare_checks_all_shards_and_uses_local_files_without_downloads() -> Result<()> {
         let directory = TempDir::new();
-        let weights = Weights::new(Some(directory.0.clone()), true);
+        let weights = Weights::new(Some(directory.0.clone()), true, Checkpoint::Original);
         for component in ["processor", "text_encoder", "transformer", "vae"] {
             std::fs::create_dir(directory.0.join(component))?;
         }
@@ -419,6 +546,57 @@ mod tests {
                 .prepare(&cancellation, &mut |_| {})
                 .unwrap_err()
                 .is::<crate::Cancelled>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mlx_checkpoints_use_fixed_shards_and_local_directories_without_an_index() -> Result<()> {
+        assert_eq!(Checkpoint::default(), Checkpoint::Original);
+        for checkpoint in Checkpoint::ALL {
+            assert_eq!(checkpoint.revision().len(), 40);
+            let json = serde_json::to_string(&checkpoint)?;
+            assert_eq!(json, format!("\"{}\"", checkpoint.name()));
+        }
+        let mut no_index = |name: &str| -> Result<PathBuf> { panic!("fetched {name}") };
+        let remote = Weights::new(None, true, Checkpoint::Mlx4Bit);
+        assert_eq!(
+            remote.shard_files("transformer", &mut no_index)?,
+            [
+                "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+                "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+            ]
+        );
+        assert_eq!(remote.shard_files("text_encoder", &mut no_index)?.len(), 4);
+
+        let directory = TempDir::new();
+        let local = Weights::new(Some(directory.0.clone()), true, Checkpoint::Mlx8Bit);
+        for name in [
+            "processor/tokenizer.json",
+            "transformer/config.json",
+            "transformer/b.safetensors",
+            "transformer/a.safetensors",
+            "transformer/notes.txt",
+            "text_encoder/model.safetensors",
+            "vae/config.json",
+            "vae/diffusion_pytorch_model.safetensors",
+        ] {
+            let path = directory.0.join(name);
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(path, b"fixture")?;
+        }
+        assert_eq!(
+            local.shard_files("transformer", &mut no_index)?,
+            ["transformer/a.safetensors", "transformer/b.safetensors"]
+        );
+        local.prepare(&CancellationToken::default(), &mut |_| {
+            panic!("local file triggered download")
+        })?;
+        std::fs::remove_file(directory.0.join("text_encoder/model.safetensors"))?;
+        assert!(
+            local
+                .prepare(&CancellationToken::default(), &mut |_| {})
+                .is_err()
         );
         Ok(())
     }
@@ -471,7 +649,7 @@ mod tests {
                 }
                 let body = if metadata { &data[..1] } else { &data[..] };
                 write!(stream, "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes 0-{}/{}\r\nX-Repo-Commit: {}\r\nETag: fixture\r\nConnection: close\r\n\r\n",
-                    body.len(), body.len() - 1, data.len(), REVISION).unwrap();
+                    body.len(), body.len() - 1, data.len(), Checkpoint::Original.revision()).unwrap();
                 stream.write_all(body).unwrap();
             }
         });
@@ -481,7 +659,12 @@ mod tests {
             .with_cache_dir(directory.0.clone())
             .with_progress(false)
             .build()?;
-        let repo = Repo::with_revision(MODEL.into(), RepoType::Model, REVISION.into());
+        let checkpoint = Checkpoint::Original;
+        let repo = Repo::with_revision(
+            checkpoint.repo().into(),
+            RepoType::Model,
+            checkpoint.revision().into(),
+        );
         let path = api.repo(repo).download_with_progress(
             "fixture.safetensors",
             DownloadReporter::new(&mut |event| events.push(event)),

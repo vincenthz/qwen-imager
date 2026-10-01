@@ -490,3 +490,49 @@ fn shared_model_sessions_run_concurrently_and_cancel_independently() -> qwen_ima
     assert_eq!(recovered.image.as_raw(), expected[1].as_raw());
     Ok(())
 }
+
+#[test]
+#[ignore = "requires the cached MLX 4-bit checkpoint and Metal GPU"]
+fn mlx_checkpoint_generates_and_edits_with_shared_weights() -> qwen_imager::Result<()> {
+    use qwen_imager::{Checkpoint, SharedModel};
+    let model = SharedModel::new(ModelOptions {
+        offline: true,
+        checkpoint: Checkpoint::Mlx4Bit,
+        ..Default::default()
+    });
+    let cancellation = CancellationToken::default();
+    let mut request = Request::new("a red teapot on a white table");
+    request.scale = 0.125;
+    request.steps = 2;
+    let first = model
+        .generator()
+        .generate(&request, &cancellation, |_| {})?;
+    let pixels = first.image.as_raw();
+    assert_eq!((first.image.width(), first.image.height()), (256, 256));
+    assert!(
+        pixels.chunks(4).any(|p| p != &pixels[..4]),
+        "uniform image from quantized weights"
+    );
+    // Quantized weights are shared and deterministic across sessions.
+    let second = model
+        .generator()
+        .generate(&request, &cancellation, |_| {})?;
+    assert_eq!(first.image.as_raw(), second.image.as_raw());
+    // Editing runs the quantized Qwen3-VL vision tower.
+    let mut edit = Request::new("make the teapot blue");
+    edit.images.push((*first.image).clone());
+    edit.scale = 0.125;
+    edit.steps = 2;
+    let mut vision = 0;
+    model.generator().generate(&edit, &cancellation, |event| {
+        if let Event::Progress {
+            stage: Stage::ReferenceVision { .. },
+            ..
+        } = event
+        {
+            vision += 1;
+        }
+    })?;
+    assert!(vision > 0);
+    Ok(())
+}

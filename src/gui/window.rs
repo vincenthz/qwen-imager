@@ -11,7 +11,7 @@ use std::{
 use anyhow::Context as _;
 
 use crate::{
-    settings::{Settings, digits_input, parse_size, parse_steps},
+    settings::{Settings, digits_input, model_label, parse_size, parse_steps},
     timing::{GenerationTiming, format_duration},
 };
 
@@ -124,6 +124,23 @@ impl PaintColor {
 // look between the on-screen preview and the full-resolution reference.
 const BRUSHES: [(&str, f32); 3] = [("S", 0.006), ("M", 0.015), ("L", 0.035)];
 
+// Smallest crop, in reference pixels, on either side.
+const MIN_CROP: u32 = 16;
+
+/// How the pointer edits the reference shown in the main view.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    Draw,
+    Crop,
+}
+
+/// A dragged crop rectangle in normalized image coordinates (0..1 on both axes).
+#[derive(Clone, Copy)]
+struct CropSelection {
+    anchor: (f32, f32),
+    corner: (f32, f32),
+}
+
 /// A freehand stroke in normalized image coordinates (0..1 on both axes).
 #[derive(Clone)]
 struct Stroke {
@@ -184,6 +201,18 @@ impl ReferenceImage {
         let old = std::mem::replace(self, Self::new(name, Arc::new(painted)));
         let _ = window.drop_image(old.preview);
     }
+
+    /// Keeps only `region` (x, y, width, height) of the full-resolution pixels.
+    /// Pending strokes stay where they were drawn and remain undoable.
+    fn crop(&mut self, region: [u32; 4], window: &mut Window) {
+        let [x, y, width, height] = region;
+        let strokes = crop_strokes(&self.strokes, region, self.image.dimensions());
+        let cropped = image::imageops::crop_imm(&*self.image, x, y, width, height).to_image();
+        let name = std::mem::take(&mut self.name);
+        let old = std::mem::replace(self, Self::new(name, Arc::new(cropped)));
+        self.strokes = strokes;
+        let _ = window.drop_image(old.preview);
+    }
 }
 
 pub struct ImageWindow {
@@ -201,14 +230,20 @@ pub struct ImageWindow {
     busy: bool,
     ready: bool,
     checking_model: bool,
+    // The model setting changed while busy; recheck its files once idle.
+    stale_model: bool,
     loading_image: bool,
     references: Vec<ReferenceImage>,
-    // Reference being painted on in the main view, if any.
+    // Reference being painted on or cropped in the main view, if any.
     painting: Option<usize>,
+    tool: Tool,
     paint_color: PaintColor,
     brush: f32,
-    // A stroke is in progress (the last stroke of the painted reference).
+    // A drag is in progress: the last stroke of the painted reference, or `crop`.
     drawing: bool,
+    crop: Option<CropSelection>,
+    // Constrain the crop selection to a square, matching the square output.
+    square_crop: bool,
     // Window-space bounds of the main view, recorded at paint time for mouse mapping.
     canvas_bounds: Rc<Cell<Bounds<Pixels>>>,
     cancellation: CancellationToken,
@@ -265,12 +300,16 @@ impl ImageWindow {
             busy: false,
             ready: false,
             checking_model: true,
+            stale_model: false,
             loading_image: false,
             references: Vec::new(),
             painting: None,
+            tool: Tool::Draw,
             paint_color: PaintColor::Red,
             brush: BRUSHES[1].1,
             drawing: false,
+            crop: None,
+            square_crop: false,
             canvas_bounds: Rc::default(),
             cancellation: CancellationToken::default(),
             status: "Checking model files…".into(),
@@ -300,6 +339,31 @@ impl ImageWindow {
             self.prompt.update(cx, |input, cx| input.focus(window, cx));
         }
         cx.notify();
+    }
+
+    /// Switches to a session of a newly selected model once this workspace is idle.
+    /// Cached encoder results belong to the previous model and are dropped.
+    pub fn set_generator(
+        &mut self,
+        generator: Arc<Mutex<Generator>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.generator = generator;
+        self.stale_model = true;
+        self.recheck_if_stale(window, cx);
+    }
+
+    fn recheck_if_stale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.stale_model || self.busy {
+            return;
+        }
+        self.stale_model = false;
+        self.ready = false;
+        self.checking_model = true;
+        self.status = String::new();
+        self.cancellation = CancellationToken::default();
+        self.check_model(window, cx);
     }
 
     pub fn deactivate(&mut self) {
@@ -332,12 +396,14 @@ impl ImageWindow {
     fn check_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.busy = true;
         let cancellation = self.cancellation.clone();
+        let checkpoint = cx.global::<Settings>().model;
         let sender = self.listen(window, cx);
         thread::spawn(move || {
             // Startup only checks local files, including every indexed weight shard.
             // Downloads are authorized exclusively by the Download button below.
             let mut generator = Generator::new(ModelOptions {
                 offline: true,
+                checkpoint,
                 ..Default::default()
             });
             let result = generator.prepare(&cancellation, |_| {});
@@ -354,9 +420,13 @@ impl ImageWindow {
         self.status = "Preparing download…".into();
         self.progress = 0.;
         let cancellation = self.cancellation.clone();
+        let checkpoint = cx.global::<Settings>().model;
         let sender = self.listen(window, cx);
         thread::spawn(move || {
-            let mut generator = Generator::new(ModelOptions::default());
+            let mut generator = Generator::new(ModelOptions {
+                checkpoint,
+                ..Default::default()
+            });
             let result = generator.prepare(&cancellation, |progress| {
                 if sender.send_blocking(Message::Download(progress)).is_err() {
                     cancellation.cancel();
@@ -625,11 +695,29 @@ impl ImageWindow {
             self.stop_painting();
         } else {
             self.drawing = false;
+            self.crop = None;
             self.painting = Some(index);
-            self.status = format!(
-                "Drawing on image {}. Paint over it, then Generate.",
+            self.status = self.tool_status(index);
+        }
+        cx.notify();
+    }
+
+    fn tool_status(&self, index: usize) -> String {
+        match self.tool {
+            Tool::Draw => format!("Drawing on image {}. Paint over it, then Generate.", index + 1),
+            Tool::Crop => format!(
+                "Cropping image {}. Drag to select the area to keep, then Apply.",
                 index + 1
-            );
+            ),
+        }
+    }
+
+    fn set_tool(&mut self, tool: Tool, cx: &mut Context<Self>) {
+        self.tool = tool;
+        self.drawing = false;
+        self.crop = None;
+        if let Some(index) = self.painting {
+            self.status = self.tool_status(index);
         }
         cx.notify();
     }
@@ -637,6 +725,7 @@ impl ImageWindow {
     fn stop_painting(&mut self) {
         self.painting = None;
         self.drawing = false;
+        self.crop = None;
     }
 
     fn painted_reference(&mut self) -> Option<&mut ReferenceImage> {
@@ -700,6 +789,74 @@ impl ImageWindow {
             stroke.points.push(point);
             cx.notify();
         }
+    }
+
+    fn start_crop(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let Some(point) = self.image_point(event.position) else {
+            return;
+        };
+        if !(0. ..=1.).contains(&point.0) || !(0. ..=1.).contains(&point.1) {
+            return;
+        }
+        self.crop = Some(CropSelection {
+            anchor: point,
+            corner: point,
+        });
+        self.drawing = true;
+        cx.notify();
+    }
+
+    fn extend_crop(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if !self.drawing {
+            return;
+        }
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.drawing = false;
+            return;
+        }
+        let Some((x, y)) = self.image_point(event.position) else {
+            return;
+        };
+        if let Some(crop) = &mut self.crop {
+            crop.corner = (x.clamp(0., 1.), y.clamp(0., 1.));
+            cx.notify();
+        }
+    }
+
+    fn apply_crop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let (Some(index), Some(selection)) = (self.painting, self.crop) else {
+            return;
+        };
+        let reference = &self.references[index];
+        let Some(region) = crop_region(selection, reference.image.dimensions(), self.square_crop)
+        else {
+            self.status = format!("Select at least {MIN_CROP}×{MIN_CROP} pixels to crop.");
+            cx.notify();
+            return;
+        };
+        if self
+            .before
+            .as_ref()
+            .is_some_and(|before| Arc::ptr_eq(before, &reference.preview))
+        {
+            self.clear_comparison();
+        }
+        self.drawing = false;
+        self.crop = None;
+        self.references[index].crop(region, window);
+        self.status = format!(
+            "Cropped image {} to {}×{} pixels.",
+            index + 1,
+            region[2],
+            region[3]
+        );
+        cx.notify();
     }
 
     fn undo_stroke(&mut self, cx: &mut Context<Self>) {
@@ -901,6 +1058,10 @@ impl ImageWindow {
                 }
             }
         }
+        if self.stale_model && !self.busy {
+            // Defer so the check's new channel does not replace this one mid-message.
+            cx.defer_in(window, |view, window, cx| view.recheck_if_stale(window, cx));
+        }
         if activity {
             cx.emit(WorkspaceActivity);
         }
@@ -1045,7 +1206,7 @@ impl Render for ImageWindow {
                                 return content.child("Checking local model files…");
                             }
                             content
-                                .child("The image model is not fully available on this Mac. Download it to start generating images. The full model needs about 32 GB of disk space; files already downloaded will be reused.")
+                                .child(format!("The {} image model is not fully available on this Mac. Download it to start generating images. It needs about {} GB of disk space; files already downloaded will be reused.", model_label(cx.global::<Settings>().model), cx.global::<Settings>().model.download_gb()))
                                 .child(div().child(
                                     Button::new("download")
                                         .primary()
@@ -1215,8 +1376,40 @@ impl Render for ImageWindow {
                     )))))
             .when_some(self.painting.filter(|_| !self.busy), |view_root, index| {
                 let has_strokes = !self.references[index].strokes.is_empty();
+                let crop_region = self.crop.and_then(|crop| {
+                    crop_region(crop, self.references[index].image.dimensions(), self.square_crop)
+                });
                 view_root.child(div().flex().flex_wrap().items_center().gap_2().text_sm()
-                    .child(format!("Draw on image {}", index + 1))
+                    .child(format!("Image {}", index + 1))
+                    .child(Button::new("tool-draw").label("Draw")
+                        .selected(self.tool == Tool::Draw)
+                        .tooltip("Paint over the image")
+                        .on_click(cx.listener(|view, _, _, cx| view.set_tool(Tool::Draw, cx))))
+                    .child(Button::new("tool-crop").label("Crop")
+                        .selected(self.tool == Tool::Crop)
+                        .tooltip("Keep only part of the image")
+                        .on_click(cx.listener(|view, _, _, cx| view.set_tool(Tool::Crop, cx))))
+                    .child(div().w(px(8.)))
+                    .when(self.tool == Tool::Crop, |row| row
+                    .child(Button::new("square-crop").label("Square")
+                        .selected(self.square_crop)
+                        .tooltip("Keep the selection square, like the generated image")
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.square_crop = !view.square_crop;
+                            cx.notify();
+                        })))
+                    .when_some(crop_region, |row, [_, _, width, height]| row.child(
+                        div().text_color(rgb(0x9da6b5)).child(format!("{width}×{height}"))))
+                    .child(Button::new("apply-crop").label("Apply").disabled(crop_region.is_none())
+                        .tooltip("Crop the reference to the selection")
+                        .on_click(cx.listener(|view, _, window, cx| view.apply_crop(window, cx))))
+                    .child(Button::new("clear-crop").label("Clear").disabled(self.crop.is_none())
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.crop = None;
+                            view.drawing = false;
+                            cx.notify();
+                        }))))
+                    .when(self.tool == Tool::Draw, |row| row
                     .children(PaintColor::ALL.into_iter().map(|color| {
                         let selected = self.paint_color == color;
                         div().id(color.name()).w(px(24.)).h(px(24.)).rounded_full()
@@ -1245,9 +1438,9 @@ impl Render for ImageWindow {
                     .child(Button::new("undo-stroke").label("Undo").disabled(!has_strokes)
                         .on_click(cx.listener(|view, _, _, cx| view.undo_stroke(cx))))
                     .child(Button::new("clear-strokes").label("Clear").disabled(!has_strokes)
-                        .on_click(cx.listener(|view, _, _, cx| view.clear_strokes(cx))))
+                        .on_click(cx.listener(|view, _, _, cx| view.clear_strokes(cx)))))
                     .child(Button::new("done-painting").label("Done").ml_auto()
-                        .tooltip("Stop drawing. Paint is applied when you Generate.")
+                        .tooltip("Stop editing. Paint is applied when you Generate.")
                         .on_click(cx.listener(move |view, _, _, cx| view.toggle_painting(index, cx)))))
             })
             .child(
@@ -1265,13 +1458,23 @@ impl Render for ImageWindow {
                     .map(|container| match self.painting.and_then(|index| self.references.get(index)) {
                         Some(reference) => {
                             let bounds = self.canvas_bounds.clone();
+                            let dimensions = reference.image.dimensions();
                             container
                                 .cursor(CursorStyle::Crosshair)
-                                .on_mouse_down(MouseButton::Left, cx.listener(|view, event, _, cx| view.start_stroke(event, cx)))
-                                .on_mouse_move(cx.listener(|view, event, _, cx| view.extend_stroke(event, cx)))
+                                .map(|container| match self.tool {
+                                    Tool::Draw => container
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|view, event, _, cx| view.start_stroke(event, cx)))
+                                        .on_mouse_move(cx.listener(|view, event, _, cx| view.extend_stroke(event, cx))),
+                                    Tool::Crop => container
+                                        .on_mouse_down(MouseButton::Left, cx.listener(|view, event, _, cx| view.start_crop(event, cx)))
+                                        .on_mouse_move(cx.listener(|view, event, _, cx| view.extend_crop(event, cx))),
+                                })
                                 .on_mouse_up(MouseButton::Left, cx.listener(|view, _, _, _| view.drawing = false))
                                 .child(img(reference.preview.clone()).size_full().object_fit(ObjectFit::Contain))
                                 .child(stroke_overlay(reference, Some(bounds)))
+                                .when_some(self.crop.filter(|_| self.tool == Tool::Crop), |container, crop| {
+                                    container.child(crop_overlay(crop_bounds(crop, dimensions, self.square_crop), dimensions))
+                                })
                         }
                         None => container.map(|container| match self.before.as_ref().filter(|_| self.showing_before).or(self.rendered.as_ref()).or_else(|| self.references.last().map(|reference| &reference.preview)) {
                         Some(image) => container.child(
@@ -1369,6 +1572,120 @@ fn stroke_overlay(
                     }
                 }
             });
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
+/// The selection in image pixels as (left, top, right, bottom). A square
+/// selection grows from the anchor without leaving the image.
+fn crop_bounds(
+    selection: CropSelection,
+    (width, height): (u32, u32),
+    square: bool,
+) -> (f32, f32, f32, f32) {
+    let (width, height) = (width as f32, height as f32);
+    let (ax, ay) = (selection.anchor.0 * width, selection.anchor.1 * height);
+    let (mut dx, mut dy) = (
+        selection.corner.0 * width - ax,
+        selection.corner.1 * height - ay,
+    );
+    if square {
+        let room_x = if dx < 0. { ax } else { width - ax };
+        let room_y = if dy < 0. { ay } else { height - ay };
+        let side = dx.abs().max(dy.abs()).min(room_x).min(room_y);
+        dx = side.copysign(dx);
+        dy = side.copysign(dy);
+    }
+    (ax.min(ax + dx), ay.min(ay + dy), ax.max(ax + dx), ay.max(ay + dy))
+}
+
+/// The selection as a pixel region (x, y, width, height), if it is large enough.
+fn crop_region(selection: CropSelection, dimensions: (u32, u32), square: bool) -> Option<[u32; 4]> {
+    let (left, top, right, bottom) = crop_bounds(selection, dimensions, square);
+    let (x, y) = (left.round() as u32, top.round() as u32);
+    let mut width = (right.round() as u32).min(dimensions.0).saturating_sub(x);
+    let mut height = (bottom.round() as u32).min(dimensions.1).saturating_sub(y);
+    if square {
+        width = width.min(height);
+        height = width;
+    }
+    (width >= MIN_CROP && height >= MIN_CROP).then_some([x, y, width, height])
+}
+
+/// Maps strokes into a cropped region, dropping those entirely outside it.
+fn crop_strokes(
+    strokes: &[Stroke],
+    [x, y, width, height]: [u32; 4],
+    (full_width, full_height): (u32, u32),
+) -> Vec<Stroke> {
+    // Brush widths are relative to the longer side, which the crop changes.
+    let scale = full_width.max(full_height) as f32 / width.max(height) as f32;
+    let longer = width.max(height) as f32;
+    strokes
+        .iter()
+        .filter_map(|stroke| {
+            let points: Vec<_> = stroke
+                .points
+                .iter()
+                .map(|&(px_, py)| {
+                    (
+                        (px_ * full_width as f32 - x as f32) / width as f32,
+                        (py * full_height as f32 - y as f32) / height as f32,
+                    )
+                })
+                .collect();
+            let width_ = stroke.width * scale;
+            let (rx, ry) = (
+                width_ * longer / 2. / width as f32,
+                width_ * longer / 2. / height as f32,
+            );
+            let (min_x, max_x, min_y, max_y) = points.iter().fold(
+                (f32::MAX, f32::MIN, f32::MAX, f32::MIN),
+                |(a, b, c, d), &(px_, py)| (a.min(px_), b.max(px_), c.min(py), d.max(py)),
+            );
+            (max_x >= -rx && min_x <= 1. + rx && max_y >= -ry && min_y <= 1. + ry).then(|| {
+                Stroke {
+                    color: stroke.color,
+                    width: width_,
+                    points,
+                }
+            })
+        })
+        .collect()
+}
+
+// Dims everything outside the crop selection (given in image pixels).
+fn crop_overlay(
+    (left, top, right, bottom): (f32, f32, f32, f32),
+    dimensions: (u32, u32),
+) -> impl IntoElement {
+    canvas(
+        |_, _, _| {},
+        move |bounds, (), window, _| {
+            let rect = contain(bounds, dimensions);
+            let at = |x: f32, y: f32| {
+                point(
+                    rect.origin.x + rect.size.width * (x / dimensions.0 as f32),
+                    rect.origin.y + rect.size.height * (y / dimensions.1 as f32),
+                )
+            };
+            let (width, height) = (dimensions.0 as f32, dimensions.1 as f32);
+            let shade = gpui::rgba(0x000000a0);
+            for (a, b) in [
+                (at(0., 0.), at(width, top)),
+                (at(0., bottom), at(width, height)),
+                (at(0., top), at(left, bottom)),
+                (at(right, top), at(width, bottom)),
+            ] {
+                window.paint_quad(gpui::fill(Bounds::from_corners(a, b), shade));
+            }
+            window.paint_quad(gpui::outline(
+                Bounds::from_corners(at(left, top), at(right, bottom)),
+                rgb(0x8aa6ff),
+                gpui::BorderStyle::default(),
+            ));
         },
     )
     .absolute()
@@ -1510,5 +1827,62 @@ mod tests {
         assert_eq!(image.get_pixel(10, 51).0, [0, 255, 0, 255]);
         assert_eq!(image.get_pixel(50, 45).0, [0, 0, 0, 255]);
         assert_eq!(image.get_pixel(2, 50).0, [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn crop_region_orders_corners_and_rejects_tiny_selections() {
+        let selection = CropSelection {
+            anchor: (0.75, 0.5),
+            corner: (0.25, 0.1),
+        };
+        assert_eq!(crop_region(selection, (200, 100), false), Some([50, 10, 100, 40]));
+        let tiny = CropSelection {
+            anchor: (0.5, 0.5),
+            corner: (0.52, 0.9),
+        };
+        assert_eq!(crop_region(tiny, (200, 100), false), None);
+    }
+
+    #[test]
+    fn square_crop_stays_inside_the_image() {
+        let selection = CropSelection {
+            anchor: (0.5, 0.5),
+            corner: (1.0, 0.6),
+        };
+        // 100px of room to the right, but only 50px below the anchor.
+        assert_eq!(crop_region(selection, (200, 100), true), Some([100, 50, 50, 50]));
+        let up_left = CropSelection {
+            anchor: (0.5, 0.5),
+            corner: (0.0, 0.45),
+        };
+        assert_eq!(crop_region(up_left, (200, 100), true), Some([50, 0, 50, 50]));
+    }
+
+    #[test]
+    fn cropped_strokes_keep_their_pixels() {
+        let stroke = Stroke {
+            color: PaintColor::Red,
+            width: 0.04,
+            points: vec![(0.1, 0.5), (0.9, 0.5)],
+        };
+        let outside = Stroke {
+            color: PaintColor::Blue,
+            width: 0.01,
+            points: vec![(0.05, 0.05)],
+        };
+        let region = [20, 30, 50, 40];
+        let mut full = RgbaImage::from_pixel(100, 100, image::Rgba([0, 0, 0, 255]));
+        rasterize_stroke(&mut full, &stroke);
+        let expected = image::imageops::crop_imm(&full, 20, 30, 50, 40).to_image();
+        let strokes = crop_strokes(&[stroke, outside], region, (100, 100));
+        assert_eq!(strokes.len(), 1);
+        let mut cropped = RgbaImage::from_pixel(50, 40, image::Rgba([0, 0, 0, 255]));
+        rasterize_stroke(&mut cropped, &strokes[0]);
+        let differing = cropped
+            .pixels()
+            .zip(expected.pixels())
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(differing <= 4, "{differing} pixels differ");
     }
 }

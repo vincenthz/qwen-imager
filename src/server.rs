@@ -10,7 +10,8 @@ use axum::{
     routing::{get, post},
 };
 use qwen_imager::{
-    CancellationToken, Event, Generator, ModelOptions, PreviewControl, Request, RgbaImage, Stage,
+    CancellationToken, Checkpoint, Event, Generator, ModelOptions, PreviewControl, Request,
+    RgbaImage, Stage,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -305,9 +306,18 @@ struct Service {
     authorization: Option<HeaderValue>,
     reference_memory: Arc<Semaphore>,
     uploads: Arc<Semaphore>,
+    checkpoint: Checkpoint,
 }
 impl Service {
+    #[cfg(test)]
     fn new(max_jobs: usize, authorization: Option<HeaderValue>) -> Arc<Self> {
+        Self::with_checkpoint(max_jobs, authorization, Checkpoint::default())
+    }
+    fn with_checkpoint(
+        max_jobs: usize,
+        authorization: Option<HeaderValue>,
+        checkpoint: Checkpoint,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store: Mutex::new(Store {
                 jobs: BTreeMap::new(),
@@ -322,6 +332,7 @@ impl Service {
                 REFERENCE_MEMORY_LIMIT / REFERENCE_MEMORY_UNIT,
             )),
             uploads: Arc::new(Semaphore::new(2)),
+            checkpoint,
         })
     }
     fn job(&self, id: u64) -> ApiResult<SharedJob> {
@@ -511,7 +522,7 @@ async fn health(State(service): State<Arc<Service>>) -> Json<serde_json::Value> 
     let store = service.store.lock().unwrap();
     Json(
         serde_json::json!({"status": if store.stopping { "stopping" } else { "ok" },
-        "model": qwen_imager::MODEL, "retained_jobs": store.jobs.len(), "queued_jobs": store.queue.len(), "max_jobs": service.max_jobs}),
+        "model": service.checkpoint.repo(), "revision": service.checkpoint.revision(), "retained_jobs": store.jobs.len(), "queued_jobs": store.queue.len(), "max_jobs": service.max_jobs}),
     )
 }
 fn decode_references(
@@ -774,7 +785,7 @@ pub fn run(address: SocketAddr, max_jobs: usize, options: ModelOptions) -> anyho
         .build()?;
     runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind(address).await?;
-        let service = Service::new(max_jobs, authorization);
+        let service = Service::with_checkpoint(max_jobs, authorization, options.checkpoint);
         let worker_service = service.clone();
         let thread = std::thread::Builder::new().name("generation".into()).spawn(move || worker(worker_service, options))?;
         eprintln!("Qwen HTTP service listening on http://{} (one generation at a time, {max_jobs} retained jobs)", listener.local_addr()?);

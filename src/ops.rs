@@ -1,9 +1,12 @@
 //! Tensor operations shared only by the three Qwen 2.1 components.
 use candle_core::{D, DType, Result, Tensor};
-use candle_nn::{Linear, Module, VarBuilder};
+use candle_nn::{Module, VarBuilder};
 
+pub use crate::quant::Linear;
+
+/// Dense or MLX-quantized, depending on the checkpoint's tensors.
 pub fn linear(vb: VarBuilder, input: usize, output: usize, bias: bool) -> Result<Linear> {
-    candle_nn::linear_b(input, output, bias, vb)
+    Linear::load(vb, input, output, bias)
 }
 
 pub fn rms(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
@@ -79,15 +82,39 @@ pub fn attention_in(
         // kernel produces NaNs for some such inputs; the default uses FP32
         // attention and casts its output back, retaining BF16 model weights
         // and activations.
+        let seq = q.dim(2)?;
+        // Candle 0.9.2's causal loop bound for the last 32-row query block is
+        // not clamped to the key length. It then reads up to 31 key/value rows
+        // past the end, unchecked. Those rows are masked, but stale NaN bytes
+        // in the allocation still poison the output (0 * NaN). Zero-padding
+        // every sequence to a whole query block at the end keeps the causal
+        // offset, so real queries never see padded keys; padded rows are dropped.
+        let pad = if causal {
+            seq.next_multiple_of(32) - seq
+        } else {
+            0
+        };
+        let prepare = |x: &Tensor| -> Result<Tensor> {
+            let x = x.to_dtype(precision)?;
+            if pad == 0 {
+                return x.contiguous();
+            }
+            let (b, h, _, d) = x.dims4()?;
+            Tensor::cat(
+                &[&x, &Tensor::zeros((b, h, pad, d), precision, x.device())?],
+                2,
+            )
+        };
         return candle_nn::ops::sdpa(
-            &q.to_dtype(precision)?.contiguous()?,
-            &k.to_dtype(precision)?.contiguous()?,
-            &v.to_dtype(precision)?.contiguous()?,
+            &prepare(q)?,
+            &prepare(k)?,
+            &prepare(v)?,
             None,
             causal,
             scale,
             1.0,
         )?
+        .narrow(2, 0, seq)?
         .to_dtype(q.dtype());
     }
     let (b, h, seq, _) = q.dims4()?;
@@ -235,6 +262,52 @@ mod tests {
                     "{dtype:?} attention seq={seq} kv={kv} causal={causal}: max error {max}"
                 );
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Metal GPU access"]
+    fn causal_attention_ignores_stale_memory_after_the_last_key() -> Result<()> {
+        // A fresh device has its own buffer pool. Releasing a larger NaN buffer
+        // makes it the best fit for the key/value copies below, so the bytes
+        // after their last row are NaN, as when freed tensors are recycled.
+        let gpu = Device::new_metal(0)?;
+        let make = |heads: usize, len: usize, shift: f32| -> Result<Tensor> {
+            let data: Vec<f32> = (0..heads * len * 128)
+                .map(|i| (i as f32 * 0.013 + shift).sin())
+                .collect();
+            Tensor::from_vec(data, (1, heads, len, 128), &Device::Cpu)
+        };
+        for (seq, kv, heads) in [(37, 37, 8), (45, 61, 8), (33, 33, 2)] {
+            let (q, k, v) = (
+                make(32, seq, 0.)?,
+                make(heads, kv, 0.4)?,
+                make(heads, kv, 0.9)?,
+            );
+            let expected = attention(&q, &k, &v, true)?;
+            // Keep the uploads alive: a released one would be a better fit.
+            let (qg, kg, vg) = (q.to_device(&gpu)?, k.to_device(&gpu)?, v.to_device(&gpu)?);
+            let poisoned = |x: &Tensor| -> Result<Tensor> {
+                drop(Tensor::full(
+                    f32::NAN,
+                    x.elem_count() + 64 * 128 * heads,
+                    &gpu,
+                )?);
+                // `affine` allocates its output from the pool.
+                x.affine(1., 0.)
+            };
+            let (kp, vp) = (poisoned(&kg)?, poisoned(&vg)?);
+            let actual = attention(&qg, &kp, &vp, true)?.to_device(&Device::Cpu)?;
+            let error = (expected - actual)?
+                .abs()?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            assert!(error.iter().all(|v| v.is_finite()), "seq={seq} kv={kv}");
+            assert!(
+                error.into_iter().fold(0f32, f32::max) < 1e-4,
+                "seq={seq} kv={kv}"
+            );
         }
         Ok(())
     }

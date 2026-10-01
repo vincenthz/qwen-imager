@@ -7,8 +7,8 @@ cargo build --release --bin qwen-imager-cli
 ./target/release/qwen-imager-cli --serve --offline
 ```
 
-The default address is `127.0.0.1:6996`. `--model-dir PATH` and `--offline`
-work as in the normal CLI. The first job loads the model; later jobs reuse its
+The default address is `127.0.0.1:6996`. `--model`, `--model-dir PATH` and
+`--offline` work as in the normal CLI; one service serves one checkpoint. The first job loads the model; later jobs reuse its
 loaded weights. One job runs at a time, with other jobs queued in submission
 order. HTTP requests remain responsive while inference runs.
 
@@ -150,7 +150,7 @@ as PNG lazily, off the inference thread. Repeated fetches reuse the encoded PNG.
 
 | Method and path | Result |
 | --- | --- |
-| `GET /health` | Service availability, model ID, queue size, and capacity; does not load/test the model |
+| `GET /health` | Service availability, model ID and pinned revision, queue size, and capacity; does not load/test the model |
 | `GET /jobs` | `{"jobs": [...]}` for all retained jobs, oldest first |
 | `POST /jobs` | Submit JSON or multipart images + parameters; `202` with job and `Location` |
 | `GET /jobs/{id}` | Current job status |

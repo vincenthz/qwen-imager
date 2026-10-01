@@ -82,7 +82,7 @@ impl SharedTensors {
     }
 
     fn get(&self, name: &str, dtype: DType, device: &Device) -> candle_core::Result<Tensor> {
-        if dtype != self.source.dtype() {
+        if !crate::weights::stored_dtype(dtype, self.source.dtype()) {
             candle_core::bail!("shared weights require their original dtype");
         }
         let tensor = {
@@ -93,7 +93,7 @@ impl SharedTensors {
             if let Some(tensor) = tensors.get(name) {
                 tensor.clone()
             } else {
-                let tensor = immutable_buffer(self.source.get_unchecked(name)?)?;
+                let tensor = immutable_buffer(self.source.get_unchecked_dtype(name, dtype)?)?;
                 tensors.insert(name.to_owned(), tensor.clone());
                 tensor
             }

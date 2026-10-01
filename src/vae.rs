@@ -314,7 +314,7 @@ mod tests {
     #[ignore = "requires the cached Qwen 2.1 checkpoint and Metal GPU access"]
     fn checkpoint_matches_diffusers_reference() -> anyhow::Result<()> {
         let device = Device::new_metal(0)?;
-        let weights = crate::weights::Weights::new(None, true);
+        let weights = crate::weights::Weights::new(None, true, crate::Checkpoint::Original);
         let vae = Vae::new(
             weights.builder("vae", DType::F32, &device)?,
             weights.config("vae/config.json")?,

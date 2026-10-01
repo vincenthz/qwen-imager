@@ -4,7 +4,8 @@ Native Rust inference for **Qwen Image 2.1** on Apple Silicon Macs, using
 Candle's Metal backend. No Python, PyTorch, server, or C++ inference engine at
 runtime. Library-first, with a CLI for text-to-image, up to 10 reference images,
 and RGBA PNG output. An optional GPUI desktop window uses the same library.
-The library takes and returns in-memory RGBA images.
+The library takes and returns in-memory RGBA images. It runs the original BF16
+checkpoint or a smaller MLX-quantized (4-bit or 8-bit) pack of the same model.
 
 ## Desktop window
 
@@ -41,7 +42,8 @@ button instead of the generation controls. Clicking Download starts fetching
 missing files and displays a progress bar with bytes and percentage for the
 current file. The generation interface appears when the download finishes;
 fully cached models open it directly. Download errors remain visible and you
-can retry with Download. The model is approximately 32 GB; `HF_HOME` and
+can retry with Download. The download size depends on the **Model** setting
+(about 32 GB for BF16, 18 GB for MLX 8-bit, 11 GB for MLX 4-bit); `HF_HOME` and
 `HF_HUB_CACHE` work as they do in the CLI.
 
 The top bar starts with a **gear** icon that opens **Settings**, followed by
@@ -72,6 +74,12 @@ Settings are saved in `~/Library/Application Support/QwenImager/settings.json`:
   different pixels. If a BF16 step produces non-finite latents, it is redone in
   Float32 and the rest of that generation stays in Float32. Applies from the
   next generation.
+- **Model**: **BF16** (the default, the original checkpoint), **MLX 8-bit**, or
+  **MLX 4-bit** (see [Checkpoints](#checkpoints)). Each workspace switches as
+  soon as it is idle; one still generating finishes with the previous model
+  first, and both models stay in memory until it does. Switching drops the
+  workspace's cached prompt and reference encodings. If the selected model is
+  not fully downloaded, the workspace shows the Download screen.
 
 Enter a prompt and click **Generate** to its right. **Steps** and the adjacent
 **Size (px)** field (the square image's side length, multiples of 32 from 32 to
@@ -125,14 +133,22 @@ Size. Image decoding runs in the background, preserves alpha, and respects photo
 orientation. Cancelling the picker, selecting too many files, or choosing an
 unreadable file keeps the previous references without adding a partial selection.
 
-Click a reference thumbnail to draw on it. The main view then shows that image,
-and a toolbar above it offers red, blue, green and white paint, three brush
+Click a reference thumbnail to edit it. The main view then shows that image,
+and a toolbar above it switches between the **Draw** and **Crop** tools. Draw
+offers red, blue, green and white paint, three brush
 sizes (**S**/**M**/**L**, relative to the image's longer side), **Undo**,
 **Clear**, and **Done**. Drag on the image to paint freehand. The thumbnail
 shows pending paint; click it again or press Done to return to the result
 view. When you click Generate, the paint is applied to the full-resolution
 reference, so that run and **Before** use the painted image. After that the
 paint can no longer be undone; to start over, remove the image and add it again.
+
+With Crop, drag on the image to select the area to keep; the rest is dimmed and
+the toolbar shows the selection's size in pixels. **Square** constrains the
+selection to match the square output. **Apply** crops the full-resolution
+reference immediately (at least 16×16 pixels); pending paint stays where it was
+drawn and can still be undone. A crop cannot be undone; remove the image and add
+it again to recover the original.
 
 Model downloads, inference, and saving run off the UI thread. A bounded event
 queue limits retained preview buffers, and old image textures are released when
@@ -143,6 +159,42 @@ The GUI supports text-to-image and editing with up to 10 reference images;
 advanced options remain available through the library and CLI. The `gui` feature is
 optional, so library/CLI builds do not compile GPUI. GPUI compiles its Metal
 shaders at runtime; the separate Xcode Metal shader compiler is not required.
+
+## Checkpoints
+
+| Model (`--model`) | Repository | Download | Resident denoiser + VAE decoder |
+| --- | --- | --- | --- |
+| `bf16` (default) | [`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1) | ~32 GB | ~14.2 GiB |
+| `mlx-8bit` | [`ddalcu/Qwen-Image-2.1-MLX-Serve-8bit`](https://huggingface.co/ddalcu/Qwen-Image-2.1-MLX-Serve-8bit) | ~18 GB | ~7.7 GiB (estimated) |
+| `mlx-4bit` | [`ddalcu/Qwen-Image-2.1-MLX-Serve-4bit`](https://huggingface.co/ddalcu/Qwen-Image-2.1-MLX-Serve-4bit) | ~11 GB | ~4.5 GiB (estimated) |
+
+The MLX packs keep the original's Diffusers layout and key names. The 32
+denoiser blocks and the text encoder's layers are MLX affine-quantized (group
+size 64); embeddings, norms, the denoiser's input/timestep/modulation/output
+layers, and the VAE stay dense, and the Qwen3-VL vision tower is kept, so
+editing with references works as with the original. Quantized weights stay
+packed in GPU memory. A fused Metal kernel unpacks 4- and 8-bit weight tiles
+into threadgroup memory inside the matmul, so the dense weights never exist in
+device memory; the CPU and unsupported shapes (such as 2-bit) expand a
+temporary dense weight instead. Other MLX conversions of Qwen Image 2.1
+(for example mflux packs) rename keys, reorder VAE convolutions, or drop the
+vision tower, and are not supported.
+
+Measured on an M2 Max with 96 GiB (warm file cache, same prompt and seed):
+
+| Size, steps | BF16 per step / total / peak | MLX 4-bit per step / total / peak |
+| --- | --- | --- |
+| 512×512, 8 steps | 2.1 s / 54 s / 19.2 GB | 2.2 s / 22 s / 10.4 GB |
+| 1024×1024, 4 steps | 9.5 s / 49 s / 29.6 GB | 10.3 s / 49 s / 20.8 GB |
+
+Denoising is compute-bound at these sizes, so the fused kernel does the same
+arithmetic as BF16 and is about 5–8% slower per step; the MLX packs are faster
+overall when loading dominates (the smaller encoder and denoiser load in
+seconds, and the text encoder reloads for each new prompt). The resident sizes
+for the MLX packs are estimated from their file sizes. 4-bit
+pixels differ from BF16 for the same seed: fine detail and small text can
+change, while composition generally follows the prompt as well. Seeds are
+reproducible within one checkpoint, not across checkpoints.
 
 ## Library
 
@@ -248,7 +300,10 @@ use; text/vision encoder weights are still released after encoding. Denoiser
 prefix attention and rotary state are rebuilt for each request, including after
 cancellation. `DenoiserLoading` progress therefore also appears on warm runs.
 Resident weights use approximately 14.2 GiB for the denoiser and VAE decoder
-(about 0.3 GiB more after reference encoding), plus working memory. Drop the
+with the BF16 checkpoint (about 0.3 GiB more after reference encoding), plus
+working memory; see [Checkpoints](#checkpoints) for the MLX packs. Select a
+checkpoint with `ModelOptions { checkpoint: Checkpoint::Mlx4Bit, .. }`;
+`Checkpoint::repo()` and `revision()` identify it for logs and metrics. Drop the
 generator or call `Generator::unload_models()` to release its GPU resources.
 Unloading preserves the latest request's encoder output, and each reference's
 vision features and VAE latents, in CPU memory. Reusing the same `Generator` with an
@@ -290,17 +345,20 @@ cargo build --release
 ```
 
 Requires an Apple Silicon Mac with Metal access, Rust, and Xcode command line
-tools. This is the full BF16 checkpoint, not a quantized model: weights occupy
-about 32 GB on disk and inference needs substantial unified memory. Start with
-`--scale 0.25` on a memory-constrained machine. Larger resolutions and multiple
-references increase working memory.
+tools. By default this runs the full BF16 checkpoint: weights occupy about
+32 GB on disk and inference needs substantial unified memory. `--model mlx-4bit`
+or `--model mlx-8bit` selects a quantized pack instead (see
+[Checkpoints](#checkpoints)). Start with `--scale 0.25` on a memory-constrained
+machine. Larger resolutions and multiple references increase working memory.
 
-The first run downloads the original Hugging Face checkpoint. Existing Python
+The first run downloads the selected Hugging Face checkpoint. Existing Python
 downloads in `~/.cache/huggingface/hub` are reused. `HF_HOME` and `HF_HUB_CACHE`
 are respected. `--offline` forbids downloads; `--model-dir PATH` loads an
-existing Diffusers snapshot with `processor/`, `text_encoder/`, `transformer/`,
-and `vae/` subdirectories. Keep its files unchanged while the generator exists.
-The checkpoint revision is pinned in `src/weights.rs`.
+existing Diffusers snapshot of the selected `--model`, with `processor/`,
+`text_encoder/`, `transformer/`, and `vae/` subdirectories. Without a
+`*.safetensors.index.json`, every `.safetensors` file in a component directory
+is loaded. Keep its files unchanged while the generator exists. Checkpoint
+revisions are pinned in `src/weights.rs`.
 
 Defaults: native 2K size, 40 steps, seed 42, `out.png`. Without `-r`, editing
 follows the last reference's aspect ratio. Dimensions are rounded down to
@@ -352,7 +410,7 @@ For transparency, use the model's prompt convention:
 
 The implementation contains only the Qwen3-VL encoder, Qwen 2.1 single-stream
 DiT, its RGBA VAE, and the fixed flow-matching Euler schedule. There is no device
-selection, CPU/CUDA inference mode, model selection, video, LoRA, training,
+selection, CPU/CUDA inference mode, video, LoRA, training,
 batch generation, or prompt rewriting. Encoder layers load as needed; their
 weights are released after encoding. Denoiser and VAE weights remain cached
 across previews and generations until the generator is dropped or unloaded.
@@ -366,13 +424,16 @@ cargo test --no-default-features
 cargo clippy --all-targets -- -D warnings
 cargo test --features gui
 cargo clippy --features gui --all-targets -- -D warnings
-# Requires the cached checkpoint and access to the Metal GPU:
+# Requires the cached BF16 and MLX 4-bit checkpoints and access to the Metal GPU:
 cargo test -- --ignored --test-threads=1
 ```
 
-The Metal tests compare attention (including a captured Qwen regression case)
-against a dense CPU reference and the VAE
-against fixed Diffusers outputs. An end-to-end Metal test checks ordered progress,
+The Metal tests compare attention (including a captured Qwen regression case,
+and causal attention over recycled buffers holding NaNs) against a dense CPU
+reference, MLX dequantization and matmul against tensors produced by MLX
+itself, the fused quantized matmul against expanded weights, and the
+VAE against fixed Diffusers outputs. An MLX 4-bit end-to-end test generates,
+edits with a reference, and checks identical pixels across shared-model sessions. An end-to-end Metal test checks ordered progress,
 encoder/prefix cancellation, model unloading, and identical final pixels with
 previews enabled/disabled. Warm runs are compared with fresh generators after
 prompt, reference, seed, and size changes. Manual-preview tests verify snapshot
