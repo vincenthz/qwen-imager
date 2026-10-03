@@ -23,6 +23,7 @@ impl AssetSource for Assets {
             "icons/sparkles.svg" => Some(Cow::Borrowed(include_bytes!("assets/sparkles.svg"))),
             "icons/sliders.svg" => Some(Cow::Borrowed(include_bytes!("assets/sliders.svg"))),
             "icons/workflow.svg" => Some(Cow::Borrowed(include_bytes!("assets/workflow.svg"))),
+            "icons/trash.svg" => Some(Cow::Borrowed(include_bytes!("assets/trash.svg"))),
             _ => None,
         })
     }
@@ -38,6 +39,7 @@ impl AssetSource for Assets {
             "icons/sparkles.svg",
             "icons/sliders.svg",
             "icons/workflow.svg",
+            "icons/trash.svg",
         ]
         .into_iter()
         .filter(|asset| asset.starts_with(path))
@@ -70,11 +72,11 @@ fn main() {
                 }
             })
             .detach();
-            let bounds = Bounds::centered(None, size(px(820.), px(850.)), cx);
+            let bounds = Bounds::centered(None, size(px(1280.), px(850.)), cx);
             cx.open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(size(px(540.), px(600.))),
+                    window_min_size: Some(size(px(900.), px(600.))),
                     titlebar: Some(TitlebarOptions {
                         title: Some("Qwen Image 2.1".into()),
                         ..TitleBar::title_bar_options()

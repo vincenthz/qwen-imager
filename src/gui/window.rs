@@ -201,6 +201,22 @@ struct ReferenceImage {
     strokes: Vec<Stroke>,
 }
 
+/// A completed generation kept in the workspace history.
+struct HistoryItem {
+    image: Arc<RgbaImage>,
+    thumbnail: Arc<RenderImage>,
+}
+
+impl HistoryItem {
+    fn new(image: Arc<RgbaImage>) -> Self {
+        let thumbnail = image::imageops::thumbnail(&*image, 256, 256);
+        Self {
+            image,
+            thumbnail: render_image(&thumbnail),
+        }
+    }
+}
+
 impl ReferenceImage {
     fn load(path: &Path) -> anyhow::Result<Self> {
         let image = qwen_imager::image_input::open(path)?;
@@ -270,6 +286,8 @@ pub struct ImageWindow {
     stale_model: bool,
     loading_image: bool,
     references: Vec<ReferenceImage>,
+    // Completed generations for this workspace, newest last.
+    history: Vec<HistoryItem>,
     // Reference being painted on or cropped in the main view, if any.
     painting: Option<usize>,
     tool: Tool,
@@ -287,6 +305,8 @@ pub struct ImageWindow {
     progress: f32,
     image: Option<Arc<RgbaImage>>,
     rendered: Option<Arc<RenderImage>>,
+    // A reference or history image the user clicked to view in the preview.
+    viewing: Option<Arc<RenderImage>>,
     // Reference preview shown by the Before/After toggle once a generation finishes.
     before: Option<Arc<RenderImage>>,
     showing_before: bool,
@@ -339,6 +359,7 @@ impl ImageWindow {
             stale_model: false,
             loading_image: false,
             references: Vec::new(),
+            history: Vec::new(),
             painting: None,
             tool: Tool::Draw,
             paint_color: PaintColor::Red,
@@ -352,6 +373,7 @@ impl ImageWindow {
             progress: 0.,
             image: None,
             rendered: None,
+            viewing: None,
             before: None,
             showing_before: false,
             completed: false,
@@ -711,19 +733,60 @@ impl ImageWindow {
         let Some(image) = self.image.clone() else {
             return;
         };
+        self.use_image_as_input(image, "Generated image".into(), window, cx);
+    }
+
+    fn use_image_as_input(
+        &mut self,
+        image: Arc<RgbaImage>,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // Clears the before/after comparison before its reference textures are dropped.
         self.clear_image(window);
         self.stop_painting();
         for reference in self.references.drain(..) {
             let _ = window.drop_image(reference.preview);
         }
-        self.references
-            .push(ReferenceImage::new("Generated image".into(), image));
+        self.references.push(ReferenceImage::new(name, image));
         self.progress = 0.;
         self.status =
             "Generated image is now the reference. Describe the changes you want, then Generate."
                 .into();
         cx.notify();
+    }
+
+    fn view_reference(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(reference) = self.references.get(index) {
+            self.viewing = Some(reference.preview.clone());
+            cx.notify();
+        }
+    }
+
+    fn view_history(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(item) = self.history.get(index) {
+            self.viewing = Some(render_image(&item.image));
+            cx.notify();
+        }
+    }
+
+    fn remove_history(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.history.len() {
+            return;
+        }
+        let item = self.history.remove(index);
+        let _ = window.drop_image(item.thumbnail);
+        cx.notify();
+    }
+
+    fn use_history_as_input(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.loading_image {
+            return;
+        }
+        if let Some(item) = self.history.get(index) {
+            self.use_image_as_input(item.image.clone(), "Generated image".into(), window, cx);
+        }
     }
 
     fn toggle_painting(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1086,7 +1149,8 @@ impl ImageWindow {
                 self.ticker = None;
                 match result {
                     Ok(generated) => {
-                        self.set_image(generated.image, window);
+                        self.set_image(generated.image.clone(), window);
+                        self.history.push(HistoryItem::new(generated.image));
                         // References cannot change while busy, so these are the run's inputs.
                         self.before = self.references.last().map(|r| r.preview.clone());
                         self.completed = true;
@@ -1112,6 +1176,7 @@ impl ImageWindow {
             let _ = window.drop_image(old);
         }
         self.image = None;
+        self.viewing = None;
         self.clear_comparison();
     }
 
@@ -1186,6 +1251,10 @@ impl ImageWindow {
         let Some(image) = self.image.clone() else {
             return;
         };
+        self.save_image(image, cx);
+    }
+
+    fn save_image(&mut self, image: Arc<RgbaImage>, cx: &mut Context<Self>) {
         let directory = cx.global::<Settings>().save_directory();
         let answer = cx.prompt_for_new_path(&directory, Some("qwen-image.png"));
         cx.spawn(async move |view, cx| {
@@ -1327,14 +1396,6 @@ impl ImageWindow {
                             .disabled(self.cancellation.is_cancelled())
                             .on_click(cx.listener(|view, _, _, cx| view.toggle_pause(cx))),
                     ))
-                    .child(
-                        Button::new("save")
-                            .flex_shrink_0()
-                            .icon(Icon::default().path("icons/save.svg"))
-                            .tooltip("Save PNG")
-                            .disabled(self.busy || self.loading_image || self.image.is_none())
-                            .on_click(cx.listener(|view, _, _, cx| view.save(cx))),
-                    )
             )
             .child(div().flex().flex_wrap().items_center().gap_3()
                 .child(div().flex().items_center().gap_2()
@@ -1361,37 +1422,6 @@ impl ImageWindow {
                         } else { "Preview the latest completed step while generation continues" })
                         .disabled(!self.busy || self.preview_control.is_none() || self.preview_pending || self.cancellation.is_cancelled())
                         .on_click(cx.listener(|view, _, _, cx| view.request_preview(cx))))))
-            .child(div().id("reference-images").flex().items_center().gap_2()
-                .flex_shrink_0().overflow_x_scroll().py_1()
-                .children(self.references.iter().enumerate().map(|(index, reference)| {
-                    let selected = self.painting == Some(index);
-                    div().id(("reference", index)).relative().w(px(72.)).h(px(72.)).flex_shrink_0()
-                        .rounded_md().border_1()
-                        .border_color(if selected { rgb(0x8aa6ff) } else { rgb(0x303640) })
-                        .bg(rgb(0x22262d))
-                        .when(!self.busy && !self.loading_image, |tile| tile.cursor_pointer())
-                        .on_click(cx.listener(move |view, _, _, cx| view.toggle_painting(index, cx)))
-                        .child(img(reference.preview.clone()).size_full().object_fit(ObjectFit::Contain))
-                        .when(!reference.strokes.is_empty(), |tile| tile.child(
-                            stroke_overlay(reference, None)))
-                        .child(div().absolute().bottom_0().left_0().px_1().text_xs()
-                            .bg(rgb(0x15171b)).child((index + 1).to_string()))
-                        .child(Button::new(("remove-image", index))
-                            .absolute().top(px(2.)).right(px(2.)).w(px(22.)).h(px(22.)).p_0()
-                            .label("−").tooltip(format!("Remove {}", reference.name))
-                            .disabled(self.busy || self.loading_image)
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                view.remove_reference(index, window, cx);
-                            })))
-                }))
-                .child(Button::new("add-images").w(px(72.)).h(px(72.)).flex_shrink_0()
-                    .icon(Icon::default().path("icons/image.svg"))
-                    .label("+")
-                    .tooltip(if self.loading_image { "Loading images…" }
-                        else if self.references.len() >= MAX_REFERENCES { "Maximum of 10 reference images" }
-                        else { "Add reference images" })
-                    .disabled(self.busy || self.loading_image || self.references.len() >= MAX_REFERENCES)
-                    .on_click(cx.listener(|view, _, window, cx| view.load_image(window, cx)))))
             .child(
                 div()
                     .h(px(6.))
@@ -1507,54 +1537,308 @@ impl ImageWindow {
                     .min_h_0()
                     .w_full()
                     .flex()
+                    .gap_2()
+                    .child(self.references_panel(cx))
+                    .child(self.preview_panel(cx))
+                    .child(self.history_panel(cx)),
+            )
+    }
+
+    fn canvas(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .overflow_hidden()
+            .bg(rgb(0x22262d))
+            .relative()
+            .map(|container| match self.painting.and_then(|index| self.references.get(index)) {
+                Some(reference) => {
+                    let bounds = self.canvas_bounds.clone();
+                    let dimensions = reference.image.dimensions();
+                    container
+                        .cursor(CursorStyle::Crosshair)
+                        .map(|container| match self.tool {
+                            Tool::Draw => container
+                                .on_mouse_down(MouseButton::Left, cx.listener(|view, event, _, cx| view.start_stroke(event, cx)))
+                                .on_mouse_move(cx.listener(|view, event, _, cx| view.extend_stroke(event, cx))),
+                            Tool::Crop => container
+                                .on_mouse_down(MouseButton::Left, cx.listener(|view, event, _, cx| view.start_crop(event, cx)))
+                                .on_mouse_move(cx.listener(|view, event, _, cx| view.extend_crop(event, cx))),
+                        })
+                        .on_mouse_up(MouseButton::Left, cx.listener(|view, _, _, _| view.drawing = false))
+                        .child(img(reference.preview.clone()).size_full().object_fit(ObjectFit::Contain))
+                        .child(stroke_overlay(reference, Some(bounds)))
+                        .when_some(self.crop.filter(|_| self.tool == Tool::Crop), |container, crop| {
+                            container.child(crop_overlay(crop_bounds(crop, dimensions, self.square_crop), dimensions))
+                        })
+                }
+                None => container.map(|container| match self.viewing.as_ref().or_else(|| self.before.as_ref().filter(|_| self.showing_before)).or(self.rendered.as_ref()).or_else(|| self.references.last().map(|reference| &reference.preview)) {
+                Some(image) => container.child(
+                    img(image.clone())
+                        .size_full()
+                        .object_fit(ObjectFit::Contain),
+                ),
+                None => container.child(
+                    div()
+                        .text_color(rgb(0x9da6b5))
+                        .child("Your image will appear here"),
+                ),
+            })})
+            .when(self.before.is_some() && self.painting.is_none(), |container| container.child(
+                div().absolute().top_2().left_2().px_2().py_1().rounded_md().text_xs()
+                    .bg(rgb(0x15171b)).text_color(rgb(0xe4e7ec))
+                    .child(if self.showing_before { "Before" } else { "After" })))
+            .when(!self.completed && self.painting.is_none() && self.rendered.is_some(), |container| {
+                container.when_some(self.preview_step, |container, step| container.child(
+                    div().absolute().top_2().left_2().px_2().py_1().rounded_md().text_xs()
+                        .bg(rgb(0x15171b)).text_color(rgb(0xe4e7ec))
+                        .child(format!("Preview · step {step}"))))
+            })
+    }
+
+    fn preview_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
                     .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .overflow_hidden()
-                    .bg(rgb(0x22262d))
-                    .relative()
-                    .map(|container| match self.painting.and_then(|index| self.references.get(index)) {
-                        Some(reference) => {
-                            let bounds = self.canvas_bounds.clone();
-                            let dimensions = reference.image.dimensions();
-                            container
-                                .cursor(CursorStyle::Crosshair)
-                                .map(|container| match self.tool {
-                                    Tool::Draw => container
-                                        .on_mouse_down(MouseButton::Left, cx.listener(|view, event, _, cx| view.start_stroke(event, cx)))
-                                        .on_mouse_move(cx.listener(|view, event, _, cx| view.extend_stroke(event, cx))),
-                                    Tool::Crop => container
-                                        .on_mouse_down(MouseButton::Left, cx.listener(|view, event, _, cx| view.start_crop(event, cx)))
-                                        .on_mouse_move(cx.listener(|view, event, _, cx| view.extend_crop(event, cx))),
-                                })
-                                .on_mouse_up(MouseButton::Left, cx.listener(|view, _, _, _| view.drawing = false))
-                                .child(img(reference.preview.clone()).size_full().object_fit(ObjectFit::Contain))
-                                .child(stroke_overlay(reference, Some(bounds)))
-                                .when_some(self.crop.filter(|_| self.tool == Tool::Crop), |container, crop| {
-                                    container.child(crop_overlay(crop_bounds(crop, dimensions, self.square_crop), dimensions))
-                                })
-                        }
-                        None => container.map(|container| match self.before.as_ref().filter(|_| self.showing_before).or(self.rendered.as_ref()).or_else(|| self.references.last().map(|reference| &reference.preview)) {
-                        Some(image) => container.child(
-                            img(image.clone())
-                                .size_full()
-                                .object_fit(ObjectFit::Contain),
-                        ),
-                        None => container.child(
+                    .justify_between()
+                    .child(div().text_sm().text_color(rgb(0x9da6b5)).child("Preview"))
+                    .child(
+                        Button::new("save")
+                            .icon(Icon::default().path("icons/save.svg"))
+                            .label("Save")
+                            .disabled(self.busy || self.image.is_none())
+                            .on_click(cx.listener(|view, _, _, cx| view.save(cx))),
+                    ),
+            )
+            .child(self.canvas(cx))
+    }
+
+    fn references_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(220.))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_2()
+            .rounded_md()
+            .bg(rgb(0x1c1f24))
+            .child(div().text_sm().text_color(rgb(0x9da6b5)).child("References"))
+            .child(
+                Button::new("add-images")
+                    .w_full()
+                    .flex_shrink_0()
+                    .icon(Icon::default().path("icons/image.svg"))
+                    .label(if self.references.is_empty() {
+                        "Add images"
+                    } else {
+                        "Add"
+                    })
+                    .tooltip(if self.loading_image {
+                        "Loading images…"
+                    } else if self.references.len() >= MAX_REFERENCES {
+                        "Maximum of 10 reference images"
+                    } else {
+                        "Add reference images"
+                    })
+                    .disabled(
+                        self.busy
+                            || self.loading_image
+                            || self.references.len() >= MAX_REFERENCES,
+                    )
+                    .on_click(cx.listener(|view, _, window, cx| view.load_image(window, cx))),
+            )
+            .child(
+                div()
+                    .id("references-list")
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .overflow_y_scroll()
+                    .children(self.references.iter().enumerate().map(|(index, reference)| {
+                        let selected = self.painting == Some(index);
+                        div()
+                            .w_full()
+                            .flex_shrink_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id(("reference-view", index))
+                                    .relative()
+                                    .w_full()
+                                    .h(px(110.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .overflow_hidden()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(if selected {
+                                        rgb(0x8aa6ff)
+                                    } else {
+                                        rgb(0x303640)
+                                    })
+                                    .bg(rgb(0x22262d))
+                                    .when(!self.busy && !self.loading_image, |tile| {
+                                        tile.cursor_pointer()
+                                    })
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.view_reference(index, cx)
+                                    }))
+                                    .child(
+                                        img(reference.preview.clone())
+                                            .size_full()
+                                            .object_fit(ObjectFit::Contain),
+                                    )
+                                    .when(!reference.strokes.is_empty(), |tile| {
+                                        tile.child(stroke_overlay(reference, None))
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_1()
+                                    .child(
+                                        Button::new(("remove-image", index))
+                                            .xsmall()
+                                            .icon(Icon::default().path("icons/trash.svg"))
+                                            .tooltip(format!("Remove {}", reference.name))
+                                            .disabled(self.busy || self.loading_image)
+                                            .on_click(cx.listener(move |view, _, window, cx| {
+                                                view.remove_reference(index, window, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(("edit-image", index))
+                                            .xsmall()
+                                            .flex_1()
+                                            .label(if selected { "Done" } else { "Edit" })
+                                            .selected(selected)
+                                            .tooltip(if selected {
+                                                "Finish editing"
+                                            } else {
+                                                "Paint or crop this image"
+                                            })
+                                            .disabled(self.busy || self.loading_image)
+                                            .on_click(cx.listener(move |view, _, _, cx| {
+                                                view.toggle_painting(index, cx)
+                                            })),
+                                    ),
+                            )
+                    }))
+            )
+    }
+
+    fn history_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(220.))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_2()
+            .rounded_md()
+            .bg(rgb(0x1c1f24))
+            .child(div().text_sm().text_color(rgb(0x9da6b5)).child("History"))
+            .child(
+                div()
+                    .id("history-list")
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .overflow_y_scroll()
+                    .children(self.history.iter().enumerate().map(|(index, item)| {
+                        let thumbnail = item.thumbnail.clone();
+                        let image = item.image.clone();
+                        div()
+                            .w_full()
+                            .flex_shrink_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .id(("history-view", index))
+                                    .w_full()
+                                    .h(px(110.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .overflow_hidden()
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(0x303640))
+                                    .bg(rgb(0x22262d))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.view_history(index, cx)
+                                    }))
+                                    .child(
+                                        img(thumbnail)
+                                            .size_full()
+                                            .object_fit(ObjectFit::Contain),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_1()
+                                    .child(
+                                        Button::new(("remove-history", index))
+                                            .xsmall()
+                                            .icon(Icon::default().path("icons/trash.svg"))
+                                            .tooltip("Remove from history")
+                                            .on_click(cx.listener(move |view, _, window, cx| {
+                                                view.remove_history(index, window, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(("save-history", index))
+                                            .xsmall()
+                                            .flex_1()
+                                            .icon(Icon::default().path("icons/save.svg"))
+                                            .tooltip("Save PNG")
+                                            .on_click(cx.listener(move |view, _, _, cx| {
+                                                view.save_image(image.clone(), cx)
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new(("use-history", index))
+                                            .xsmall()
+                                            .flex_1()
+                                            .icon(Icon::default().path("icons/image.svg"))
+                                            .tooltip("Use as input")
+                                            .on_click(cx.listener(move |view, _, window, cx| {
+                                                view.use_history_as_input(index, window, cx)
+                                            })),
+                                    ),
+                            )
+                    }))
+                    .when(self.history.is_empty(), |list| {
+                        list.child(
                             div()
+                                .text_sm()
                                 .text_color(rgb(0x9da6b5))
-                                .child("Your image will appear here"),
-                        ),
-                    })})
-                    .when(self.before.is_some() && self.painting.is_none(), |container| container.child(
-                        div().absolute().top_2().left_2().px_2().py_1().rounded_md().text_xs()
-                            .bg(rgb(0x15171b)).text_color(rgb(0xe4e7ec))
-                            .child(if self.showing_before { "Before" } else { "After" })))
-                    .when(!self.completed && self.painting.is_none() && self.rendered.is_some(), |container| {
-                        container.when_some(self.preview_step, |container, step| container.child(
-                            div().absolute().top_2().left_2().px_2().py_1().rounded_md().text_xs()
-                                .bg(rgb(0x15171b)).text_color(rgb(0xe4e7ec))
-                                .child(format!("Preview · step {step}"))))
+                                .child("No generations yet."),
+                        )
                     }),
             )
     }
@@ -1637,21 +1921,9 @@ impl ImageWindow {
                     .min_h_0()
                     .w_full()
                     .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .overflow_hidden()
-                    .bg(rgb(0x22262d))
-                    .child(match &self.rendered {
-                        Some(image) => img(image.clone())
-                            .size_full()
-                            .object_fit(ObjectFit::Contain)
-                            .into_any_element(),
-                        None => div()
-                            .text_color(rgb(0x9da6b5))
-                            .child("Your image will appear here")
-                            .into_any_element(),
-                    }),
+                    .gap_2()
+                    .child(self.preview_panel(cx))
+                    .child(self.history_panel(cx)),
             )
             .child(
                 div()
