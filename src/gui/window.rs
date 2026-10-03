@@ -23,7 +23,7 @@ use gpui::{
 use gpui_component::{
     Disableable, Icon, Selectable,
     button::*,
-    input::{Input, InputState},
+    input::{Input, InputState, Textarea, TextareaState},
 };
 use qwen_imager::{
     AttentionPrecision, CancellationToken, Cancelled, DownloadProgress, Event, Generation,
@@ -221,7 +221,7 @@ impl ReferenceImage {
 }
 
 pub struct ImageWindow {
-    prompt: Entity<InputState>,
+    prompt: Entity<TextareaState>,
     steps: Entity<InputState>,
     size: Entity<InputState>,
     seed: Entity<InputState>,
@@ -279,7 +279,7 @@ impl ImageWindow {
         generator: Arc<Mutex<Generator>>,
     ) -> Self {
         let prompt = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 .auto_grow(3, 12)
                 .placeholder("Describe the image or the changes you want… (⌘↩ to generate)")
         });
@@ -506,7 +506,9 @@ impl ImageWindow {
         self.timing = Some(GenerationTiming::new(request.steps));
         self.ticker = Some(cx.spawn(async move |view, cx| {
             loop {
-                gpui::Timer::after(Duration::from_secs(1)).await;
+                cx.background_executor()
+                    .timer(Duration::from_secs(1))
+                    .await;
                 if !view
                     .update(cx, |view, cx| {
                         cx.notify();
@@ -1252,7 +1254,7 @@ impl Render for ImageWindow {
                     .items_center()
                     .gap_2()
                     .child(div().flex_1().min_w_0().key_context(PROMPT_CONTEXT)
-                        .child(Input::new(&self.prompt).disabled(self.busy)))
+                        .child(Textarea::new(&self.prompt).disabled(self.busy)))
                     .child(
                         Button::new("generate")
                             .primary()

@@ -4,10 +4,13 @@ use std::{
 };
 
 use gpui::{
-    Context, Entity, MouseButton, ScrollHandle, Subscription, Window, div, prelude::*, px, rgb,
-    rgba,
+    Context, Entity, MouseButton, ScrollHandle, Subscription, Window, div, prelude::*, rgb, rgba,
 };
-use gpui_component::{Icon, Selectable, button::Button};
+use gpui_component::{
+    Disableable, Icon, Selectable, Sizable as _, TitleBar,
+    button::{Button, ButtonVariants as _},
+    tab::{Tab, TabBar},
+};
 use qwen_imager::{Checkpoint, ModelOptions, SharedModel};
 
 use crate::{
@@ -88,35 +91,47 @@ impl Workspaces {
             return;
         }
         // The hidden workspace inputs must not receive keyboard events.
-        window.blur();
+        window.blur(cx);
         let panel = cx.new(|cx| SettingsPanel::new(window, cx));
         let subscription = cx.subscribe_in(&panel, window, |workspaces, _, event, window, cx| {
-            if let SettingsEvent::Saved(previous) = event {
-                let model = cx.global::<Settings>().model;
-                if model != previous.model {
-                    // Running generations keep the previous weights until they finish.
-                    workspaces.model = shared_model(model);
+            match event {
+                SettingsEvent::Saved(previous) => {
+                    workspaces.on_settings_saved(&previous, window, cx);
                 }
-                for tab in &workspaces.tabs {
-                    let generator = (model != previous.model)
-                        .then(|| Arc::new(Mutex::new(workspaces.model.generator())));
-                    tab.view.update(cx, |view, cx| {
-                        if let Some(generator) = generator {
-                            view.set_generator(generator, window, cx);
-                        }
-                        view.apply_defaults(previous, window, cx)
-                    });
-                }
+                SettingsEvent::Dismissed => workspaces.close_settings(window, cx),
             }
-            workspaces.close_settings(window, cx);
         });
         self.settings = Some((panel, subscription));
         cx.notify();
     }
 
+    fn on_settings_saved(
+        &mut self,
+        previous: &Settings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let model = cx.global::<Settings>().model;
+        if model != previous.model {
+            // Running generations keep the previous weights until they finish.
+            self.model = shared_model(model);
+        }
+        for tab in &self.tabs {
+            let generator = (model != previous.model)
+                .then(|| Arc::new(Mutex::new(self.model.generator())));
+            tab.view.update(cx, |view, cx| {
+                if let Some(generator) = generator {
+                    view.set_generator(generator, window, cx);
+                }
+                view.apply_defaults(previous, window, cx)
+            });
+        }
+        cx.notify();
+    }
+
     fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings.take().is_some() {
-            window.blur();
+            window.blur(cx);
             self.tabs[self.activity.active]
                 .view
                 .update(cx, |view, cx| view.activate(window, cx));
@@ -132,7 +147,7 @@ impl Workspaces {
             .view
             .update(cx, |view, _| view.deactivate());
         // Hidden inputs must not continue receiving keyboard events.
-        window.blur();
+        window.blur(cx);
         self.activity.select(index);
         self.tab_scroll.scroll_to_item(index);
         self.tabs[index]
@@ -140,114 +155,137 @@ impl Workspaces {
             .update(cx, |view, cx| view.activate(window, cx));
         cx.notify();
     }
+
+    fn open_unread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(&index) = self.activity.unread.iter().next() {
+            self.select(index, window, cx);
+        }
+    }
 }
 
 impl Render for Workspaces {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_unread = !self.activity.unread.is_empty();
         div()
             .size_full()
-            .relative()
             .flex()
             .flex_col()
             .bg(rgb(0x15171b))
             .text_color(rgb(0xe4e7ec))
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .flex_shrink_0()
-                    .border_b_1()
-                    .border_color(rgb(0x303640))
+                TitleBar::new()
                     .child(
-                        Button::new("settings")
-                            .flex_shrink_0()
-                            .icon(Icon::default().path("icons/settings.svg"))
-                            .selected(self.settings.is_some())
-                            .tooltip("Settings")
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                if view.settings.is_some() {
-                                    view.close_settings(window, cx);
-                                } else {
-                                    view.open_settings(window, cx);
-                                }
-                            })),
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x9da6b5))
+                            .child("Qwen Image 2.1"),
                     )
                     .child(
                         div()
-                            .id("workspace-tabs")
                             .flex()
-                            .flex_1()
-                            .min_w_0()
                             .items_center()
                             .gap_1()
-                            .overflow_x_scroll()
-                            .track_scroll(&self.tab_scroll)
-                            .children(self.tabs.iter().enumerate().map(|(index, _)| {
-                                let unread = self.activity.unread.contains(&index);
-                                Button::new(("workspace-tab", index))
-                                    .flex_shrink_0()
-                                    .label(format!("Workspace {}", index + 1))
-                                    .selected(self.activity.active == index)
-                                    .when(unread, |tab| {
-                                        tab.icon(Icon::default().path("icons/bell.svg"))
-                                    })
-                                    .tooltip(if unread {
-                                        "New preview or generation finished"
+                            .pr_2()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Button::new("notifications")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::default().path("icons/bell.svg"))
+                                    .selected(has_unread)
+                                    .disabled(!has_unread)
+                                    .tooltip(if has_unread {
+                                        "Unread activity"
                                     } else {
-                                        "Switch workspace"
+                                        "No unread activity"
                                     })
-                                    .on_click(cx.listener(move |view, _, window, cx| {
-                                        view.select(index, window, cx)
-                                    }))
-                            })),
-                    )
-                    .child(
-                        Button::new("new-workspace")
-                            .label("+")
-                            .w(px(32.))
-                            .flex_shrink_0()
-                            .tooltip("New workspace")
-                            .on_click(cx.listener(|view, _, window, cx| view.add(window, cx))),
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.open_unread(window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("settings")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::default().path("icons/settings.svg"))
+                                    .selected(self.settings.is_some())
+                                    .tooltip("Settings")
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        if view.settings.is_some() {
+                                            view.close_settings(window, cx);
+                                        } else {
+                                            view.open_settings(window, cx);
+                                        }
+                                    })),
+                            ),
                     ),
             )
             .child(
                 div()
-                    .id(("workspace-content", self.activity.active))
+                    .flex_shrink_0()
+                    .child(
+                        TabBar::new("workspace-tabs")
+                            .w_full()
+                            .selected_index(self.activity.active)
+                            .track_scroll(&self.tab_scroll)
+                            .on_click(cx.listener(|view, index, window, cx| {
+                                view.select(*index, window, cx)
+                            }))
+                            .children(self.tabs.iter().enumerate().map(|(index, _)| {
+                                let unread = self.activity.unread.contains(&index);
+                                Tab::new()
+                                    .label(format!("Workspace {}", index + 1))
+                                    .when(unread, |tab| {
+                                        tab.icon(Icon::default().path("icons/bell.svg"))
+                                    })
+                            }))
+                            .suffix(
+                                Button::new("new-workspace")
+                                    .xsmall()
+                                    .label("+")
+                                    .tooltip("New workspace")
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.add(window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                div()
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .child(self.tabs[self.activity.active].view.clone()),
-            )
-            .when_some(self.settings.as_ref(), |root, (panel, _)| {
-                // Below the tab bar so the gear stays clickable; clicking outside closes.
-                root.child(
-                    div()
-                        .id("settings-backdrop")
-                        .absolute()
-                        .top(px(48.))
-                        .left_0()
-                        .right_0()
-                        .bottom_0()
-                        .p_3()
-                        .bg(rgba(0x0000_0080))
-                        .occlude()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|view, _, window, cx| view.close_settings(window, cx)),
-                        )
-                        .child(
+                    .relative()
+                    .child(self.tabs[self.activity.active].view.clone())
+                    .when_some(self.settings.as_ref(), |root, (panel, _)| {
+                        root.child(
                             div()
-                                .id("settings-panel")
-                                .max_h_full()
-                                .overflow_y_scroll()
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(panel.clone()),
-                        ),
-                )
-            })
+                                .id("settings-backdrop")
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .p_3()
+                                .bg(rgba(0x0000_0080))
+                                .occlude()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|view, _, window, cx| {
+                                        view.close_settings(window, cx)
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .id("settings-panel")
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .child(panel.clone()),
+                                ),
+                        )
+                    }),
+            )
     }
 }
 

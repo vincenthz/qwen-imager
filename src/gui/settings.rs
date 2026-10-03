@@ -1,11 +1,18 @@
 use std::path::PathBuf;
 
 use anyhow::Context as _;
-use gpui::{Context, Entity, EventEmitter, Global, Window, div, prelude::*, px, rgb};
+use gpui::{
+    App, Context, EventEmitter, Global, SharedString, WeakEntity, Window, div, prelude::*, px,
+    rgb,
+};
 use gpui_component::{
-    Disableable, Selectable,
-    button::*,
-    input::{Input, InputState},
+    Disableable,
+    button::{Button, ButtonVariants as _},
+    input::InputState,
+    setting::{
+        NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage,
+        Settings as SettingsComponent,
+    },
 };
 use qwen_imager::Checkpoint;
 use serde::{Deserialize, Serialize};
@@ -109,92 +116,335 @@ pub fn digits_input(
 }
 
 pub enum SettingsEvent {
-    /// The new settings are already applied; this carries the previous ones.
+    /// A setting changed; carries the settings before the change.
     Saved(Settings),
     Dismissed,
 }
 
-pub struct SettingsPanel {
-    steps: Entity<InputState>,
-    size: Entity<InputState>,
-    output_directory: Option<PathBuf>,
-    automatic_previews: bool,
-    sequential_previews: bool,
-    bf16_attention: bool,
-    model: Checkpoint,
-    choosing_directory: bool,
-    error: Option<String>,
-}
+pub struct SettingsPanel;
 
 impl EventEmitter<SettingsEvent> for SettingsPanel {}
 
 impl SettingsPanel {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let settings = cx.global::<Settings>().clone();
-        Self {
-            steps: cx.new(|cx| digits_input(window, cx, settings.steps.to_string())),
-            size: cx.new(|cx| digits_input(window, cx, settings.size.to_string())),
-            output_directory: settings.output_directory,
-            automatic_previews: settings.automatic_previews,
-            sequential_previews: settings.sequential_previews,
-            bf16_attention: settings.bf16_attention,
-            model: settings.model,
-            choosing_directory: false,
-            error: None,
-        }
+    pub fn new(_: &mut Window, _: &mut Context<Self>) -> Self {
+        Self
     }
+}
 
-    fn choose_directory(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.choosing_directory {
-            return;
-        }
-        self.choosing_directory = true;
-        let answer = rfd::AsyncFileDialog::new()
-            .set_parent(window)
-            .set_title("Choose the output directory")
-            .set_directory(cx.global::<Settings>().save_directory())
-            .pick_folder();
-        cx.spawn(async move |panel, cx| {
-            let folder = answer.await;
-            let _ = panel.update(cx, |panel, cx| {
-                panel.choosing_directory = false;
-                if let Some(folder) = folder {
-                    panel.output_directory = Some(folder.path().to_owned());
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
-    }
+/// Apply a settings mutation: persist it, replace the global, and notify the
+/// workspaces so they can switch models and refresh their defaults.
+fn commit(
+    panel: &WeakEntity<SettingsPanel>,
+    cx: &mut App,
+    mutate: impl FnOnce(&mut Settings),
+) {
+    let previous = cx.global::<Settings>().clone();
+    let mut next = previous.clone();
+    mutate(&mut next);
+    let _ = next.save();
+    cx.set_global(next);
+    let _ = panel.update(cx, |_, cx| cx.emit(SettingsEvent::Saved(previous)));
+}
 
-    fn save(&mut self, cx: &mut Context<Self>) {
-        let parsed = parse_steps(&self.steps.read(cx).value())
-            .and_then(|steps| Ok((steps, parse_size(&self.size.read(cx).value())?)));
-        let (steps, size) = match parsed {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                self.error = Some(error.into());
-                cx.notify();
-                return;
-            }
-        };
-        let settings = Settings {
-            steps,
-            size,
-            output_directory: self.output_directory.clone(),
-            automatic_previews: self.automatic_previews,
-            sequential_previews: self.sequential_previews,
-            bf16_attention: self.bf16_attention,
-            model: self.model,
-        };
-        if let Err(error) = settings.save() {
-            self.error = Some(format!("Could not save settings: {error:#}"));
-            cx.notify();
-            return;
-        }
-        let previous = std::mem::replace(cx.global_mut::<Settings>(), settings);
-        cx.emit(SettingsEvent::Saved(previous));
+fn rounded_size(value: f64) -> u32 {
+    ((value / 32.0).round() as i64 * 32).clamp(32, 2048) as u32
+}
+
+fn output_directory_field(panel: WeakEntity<SettingsPanel>, cx: &mut App) -> gpui::AnyElement {
+    let directory = cx.global::<Settings>().save_directory();
+    let is_default = cx.global::<Settings>().output_directory.is_none();
+    let path = directory.display().to_string();
+    let choose_panel = panel.clone();
+    let default_panel = panel;
+
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .min_w_0()
+        .child(div().min_w_0().truncate().text_sm().child(path))
+        .child(
+            Button::new("choose-directory")
+                .label("Choose…")
+                .on_click(move |_, window, cx| {
+                    let answer = rfd::AsyncFileDialog::new()
+                        .set_parent(window)
+                        .set_title("Choose the output directory")
+                        .set_directory(cx.global::<Settings>().save_directory())
+                        .pick_folder();
+                    let panel = choose_panel.clone();
+                    cx.spawn(async move |cx| {
+                        let folder = answer.await;
+                        if let Some(folder) = folder {
+                            let path = folder.path().to_owned();
+                            let _ = cx.update(|cx| {
+                                commit(&panel, cx, |s| s.output_directory = Some(path))
+                            });
+                        }
+                    })
+                    .detach();
+                }),
+        )
+        .child(
+            Button::new("default-directory")
+                .label("Use default")
+                .disabled(is_default)
+                .on_click(move |_, _, cx| {
+                    commit(&default_panel, cx, |s| s.output_directory = None)
+                }),
+        )
+        .into_any_element()
+}
+
+impl Render for SettingsPanel {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel = cx.weak_entity();
+        let defaults = Settings::default();
+        let model_options: Vec<(SharedString, SharedString)> = Checkpoint::ALL
+            .iter()
+            .map(|&model| (model.name().into(), model_label(model).into()))
+            .collect();
+
+        div()
+            .flex()
+            .flex_col()
+            .w(px(760.))
+            .h(px(680.))
+            .max_w_full()
+            .max_h_full()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(0x303640))
+            .bg(rgb(0x1c1f24))
+            .shadow_lg()
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(rgb(0x303640))
+                    .child(div().text_lg().child("Settings"))
+                    .child(
+                        Button::new("settings-done")
+                            .primary()
+                            .label("Done")
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(SettingsEvent::Dismissed)
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(
+                        SettingsComponent::new("settings")
+                            .page(
+                                SettingPage::new("General")
+                                    .group(
+                                        SettingGroup::new()
+                                            .title("New workspaces")
+                                            .item(
+                                                SettingItem::new(
+                                                    "Steps",
+                                                    SettingField::number_input(
+                                                        NumberFieldOptions {
+                                                            min: 1.0,
+                                                            max: 1000.0,
+                                                            step: 1.0,
+                                                        },
+                                                        |cx| {
+                                                            cx.global::<Settings>().steps as f64
+                                                        },
+                                                        {
+                                                            let panel = panel.clone();
+                                                            move |value, cx| {
+                                                                commit(&panel, cx, |s| {
+                                                                    s.steps =
+                                                                        (value.round() as usize)
+                                                                            .max(1)
+                                                                })
+                                                            }
+                                                        },
+                                                    )
+                                                    .default_value(defaults.steps as f64),
+                                                )
+                                                .description(
+                                                    "The default denoising step count for new workspaces.",
+                                                ),
+                                            )
+                                            .item(
+                                                SettingItem::new(
+                                                    "Size (px)",
+                                                    SettingField::number_input(
+                                                        NumberFieldOptions {
+                                                            min: 32.0,
+                                                            max: 2048.0,
+                                                            step: 32.0,
+                                                        },
+                                                        |cx| {
+                                                            cx.global::<Settings>().size as f64
+                                                        },
+                                                        {
+                                                            let panel = panel.clone();
+                                                            move |value, cx| {
+                                                                commit(&panel, cx, |s| {
+                                                                    s.size = rounded_size(value)
+                                                                })
+                                                            }
+                                                        },
+                                                    )
+                                                    .default_value(defaults.size as f64),
+                                                )
+                                                .description(
+                                                    "The default square output size, a multiple of 32.",
+                                                ),
+                                            )
+                                    )
+                                    .group(
+                                        SettingGroup::new()
+                                            .title("Output directory")
+                                            .item(
+                                                SettingItem::new(
+                                                    "Output directory",
+                                                    SettingField::render({
+                                                        let panel = panel.clone();
+                                                        move |_, _window, cx| {
+                                                            output_directory_field(panel.clone(), cx)
+                                                        }
+                                                    }),
+                                                )
+                                                .description("The Save dialog opens here."),
+                                            )
+                                    )
+                            )
+                            .page(
+                                SettingPage::new("Generation")
+                                    .group(
+                                        SettingGroup::new()
+                                            .title("Previews")
+                                            .item(
+                                                SettingItem::new(
+                                                    "Automatic previews",
+                                                    SettingField::switch(
+                                                        |cx| {
+                                                            cx.global::<Settings>()
+                                                                .automatic_previews
+                                                        },
+                                                        {
+                                                            let panel = panel.clone();
+                                                            move |value, cx| {
+                                                                commit(&panel, cx, |s| {
+                                                                    s.automatic_previews = value
+                                                                })
+                                                            }
+                                                        },
+                                                    )
+                                                    .default_value(defaults.automatic_previews),
+                                                )
+                                                .description(
+                                                    "Decode a preview after every step.",
+                                                ),
+                                            )
+                                            .item(
+                                                SettingItem::new(
+                                                    "Sequential previews",
+                                                    SettingField::switch(
+                                                        |cx| {
+                                                            cx.global::<Settings>()
+                                                                .sequential_previews
+                                                        },
+                                                        {
+                                                            let panel = panel.clone();
+                                                            move |value, cx| {
+                                                                commit(&panel, cx, |s| {
+                                                                    s.sequential_previews = value
+                                                                })
+                                                            }
+                                                        },
+                                                    )
+                                                    .default_value(defaults.sequential_previews),
+                                                )
+                                                .description(
+                                                    "Pause sampling while each preview decodes.",
+                                                ),
+                                            )
+                                    )
+                                    .group(
+                                        SettingGroup::new()
+                                            .title("Attention precision")
+                                            .item(
+                                                SettingItem::new(
+                                                    "BF16 attention",
+                                                    SettingField::switch(
+                                                        |cx| {
+                                                            cx.global::<Settings>().bf16_attention
+                                                        },
+                                                        {
+                                                            let panel = panel.clone();
+                                                            move |value, cx| {
+                                                                commit(&panel, cx, |s| {
+                                                                    s.bf16_attention = value
+                                                                })
+                                                            }
+                                                        },
+                                                    )
+                                                    .default_value(defaults.bf16_attention),
+                                                )
+                                                .description(
+                                                    "Faster sampling with slightly different pixels.",
+                                                ),
+                                            )
+                                    )
+                                    .group(
+                                        SettingGroup::new()
+                                            .title("Model")
+                                            .item(
+                                                SettingItem::new(
+                                                    "Checkpoint",
+                                                    SettingField::dropdown(
+                                                        model_options,
+                                                        |cx| {
+                                                            cx.global::<Settings>()
+                                                                .model
+                                                                .name()
+                                                                .into()
+                                                        },
+                                                        {
+                                                            let panel = panel.clone();
+                                                            move |value, cx| {
+                                                                if let Some(model) =
+                                                                    Checkpoint::ALL
+                                                                        .into_iter()
+                                                                        .find(|m| {
+                                                                            m.name()
+                                                                                == value.as_str()
+                                                                        })
+                                                                {
+                                                                    commit(&panel, cx, |s| {
+                                                                        s.model = model
+                                                                    });
+                                                                }
+                                                            }
+                                                        },
+                                                    )
+                                                    .default_value(SharedString::from(
+                                                        defaults.model.name(),
+                                                    )),
+                                                )
+                                                .description(
+                                                    "The model weights used by new workspaces.",
+                                                ),
+                                            )
+                                    )
+                            )
+                    )
+            )
     }
 }
 
@@ -203,229 +453,6 @@ pub fn model_label(model: Checkpoint) -> &'static str {
         Checkpoint::Original => "BF16",
         Checkpoint::Mlx8Bit => "MLX 8-bit",
         Checkpoint::Mlx4Bit => "MLX 4-bit",
-    }
-}
-
-fn section(title: &'static str) -> gpui::Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .child(div().text_sm().text_color(rgb(0x9da6b5)).child(title))
-}
-
-fn hint(text: &'static str) -> impl IntoElement {
-    div().text_xs().text_color(rgb(0x9da6b5)).child(text)
-}
-
-impl Render for SettingsPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let directory = match &self.output_directory {
-            Some(directory) => directory.display().to_string(),
-            None => "~/Pictures (default)".into(),
-        };
-        div()
-            .w(px(440.))
-            .max_w_full()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .p_4()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(0x303640))
-            .bg(rgb(0x1c1f24))
-            .shadow_lg()
-            .child(div().text_lg().child("Settings"))
-            .child(
-                section("New workspaces")
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child("Steps")
-                                    .child(Input::new(&self.steps).w(px(72.))),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child("Size (px)")
-                                    .child(Input::new(&self.size).w(px(80.))),
-                            ),
-                    )
-                    .child(hint("Idle workspaces still showing the old defaults also update.")),
-            )
-            .child(
-                section("Output directory")
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .child(directory),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                Button::new("choose-directory")
-                                    .label("Choose…")
-                                    .disabled(self.choosing_directory)
-                                    .on_click(cx.listener(|panel, _, window, cx| {
-                                        panel.choose_directory(window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("default-directory")
-                                    .label("Use default")
-                                    .disabled(self.output_directory.is_none())
-                                    .on_click(cx.listener(|panel, _, _, cx| {
-                                        panel.output_directory = None;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .child(hint("The Save dialog opens here.")),
-            )
-            .child(
-                section("Previews")
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                Button::new("previews-auto")
-                                    .label("Automatic")
-                                    .selected(self.automatic_previews)
-                                    .on_click(cx.listener(|panel, _, _, cx| {
-                                        panel.automatic_previews = true;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("previews-manual")
-                                    .label("Manual")
-                                    .selected(!self.automatic_previews)
-                                    .on_click(cx.listener(|panel, _, _, cx| {
-                                        panel.automatic_previews = false;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .child(hint(if self.automatic_previews {
-                        "Show a preview after every step."
-                    } else {
-                        "Preview on request, plus automatic previews at step 5 and halfway."
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                Button::new("previews-sequential")
-                                    .label("Sequential")
-                                    .selected(self.sequential_previews)
-                                    .on_click(cx.listener(|panel, _, _, cx| {
-                                        panel.sequential_previews = true;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("previews-parallel")
-                                    .label("Parallel")
-                                    .selected(!self.sequential_previews)
-                                    .on_click(cx.listener(|panel, _, _, cx| {
-                                        panel.sequential_previews = false;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .child(hint(if self.sequential_previews {
-                        "Sampling pauses while each preview decodes."
-                    } else {
-                        "Previews decode in the background while sampling continues, skipping steps when the decoder is busy. The step-5 and halfway previews always pause sampling."
-                    })),
-            )
-            .child(
-                section("Attention precision")
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                Button::new("attention-f32")
-                                    .label("Float32")
-                                    .selected(!self.bf16_attention)
-                                    .on_click(cx.listener(|panel, _, _, cx| {
-                                        panel.bf16_attention = false;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("attention-bf16")
-                                    .label("BF16")
-                                    .selected(self.bf16_attention)
-                                    .on_click(cx.listener(|panel, _, _, cx| {
-                                        panel.bf16_attention = true;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .child(hint(if self.bf16_attention {
-                        "Faster sampling with slightly different pixels. A step that overflows is redone in Float32, which the rest of that generation then uses."
-                    } else {
-                        "The reference path: the denoiser computes attention in Float32."
-                    })),
-            )
-            .child(
-                section("Model")
-                    .child(div().flex().gap_2().children(Checkpoint::ALL.map(|model| {
-                        Button::new(model.name())
-                            .label(model_label(model))
-                            .selected(self.model == model)
-                            .on_click(cx.listener(move |panel, _, _, cx| {
-                                panel.model = model;
-                                cx.notify();
-                            }))
-                    })))
-                    .child(hint(match self.model {
-                        Checkpoint::Original => "The original BF16 weights, about 32 GB. The reference for image quality.",
-                        Checkpoint::Mlx8Bit => "8-bit denoiser and text encoder, about 18 GB. Close to the original, with less memory.",
-                        Checkpoint::Mlx4Bit => "4-bit denoiser and text encoder, about 11 GB. The least memory; details can differ from the original.",
-                    }))
-                    .child(hint("Each workspace switches once idle, and offers a download if the model is missing.")),
-            )
-            .when_some(self.error.clone(), |panel, error| {
-                panel.child(div().text_sm().text_color(rgb(0xff8a8a)).child(error))
-            })
-            .child(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap_2()
-                    .child(
-                        Button::new("settings-cancel")
-                            .label("Cancel")
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Dismissed))),
-                    )
-                    .child(
-                        Button::new("settings-save")
-                            .primary()
-                            .label("Save")
-                            .on_click(cx.listener(|panel, _, _, cx| panel.save(cx))),
-                    ),
-            )
-            .child(hint("Preview and precision settings apply from the next generation."))
     }
 }
 
@@ -463,5 +490,14 @@ mod tests {
         assert!(parse_steps("0").is_err() && parse_steps("").is_err());
         assert_eq!(parse_size("512"), Ok(512));
         assert!(parse_size("500").is_err() && parse_size("4096").is_err());
+    }
+
+    #[test]
+    fn size_rounds_to_nearest_multiple_of_32() {
+        assert_eq!(rounded_size(512.0), 512);
+        assert_eq!(rounded_size(513.0), 512);
+        assert_eq!(rounded_size(527.0), 512);
+        assert_eq!(rounded_size(0.0), 32);
+        assert_eq!(rounded_size(4096.0), 2048);
     }
 }
