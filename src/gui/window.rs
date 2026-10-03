@@ -21,7 +21,7 @@ use gpui::{
     Window, canvas, div, img, point, prelude::*, px, relative, rgb, size,
 };
 use gpui_component::{
-    Disableable, Icon, Selectable,
+    Disableable, Icon, Selectable, Sizable as _,
     button::*,
     input::{Input, InputState, Textarea, TextareaState},
 };
@@ -139,6 +139,36 @@ enum Tool {
     Crop,
 }
 
+/// The workspace layout. Simple keeps only a prompt; Advanced exposes the full
+/// editing workflow; Workflow is a placeholder for a future node-based editor.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum Mode {
+    #[default]
+    Advanced,
+    Simple,
+    Workflow,
+}
+
+impl Mode {
+    const ALL: [Self; 3] = [Self::Simple, Self::Advanced, Self::Workflow];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Simple => "Simple",
+            Self::Advanced => "Advanced",
+            Self::Workflow => "Workflow",
+        }
+    }
+
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Simple => "icons/sparkles.svg",
+            Self::Advanced => "icons/sliders.svg",
+            Self::Workflow => "icons/workflow.svg",
+        }
+    }
+}
+
 /// A dragged crop rectangle in normalized image coordinates (0..1 on both axes).
 #[derive(Clone, Copy)]
 struct CropSelection {
@@ -221,6 +251,7 @@ impl ReferenceImage {
 }
 
 pub struct ImageWindow {
+    mode: Mode,
     prompt: Entity<TextareaState>,
     steps: Entity<InputState>,
     size: Entity<InputState>,
@@ -290,6 +321,7 @@ impl ImageWindow {
             digits_input(window, cx, rand::random_range(0..(1_u64 << 30)).to_string())
         });
         let mut view = Self {
+            mode: Mode::Advanced,
             prompt,
             steps,
             size,
@@ -442,7 +474,7 @@ impl ImageWindow {
     }
 
     fn generate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.loading_image || !self.ready {
+        if self.busy || self.loading_image || !self.ready || self.mode == Mode::Workflow {
             return;
         }
         // Trailing blank lines would otherwise change the prompt's encoding.
@@ -1232,6 +1264,24 @@ impl Render for ImageWindow {
                         }),
                 );
         }
+        let mode = self.mode;
+        div()
+            .size_full()
+            .flex()
+            .bg(rgb(0x15171b))
+            .text_color(rgb(0xe4e7ec))
+            .on_action(cx.listener(|view, _: &Generate, window, cx| view.generate(window, cx)))
+            .child(self.sidebar(cx))
+            .child(match mode {
+                Mode::Simple => self.simple(cx).into_any_element(),
+                Mode::Advanced => self.advanced(cx).into_any_element(),
+                Mode::Workflow => self.workflow().into_any_element(),
+            })
+    }
+}
+
+impl ImageWindow {
+    fn advanced(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         // A running generation keeps the preview settings it started with.
         let previews = if self.busy {
             self.previews
@@ -1240,14 +1290,12 @@ impl Render for ImageWindow {
         };
         let manual_previews = !previews.automatic;
         div()
-            .size_full()
+            .flex_1()
+            .min_w_0()
             .flex()
             .flex_col()
             .gap_3()
             .p_5()
-            .bg(rgb(0x15171b))
-            .text_color(rgb(0xe4e7ec))
-            .on_action(cx.listener(|view, _: &Generate, window, cx| view.generate(window, cx)))
             .child(
                 div()
                     .flex()
@@ -1508,6 +1556,142 @@ impl Render for ImageWindow {
                                 .bg(rgb(0x15171b)).text_color(rgb(0xe4e7ec))
                                 .child(format!("Preview · step {step}"))))
                     }),
+            )
+    }
+
+    fn sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.mode;
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_1()
+            .px_1()
+            .py_2()
+            .flex_shrink_0()
+            .border_r_1()
+            .border_color(rgb(0x303640))
+            .bg(rgb(0x1c1f24))
+            .children(Mode::ALL.into_iter().enumerate().map(|(index, mode)| {
+                Button::new(("mode", index))
+                    .ghost()
+                    .large()
+                    .w(px(44.))
+                    .h(px(44.))
+                    .icon(Icon::default().path(mode.icon()))
+                    .selected(current == mode)
+                    .tooltip(format!("{} mode", mode.label()))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.mode = mode;
+                        cx.notify();
+                    }))
+            }))
+    }
+
+    fn simple(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .p_5()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .key_context(PROMPT_CONTEXT)
+                            .child(Textarea::new(&self.prompt).disabled(self.busy)),
+                    )
+                    .child(
+                        Button::new("generate")
+                            .primary()
+                            .flex_shrink_0()
+                            .label(if self.busy {
+                                if self.cancellation.is_cancelled() {
+                                    "Cancelling…"
+                                } else {
+                                    "Cancel"
+                                }
+                            } else {
+                                "Generate"
+                            })
+                            .when(!self.busy, |button| button.tooltip("Generate (⌘↩)"))
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                if view.busy {
+                                    view.cancel(cx);
+                                } else {
+                                    view.generate(window, cx);
+                                }
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .overflow_hidden()
+                    .bg(rgb(0x22262d))
+                    .child(match &self.rendered {
+                        Some(image) => img(image.clone())
+                            .size_full()
+                            .object_fit(ObjectFit::Contain)
+                            .into_any_element(),
+                        None => div()
+                            .text_color(rgb(0x9da6b5))
+                            .child("Your image will appear here")
+                            .into_any_element(),
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .text_sm()
+                    .child(if self.paused {
+                        format!("Paused · {}", self.status)
+                    } else {
+                        self.status.clone()
+                    })
+                    .when_some(self.timing.as_ref(), |row, timing| {
+                        row.child(div().text_color(rgb(0x9da6b5)).child(timing.label()))
+                    }),
+            )
+    }
+
+    fn workflow(&self) -> impl IntoElement {
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_5()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_lg().child("Workflow mode"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x9da6b5))
+                            .child("A node-based editing workflow is coming soon."),
+                    ),
             )
     }
 }

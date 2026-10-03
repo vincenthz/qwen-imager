@@ -20,6 +20,9 @@ impl AssetSource for Assets {
             "icons/settings.svg" => Some(Cow::Borrowed(include_bytes!("assets/settings.svg"))),
             "icons/pause.svg" => Some(Cow::Borrowed(include_bytes!("assets/pause.svg"))),
             "icons/play.svg" => Some(Cow::Borrowed(include_bytes!("assets/play.svg"))),
+            "icons/sparkles.svg" => Some(Cow::Borrowed(include_bytes!("assets/sparkles.svg"))),
+            "icons/sliders.svg" => Some(Cow::Borrowed(include_bytes!("assets/sliders.svg"))),
+            "icons/workflow.svg" => Some(Cow::Borrowed(include_bytes!("assets/workflow.svg"))),
             _ => None,
         })
     }
@@ -32,6 +35,9 @@ impl AssetSource for Assets {
             "icons/settings.svg",
             "icons/pause.svg",
             "icons/play.svg",
+            "icons/sparkles.svg",
+            "icons/sliders.svg",
+            "icons/workflow.svg",
         ]
         .into_iter()
         .filter(|asset| asset.starts_with(path))
