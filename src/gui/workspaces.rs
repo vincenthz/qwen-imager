@@ -9,12 +9,13 @@ use gpui::{
 use gpui_component::{
     Disableable, Icon, Selectable, Sizable as _, TitleBar,
     button::{Button, ButtonVariants as _},
+    menu::{DropdownMenu as _, PopupMenuItem},
     tab::{Tab, TabBar},
 };
-use qwen_imager::{Checkpoint, ModelOptions, SharedModel};
+use image_forger::{Checkpoint, ModelOptions, SharedModel};
 
 use crate::{
-    settings::{Settings, SettingsEvent, SettingsPanel},
+    settings::{Backend, Settings, SettingsEvent, SettingsPanel},
     window::{ImageWindow, WorkspaceActivity},
 };
 
@@ -178,7 +179,7 @@ impl Render for Workspaces {
                         div()
                             .text_sm()
                             .text_color(rgb(0x9da6b5))
-                            .child("Qwen Image 2.1"),
+                            .child("ImageForger"),
                     )
                     .child(
                         div()
@@ -187,6 +188,38 @@ impl Render for Workspaces {
                             .gap_1()
                             .pr_2()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(
+                                Button::new("compute-backend")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::default().path("icons/server.svg"))
+                                    .tooltip("Compute backend")
+                                    .dropdown_menu(move |menu, _, cx| {
+                                        let current = cx.global::<Backend>().clone();
+                                        let servers = cx.global::<Settings>().servers.clone();
+                                        let mut menu = menu.item(
+                                            PopupMenuItem::new("Local")
+                                                .checked(current == Backend::Local)
+                                                .on_click(|_, _, cx| {
+                                                    cx.set_global(Backend::Local);
+                                                }),
+                                        );
+                                        for server in servers {
+                                            let backend = Backend::Remote {
+                                                address: server.clone(),
+                                            };
+                                            let checked = current == backend;
+                                            menu = menu.item(
+                                                PopupMenuItem::new(server)
+                                                    .checked(checked)
+                                                    .on_click(move |_, _, cx| {
+                                                        cx.set_global(backend.clone());
+                                                    }),
+                                            );
+                                        }
+                                        menu
+                                    }),
+                            )
                             .child(
                                 Button::new("notifications")
                                     .ghost()

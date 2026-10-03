@@ -1,4 +1,4 @@
-# img-gen (Rust / Metal)
+# ImageForger (Rust / Metal)
 
 Native Rust inference for **Qwen Image 2.1** on Apple Silicon Macs, using
 Candle's Metal backend. No Python, PyTorch, server, or C++ inference engine at
@@ -12,7 +12,7 @@ checkpoint or a smaller MLX-quantized (4-bit or 8-bit) pack of the same model.
 From the repository root:
 
 ```sh
-cargo run --release --no-default-features --features gui --bin QwenImager
+cargo run --release --no-default-features --features gui --bin ImageForger
 ```
 
 To build the macOS app bundle, install
@@ -21,12 +21,12 @@ To build the macOS app bundle, install
 ```sh
 cargo install cargo-bundle --version 0.11.0 --locked
 cargo bundle-app
-open target/release/bundle/osx/QwenImager.app
+open target/release/bundle/osx/ImageForger.app
 ```
 
 `cargo bundle-app` is an alias for
-`cargo bundle --release --format osx --no-default-features --features gui --bin QwenImager`.
-The resulting `QwenImager.app` includes the photo-assembly icon and can be copied
+`cargo bundle --release --format osx --no-default-features --features gui --bin ImageForger`.
+The resulting `ImageForger.app` includes the photo-assembly icon and can be copied
 to Applications. Model weights stay in the Hugging Face cache and are downloaded
 through the app when needed. This produces a local app bundle; distribution
 signing and notarization are separate steps.
@@ -62,7 +62,7 @@ Concurrent runs share GPU time and each needs its own working memory; starting
 more runs does not multiply GPU capacity. Workspaces live for the current app session;
 closing the app cancels their work. Save images you want to keep before quitting.
 
-Settings are saved in `~/Library/Application Support/QwenImager/settings.json`:
+Settings are saved in `~/Library/Application Support/ImageForger/settings.json`:
 
 - **Steps** and **Size (px)** for new workspaces (defaults 20 and 512). Idle
   workspaces still showing the previous defaults adopt the new ones.
@@ -204,14 +204,14 @@ From another Rust project, depend on this directory without the optional CLI:
 
 ```toml
 [dependencies]
-img-gen = { path = "../img-gen/rust", default-features = false }
+image-forger = { path = "../image-forger/rust", default-features = false }
 ```
 
 ```rust,no_run
-use img_gen::{CancellationToken, Event, Generator, ModelOptions, Request};
+use image_forger::{CancellationToken, Event, Generator, ModelOptions, Request};
 use std::num::NonZeroUsize;
 
-fn main() -> img_gen::Result<()> {
+fn main() -> image_forger::Result<()> {
     let mut generator = Generator::new(ModelOptions::default());
     let mut request = Request::new("a corgi playing guitar in the rain");
     request.scale = 0.25;
@@ -283,7 +283,7 @@ request. Cancellation is cooperative between model layers/stages; it cannot
 preempt GPU operations, downloads, or callbacks. A background decode already in
 flight may finish after cancellation, but its result is discarded. Dropping or
 unloading the generator waits for its decoder worker to exit.
-Use `error.is::<img_gen::Cancelled>()` to distinguish it from inference failure.
+Use `error.is::<image_forger::Cancelled>()` to distinguish it from inference failure.
 Use `SharedModel::new(options).generator()` to create independent sessions that
 can run on separate threads. Keep one session per workspace to preserve its
 prompt/reference cache. Denoiser and VAE weights are loaded once into immutable
@@ -319,8 +319,8 @@ Stages served from the cache emit no `Progress` events.
 Run a persistent generation service with the CLI:
 
 ```sh
-cargo build --release --bin qwen-imager-cli
-./target/release/qwen-imager-cli --serve --offline --listen 127.0.0.1:6996
+cargo build --release --bin image-forger-cli
+./target/release/image-forger-cli --serve --offline --listen 127.0.0.1:6996
 ```
 
 Submit JSON prompts or multipart reference images with JSON parameters to
@@ -337,13 +337,13 @@ remote access, and lifecycle details.
 ```sh
 cd rust
 cargo build --release
-./target/release/img-gen "a corgi playing guitar in the rain"
-./target/release/img-gen "a panoramic mountain landscape" -r 16:9 -o mountains.png
-./target/release/img-gen "a cat astronaut" --scale 0.5 --steps 20
-./target/release/img-gen "Change the background to a sunset beach" -i ../edit.png -o edited.png
-./target/release/img-gen "These characters sit around a campfire" -i a.png -i b.png
-./target/release/img-gen "a red teapot" --scale 0.25 --preview-dir previews --preview-every 5
-./target/release/img-gen "a red teapot" --scale 0.5 --attention bf16
+./target/release/image-forger-cli "a corgi playing guitar in the rain"
+./target/release/image-forger-cli "a panoramic mountain landscape" -r 16:9 -o mountains.png
+./target/release/image-forger-cli "a cat astronaut" --scale 0.5 --steps 20
+./target/release/image-forger-cli "Change the background to a sunset beach" -i ../edit.png -o edited.png
+./target/release/image-forger-cli "These characters sit around a campfire" -i a.png -i b.png
+./target/release/image-forger-cli "a red teapot" --scale 0.25 --preview-dir previews --preview-every 5
+./target/release/image-forger-cli "a red teapot" --scale 0.5 --attention bf16
 ```
 
 Requires an Apple Silicon Mac with Metal access, Rust, and Xcode command line
@@ -391,7 +391,7 @@ generation time, and precise stage/step timestamps. To reproduce the six-image
 comparison with macOS RAM and disk-I/O sampling (200ms intervals):
 
 ```sh
-cargo build --release --bin qwen-imager-cli
+cargo build --release --bin image-forger-cli
 python3 scripts/benchmark-noise.py --output output/my-noise-comparison \
   --prompt 'a clown at the circus, with a red teapot, and a dog on a bike' \
   --seeds 42 12345 --steps 8
@@ -407,7 +407,7 @@ counter; RSS is a sampled peak and can include mapped checkpoint pages.
 For transparency, use the model's prompt convention:
 
 ```sh
-./target/release/img-gen 'This is an RGBA image with transparency. A cartoon dragon sticker. The image has alpha channel and the background is transparent.' -o dragon.png
+./target/release/image-forger-cli 'This is an RGBA image with transparency. A cartoon dragon sticker. The image has alpha channel and the background is transparent.' -o dragon.png
 ```
 
 The implementation contains only the Qwen3-VL encoder, Qwen 2.1 single-stream

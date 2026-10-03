@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use qwen_imager::{
+use image_forger::{
     CancellationToken, Checkpoint, Event, Generator, ModelOptions, PreviewControl, Request,
     RgbaImage, Stage,
 };
@@ -261,7 +261,7 @@ impl Job {
             Event::Finished { .. } => {}
         }
     }
-    fn finish(&mut self, result: anyhow::Result<qwen_imager::Generation>) {
+    fn finish(&mut self, result: anyhow::Result<image_forger::Generation>) {
         self.preview_pending = false;
         self.reference_index = None;
         self.elapsed_s = self.started.map(|s| s.elapsed().as_secs_f64());
@@ -279,7 +279,7 @@ impl Job {
                 self.output = Some(image);
             }
             Err(error) => {
-                if error.is::<qwen_imager::Cancelled>() {
+                if error.is::<image_forger::Cancelled>() {
                     self.status = Status::Cancelled;
                     self.stage = "cancelled";
                 } else {
@@ -547,7 +547,7 @@ fn decode_references(
         limits.max_image_width = Some(8192);
         limits.max_image_height = Some(8192);
         limits.max_alloc = Some(128 * 1024 * 1024);
-        let decoder = qwen_imager::image_input::ImageInput::new(&bytes, limits).map_err(invalid)?;
+        let decoder = image_forger::image_input::ImageInput::new(&bytes, limits).map_err(invalid)?;
         let (width, height) = decoder.dimensions();
         let pixels = u64::from(width) * u64::from(height);
         total_pixels += pixels;
@@ -767,14 +767,14 @@ fn router(service: Arc<Service>) -> Router {
 }
 
 pub fn run(address: SocketAddr, max_jobs: usize, options: ModelOptions) -> anyhow::Result<()> {
-    let token = std::env::var("QWEN_IMAGER_API_TOKEN").ok();
+    let token = std::env::var("IMAGEFORGER_API_TOKEN").ok();
     anyhow::ensure!(
         token.as_ref().is_none_or(|t| !t.trim().is_empty()),
-        "QWEN_IMAGER_API_TOKEN must not be empty"
+        "IMAGEFORGER_API_TOKEN must not be empty"
     );
     anyhow::ensure!(
         address.ip().is_loopback() || token.is_some(),
-        "set QWEN_IMAGER_API_TOKEN to listen beyond localhost"
+        "set IMAGEFORGER_API_TOKEN to listen beyond localhost"
     );
     let authorization = token
         .map(|t| HeaderValue::from_str(&format!("Bearer {t}")))
@@ -788,7 +788,7 @@ pub fn run(address: SocketAddr, max_jobs: usize, options: ModelOptions) -> anyho
         let service = Service::with_checkpoint(max_jobs, authorization, options.checkpoint);
         let worker_service = service.clone();
         let thread = std::thread::Builder::new().name("generation".into()).spawn(move || worker(worker_service, options))?;
-        eprintln!("Qwen HTTP service listening on http://{} (one generation at a time, {max_jobs} retained jobs)", listener.local_addr()?);
+        eprintln!("ImageForger HTTP service listening on http://{} (one generation at a time, {max_jobs} retained jobs)", listener.local_addr()?);
         let shutdown_service = service.clone();
         let result = axum::serve(listener, router(service.clone())).with_graceful_shutdown(async move {
             if let Err(error) = tokio::signal::ctrl_c().await { eprintln!("shutdown signal error: {error}"); }
@@ -1034,7 +1034,7 @@ mod tests {
                     total: 3,
                     image: pixels.clone(),
                 });
-                job.finish(Ok(qwen_imager::Generation {
+                job.finish(Ok(image_forger::Generation {
                     image: pixels.clone(),
                     elapsed: std::time::Duration::from_secs(3),
                 }));
@@ -1098,7 +1098,7 @@ mod tests {
         second
             .lock()
             .unwrap()
-            .finish(Err(qwen_imager::Cancelled.into()));
+            .finish(Err(image_forger::Cancelled.into()));
         assert_eq!(second.lock().unwrap().status, Status::Cancelled);
         let (third, request) = service.next().unwrap();
         assert_eq!(third.lock().unwrap().id, 3);
@@ -1204,7 +1204,7 @@ mod tests {
             service.cancel(1).unwrap();
             job.lock()
                 .unwrap()
-                .finish(Err(qwen_imager::Cancelled.into()));
+                .finish(Err(image_forger::Cancelled.into()));
             drop(request);
             assert_eq!(service.reference_memory.available_permits(), total);
 

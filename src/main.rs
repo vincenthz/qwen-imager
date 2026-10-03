@@ -1,6 +1,6 @@
 use anyhow::{Context, ensure};
 use clap::Parser;
-use qwen_imager::{
+use image_forger::{
     AttentionPrecision, CancellationToken, Checkpoint, Event, Generator, ModelOptions, Request,
     Stage,
 };
@@ -11,7 +11,7 @@ mod server;
 #[derive(Parser)]
 #[command(
     version,
-    about = "Generate or edit a PNG with Qwen Image 2.1 on Apple Metal"
+    about = "Generate or edit a PNG with ImageForger on Apple Metal"
 )]
 struct Args {
     /// Text prompt describing the image or edit
@@ -20,7 +20,7 @@ struct Args {
     /// Run a persistent HTTP generation service
     #[arg(long, conflicts_with_all = ["output", "images", "ratio", "scale", "steps", "seed", "noise_source_size", "attention", "metrics", "preview_dir", "preview_every"])]
     serve: bool,
-    /// HTTP listen address; remote access requires QWEN_IMAGER_API_TOKEN
+    /// HTTP listen address; remote access requires IMAGEFORGER_API_TOKEN
     #[arg(
         long,
         default_value = "127.0.0.1:6996",
@@ -125,7 +125,7 @@ fn main() -> anyhow::Result<()> {
         .images
         .iter()
         .map(|p| {
-            qwen_imager::image_input::open(p)
+            image_forger::image_input::open(p)
                 .with_context(|| format!("opening {}", p.display()))
         })
         .collect::<anyhow::Result<_>>()?;

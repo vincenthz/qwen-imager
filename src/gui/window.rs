@@ -11,7 +11,7 @@ use std::{
 use anyhow::Context as _;
 
 use crate::{
-    settings::{Settings, digits_input, model_label, parse_size, parse_steps},
+    settings::{Backend, Settings, digits_input, model_label, parse_size, parse_steps},
     timing::{GenerationTiming, format_duration},
 };
 
@@ -25,7 +25,7 @@ use gpui_component::{
     button::*,
     input::{Input, InputState, Textarea, TextareaState},
 };
-use qwen_imager::{
+use image_forger::{
     AttentionPrecision, CancellationToken, Cancelled, DownloadProgress, Event, Generation,
     Generator, ModelOptions, PauseControl, PreviewControl, Request, RgbaImage, Stage,
 };
@@ -186,11 +186,11 @@ struct Stroke {
 
 enum Message {
     PreviewRequested,
-    Checked(qwen_imager::Result<()>),
+    Checked(image_forger::Result<()>),
     Download(DownloadProgress),
-    Prepared(qwen_imager::Result<()>),
+    Prepared(image_forger::Result<()>),
     Inference(Event),
-    Complete(qwen_imager::Result<Generation>),
+    Complete(image_forger::Result<Generation>),
 }
 
 struct ReferenceImage {
@@ -219,7 +219,7 @@ impl HistoryItem {
 
 impl ReferenceImage {
     fn load(path: &Path) -> anyhow::Result<Self> {
-        let image = qwen_imager::image_input::open(path)?;
+        let image = image_forger::image_input::open(path)?;
         let name = path
             .file_name()
             .unwrap_or_default()
@@ -583,6 +583,7 @@ impl ImageWindow {
         let cancellation = self.cancellation.clone();
         let sender = self.listen(window, cx);
         let generator = self.generator.clone();
+        let backend = cx.global::<Backend>().clone();
         let references: Vec<_> = self
             .references
             .iter()
@@ -590,36 +591,55 @@ impl ImageWindow {
             .collect();
         thread::spawn(move || {
             let result = {
-                let mut generator = generator.lock().unwrap_or_else(|error| error.into_inner());
                 request.images = references
                     .into_iter()
                     .map(|reference| (*reference).clone())
                     .collect();
-                let mut preview_schedule = ManualPreviewSchedule::default();
-                generator.generate(&request, &cancellation, |event| {
-                    let requested = !cancellation.is_cancelled()
-                        && request.preview_control.as_ref().is_some_and(|control| {
-                            if previews.automatic {
-                                // Parallel automatic previews decode the latest step
-                                // whenever the decoder is idle, skipping steps otherwise.
-                                if let Event::StepFinished { step, total, .. } = event
-                                    && step < total
-                                {
-                                    control.request_preview();
-                                }
-                                false
-                            } else {
-                                // Manual checkpoints always pause sampling until decoded.
-                                preview_schedule
-                                    .on_event(&event, || control.request_blocking_preview())
+                match &backend {
+                    Backend::Local => {
+                        let mut generator =
+                            generator.lock().unwrap_or_else(|error| error.into_inner());
+                        let mut preview_schedule = ManualPreviewSchedule::default();
+                        let cancel = cancellation.clone();
+                        let preview_control = request.preview_control.clone();
+                        let sender = sender.clone();
+                        generator.generate(&request, &cancellation, move |event| {
+                            let requested = !cancel.is_cancelled()
+                                && preview_control.as_ref().is_some_and(|control| {
+                                    if previews.automatic {
+                                        // Parallel automatic previews decode the latest step
+                                        // whenever the decoder is idle, skipping steps otherwise.
+                                        if let Event::StepFinished { step, total, .. } = event
+                                            && step < total
+                                        {
+                                            control.request_preview();
+                                        }
+                                        false
+                                    } else {
+                                        // Manual checkpoints always pause sampling until decoded.
+                                        preview_schedule.on_event(&event, || {
+                                            control.request_blocking_preview()
+                                        })
+                                    }
+                                });
+                            if sender.send_blocking(Message::Inference(event)).is_err()
+                                || (requested
+                                    && sender.send_blocking(Message::PreviewRequested).is_err())
+                            {
+                                cancel.cancel();
                             }
-                        });
-                    if sender.send_blocking(Message::Inference(event)).is_err()
-                        || (requested && sender.send_blocking(Message::PreviewRequested).is_err())
-                    {
-                        cancellation.cancel();
+                        })
                     }
-                })
+                    Backend::Remote { address } => {
+                        let cancel = cancellation.clone();
+                        let sender = sender.clone();
+                        image_forger::remote::run(&request, address, &cancellation, move |event| {
+                            if sender.send_blocking(Message::Inference(event)).is_err() {
+                                cancel.cancel();
+                            }
+                        })
+                    }
+                }
             };
             let _ = sender.send_blocking(Message::Complete(result));
         });
@@ -655,7 +675,7 @@ impl ImageWindow {
             .set_title("Add reference images")
             .add_filter(
                 "Images (PNG, JPEG, WebP, HEIC)",
-                qwen_imager::image_input::EXTENSIONS,
+                image_forger::image_input::EXTENSIONS,
             )
             .pick_files();
         cx.spawn_in(window, async move |view, cx| {
@@ -1256,7 +1276,7 @@ impl ImageWindow {
 
     fn save_image(&mut self, image: Arc<RgbaImage>, cx: &mut Context<Self>) {
         let directory = cx.global::<Settings>().save_directory();
-        let answer = cx.prompt_for_new_path(&directory, Some("qwen-image.png"));
+        let answer = cx.prompt_for_new_path(&directory, Some("image-forger.png"));
         cx.spawn(async move |view, cx| {
             let result = async {
                 let Some(path) = answer.await?? else {

@@ -2,20 +2,33 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use gpui::{
-    App, Context, EventEmitter, Global, SharedString, WeakEntity, Window, div, prelude::*, px,
-    rgb,
+    App, Context, Entity, EventEmitter, Global, SharedString, WeakEntity, Window, div, prelude::*,
+    px, rgb,
 };
 use gpui_component::{
-    Disableable,
+    Disableable, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
-    input::InputState,
+    input::{Input, InputState},
     setting::{
         NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage,
         Settings as SettingsComponent,
     },
 };
-use qwen_imager::Checkpoint;
+use image_forger::Checkpoint;
 use serde::{Deserialize, Serialize};
+
+/// Which machine runs inference. [`Backend::Local`] uses this Mac; a remote
+/// backend delegates to a `image-forger` server over HTTP.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum Backend {
+    #[default]
+    Local,
+    Remote {
+        address: String,
+    },
+}
+
+impl Global for Backend {}
 
 /// Application-wide preferences, persisted between launches.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -34,6 +47,8 @@ pub struct Settings {
     pub bf16_attention: bool,
     /// Checkpoint that workspaces load; changes apply as each workspace becomes idle.
     pub model: Checkpoint,
+    /// Remote compute servers, as `host` or `host:port` addresses.
+    pub servers: Vec<String>,
 }
 
 impl Default for Settings {
@@ -46,6 +61,7 @@ impl Default for Settings {
             sequential_previews: true,
             bf16_attention: false,
             model: Checkpoint::Original,
+            servers: Vec::new(),
         }
     }
 }
@@ -55,7 +71,7 @@ impl Global for Settings {}
 impl Settings {
     fn path() -> Option<PathBuf> {
         let home = std::env::var_os("HOME")?;
-        Some(PathBuf::from(home).join("Library/Application Support/QwenImager/settings.json"))
+        Some(PathBuf::from(home).join("Library/Application Support/ImageForger/settings.json"))
     }
 
     /// Missing or unreadable settings fall back to the defaults.
@@ -121,13 +137,18 @@ pub enum SettingsEvent {
     Dismissed,
 }
 
-pub struct SettingsPanel;
+pub struct SettingsPanel {
+    server_input: Entity<InputState>,
+}
 
 impl EventEmitter<SettingsEvent> for SettingsPanel {}
 
 impl SettingsPanel {
-    pub fn new(_: &mut Window, _: &mut Context<Self>) -> Self {
-        Self
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let server_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("host or host:port")
+        });
+        Self { server_input }
     }
 }
 
@@ -149,6 +170,81 @@ fn commit(
 fn rounded_size(value: f64) -> u32 {
     ((value / 32.0).round() as i64 * 32).clamp(32, 2048) as u32
 }
+
+fn servers_field(
+    panel: &WeakEntity<SettingsPanel>,
+    input: &Entity<InputState>,
+    cx: &mut App,
+) -> gpui::AnyElement {
+    let servers = cx.global::<Settings>().servers.clone();
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .w_full()
+        .children(servers.iter().enumerate().map(|(index, server)| {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .child(server.clone()),
+                )
+                .child(
+                    Button::new(("remove-server", index))
+                        .xsmall()
+                        .icon(Icon::default().path("icons/trash.svg"))
+                        .tooltip("Remove server")
+                        .on_click({
+                            let panel = panel.clone();
+                            move |_, _, cx| {
+                                commit(&panel, cx, |s| {
+                                    if index < s.servers.len() {
+                                        s.servers.remove(index);
+                                    }
+                                });
+                            }
+                        }),
+                )
+        }))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(Input::new(input).flex_1())
+                .child(
+                    Button::new("add-server")
+                        .xsmall()
+                        .label("Add")
+                        .on_click({
+                            let panel = panel.clone();
+                            let input = input.clone();
+                            move |_, window, cx| {
+                                let address = input.read(cx).value().trim().to_string();
+                                if address.is_empty() {
+                                    return;
+                                }
+                                commit(&panel, cx, |s| {
+                                    if !s.servers.iter().any(|existing| existing == &address) {
+                                        s.servers.push(address);
+                                    }
+                                });
+                                input.update(cx, |input, cx| {
+                                    input.set_value("", window, cx);
+                                });
+                            }
+                        }),
+                ),
+        )
+        .into_any_element()
+}
+
 
 fn output_directory_field(panel: WeakEntity<SettingsPanel>, cx: &mut App) -> gpui::AnyElement {
     let directory = cx.global::<Settings>().save_directory();
@@ -324,6 +420,28 @@ impl Render for SettingsPanel {
                                     )
                             )
                             .page(
+                                SettingPage::new("Compute")
+                                    .group(
+                                        SettingGroup::new()
+                                            .title("Compute servers")
+                                            .item(
+                                                SettingItem::new(
+                                                    "Servers",
+                                                    SettingField::render({
+                                                        let panel = panel.clone();
+                                                        let input = self.server_input.clone();
+                                                        move |_, _window, cx| {
+                                                            servers_field(&panel, &input, cx)
+                                                        }
+                                                    }),
+                                                )
+                                                .description(
+                                                    "Remote ImageForger servers, as host or host:port.",
+                                                ),
+                                            )
+                                    )
+                            )
+                            .page(
                                 SettingPage::new("Generation")
                                     .group(
                                         SettingGroup::new()
@@ -470,6 +588,7 @@ mod tests {
             sequential_previews: false,
             bf16_attention: true,
             model: Checkpoint::Mlx4Bit,
+            servers: vec!["192.168.1.5:6996".into()],
         };
         let json = serde_json::to_vec(&settings).unwrap();
         assert!(String::from_utf8_lossy(&json).contains(r#""model":"mlx-4bit""#));

@@ -1,4 +1,4 @@
-use qwen_imager::{
+use image_forger::{
     CancellationToken, Cancelled, Event, Generator, ModelOptions, Request, RgbaImage, Stage,
 };
 use std::sync::Arc;
@@ -65,17 +65,17 @@ fn ui_messages_and_inputs_can_cross_threads() {
     fn send<T: Send>() {}
     send::<Request>();
     send::<Event>();
-    send::<qwen_imager::Generation>();
+    send::<image_forger::Generation>();
     send::<CancellationToken>();
     send::<Generator>();
-    send::<qwen_imager::PreviewControl>();
-    send::<qwen_imager::PauseControl>();
+    send::<image_forger::PreviewControl>();
+    send::<image_forger::PauseControl>();
 }
 
 #[test]
 #[ignore = "requires cached Qwen Image 2.1 checkpoint and Metal GPU"]
 fn manual_background_previews_preserve_pixels_and_do_not_leak_between_runs()
--> qwen_imager::Result<()> {
+-> image_forger::Result<()> {
     let mut request = Request::new("A red ceramic teapot on a wooden table.");
     request.scale = 0.0625;
     request.steps = 8;
@@ -90,7 +90,7 @@ fn manual_background_previews_preserve_pixels_and_do_not_leak_between_runs()
     })?;
 
     request.preview_every = None;
-    let control = qwen_imager::PreviewControl::default();
+    let control = image_forger::PreviewControl::default();
     request.preview_control = Some(control.clone());
     let mut previews = Vec::new();
     let manual = generator.generate(&request, &cancellation, |event| match event {
@@ -111,7 +111,7 @@ fn manual_background_previews_preserve_pixels_and_do_not_leak_between_runs()
     assert!(!control.request_preview());
 
     // Cancel with a preview in flight, then rerun without clicking Preview.
-    let control = qwen_imager::PreviewControl::default();
+    let control = image_forger::PreviewControl::default();
     request.preview_control = Some(control.clone());
     let interrupted = CancellationToken::default();
     let error = generator
@@ -124,7 +124,7 @@ fn manual_background_previews_preserve_pixels_and_do_not_leak_between_runs()
         .unwrap_err();
     assert!(error.is::<Cancelled>());
     assert!(!control.request_preview());
-    request.preview_control = Some(qwen_imager::PreviewControl::default());
+    request.preview_control = Some(image_forger::PreviewControl::default());
     let mut previews = Vec::new();
     let quiet = generator.generate(&request, &cancellation, |event| {
         if let Event::Preview { step, .. } = event {
@@ -138,7 +138,7 @@ fn manual_background_previews_preserve_pixels_and_do_not_leak_between_runs()
 
 #[test]
 #[ignore = "requires cached Qwen Image 2.1 checkpoint and Metal GPU"]
-fn blocking_previews_and_pause_hold_sampling() -> qwen_imager::Result<()> {
+fn blocking_previews_and_pause_hold_sampling() -> image_forger::Result<()> {
     use std::time::{Duration, Instant};
     let mut request = Request::new("A red ceramic teapot on a wooden table.");
     request.scale = 0.0625;
@@ -147,8 +147,8 @@ fn blocking_previews_and_pause_hold_sampling() -> qwen_imager::Result<()> {
     let cancellation = CancellationToken::default();
     let baseline = generator.generate(&request, &cancellation, |_| {})?;
 
-    let control = qwen_imager::PreviewControl::default();
-    let pause = qwen_imager::PauseControl::default();
+    let control = image_forger::PreviewControl::default();
+    let pause = image_forger::PauseControl::default();
     request.preview_control = Some(control.clone());
     request.pause = Some(pause.clone());
     let mut order = Vec::new();
@@ -196,7 +196,7 @@ fn blocking_previews_and_pause_hold_sampling() -> qwen_imager::Result<()> {
 
 #[test]
 #[ignore = "requires cached Qwen Image 2.1 checkpoint and Metal GPU"]
-fn previews_preserve_output_and_report_ordered_progress() -> qwen_imager::Result<()> {
+fn previews_preserve_output_and_report_ordered_progress() -> image_forger::Result<()> {
     let mut request = Request::new("A red ceramic teapot on a wooden table.");
     request.scale = 0.0625;
     request.steps = 3;
@@ -322,7 +322,7 @@ fn previews_preserve_output_and_report_ordered_progress() -> qwen_imager::Result
 
 #[test]
 #[ignore = "requires cached Qwen Image 2.1 checkpoint and Metal GPU"]
-fn cached_encoder_results_match_a_fresh_generator() -> qwen_imager::Result<()> {
+fn cached_encoder_results_match_a_fresh_generator() -> image_forger::Result<()> {
     let cancellation = CancellationToken::default();
     let mut request = Request::new("A red ceramic teapot on a wooden table.");
     request.scale = 0.0625;
@@ -377,8 +377,8 @@ fn cached_encoder_results_match_a_fresh_generator() -> qwen_imager::Result<()> {
 
 #[test]
 #[ignore = "requires cached Qwen Image 2.1 checkpoint and Metal GPU"]
-fn shared_model_sessions_run_concurrently_and_cancel_independently() -> qwen_imager::Result<()> {
-    use qwen_imager::{PreviewControl, SharedModel};
+fn shared_model_sessions_run_concurrently_and_cancel_independently() -> image_forger::Result<()> {
+    use image_forger::{PreviewControl, SharedModel};
     use std::{sync::mpsc, thread, time::Duration};
 
     let mut first = Request::new("A red ceramic teapot on a wooden table.");
@@ -402,7 +402,7 @@ fn shared_model_sessions_run_concurrently_and_cancel_independently() -> qwen_ima
                 .generate(request, &CancellationToken::default(), |_| {})
                 .map(|g| g.image)
         })
-        .collect::<qwen_imager::Result<_>>()?;
+        .collect::<image_forger::Result<_>>()?;
     drop(baseline);
 
     let model = SharedModel::new(ModelOptions {
@@ -446,7 +446,7 @@ fn shared_model_sessions_run_concurrently_and_cancel_independently() -> qwen_ima
             }));
         }
         drop(ready);
-        let reached = (|| -> qwen_imager::Result<()> {
+        let reached = (|| -> image_forger::Result<()> {
             let a = receiver.recv_timeout(Duration::from_secs(180))?;
             let b = receiver.recv_timeout(Duration::from_secs(180))?;
             anyhow::ensure!(
@@ -493,8 +493,8 @@ fn shared_model_sessions_run_concurrently_and_cancel_independently() -> qwen_ima
 
 #[test]
 #[ignore = "requires the cached MLX 4-bit checkpoint and Metal GPU"]
-fn mlx_checkpoint_generates_and_edits_with_shared_weights() -> qwen_imager::Result<()> {
-    use qwen_imager::{Checkpoint, SharedModel};
+fn mlx_checkpoint_generates_and_edits_with_shared_weights() -> image_forger::Result<()> {
+    use image_forger::{Checkpoint, SharedModel};
     let model = SharedModel::new(ModelOptions {
         offline: true,
         checkpoint: Checkpoint::Mlx4Bit,

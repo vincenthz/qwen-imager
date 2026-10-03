@@ -210,7 +210,7 @@ mod tests {
     #[test]
     fn loads_jpg_jpeg_heic_heif_and_uppercase_paths() {
         let directory =
-            std::env::temp_dir().join(format!("qwen-image-input-{}", std::process::id()));
+            std::env::temp_dir().join(format!("image-forger-input-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         for (extension, bytes) in [
             ("jpg", JPEG),

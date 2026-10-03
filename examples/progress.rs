@@ -1,9 +1,9 @@
 //! Worker/channel boundary for a future GUI. Run with:
 //! cargo run --release --no-default-features --example progress -- "a red teapot"
-use qwen_imager::{CancellationToken, Event, Generator, ModelOptions, Request};
+use image_forger::{CancellationToken, Event, Generator, ModelOptions, Request};
 use std::{num::NonZeroUsize, sync::mpsc, thread};
 
-fn main() -> qwen_imager::Result<()> {
+fn main() -> image_forger::Result<()> {
     let prompt = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "a red teapot".into());

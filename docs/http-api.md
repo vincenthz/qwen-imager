@@ -3,8 +3,8 @@
 Build and start the same CLI in server mode:
 
 ```sh
-cargo build --release --bin qwen-imager-cli
-./target/release/qwen-imager-cli --serve --offline
+cargo build --release --bin image-forger-cli
+./target/release/image-forger-cli --serve --offline
 ```
 
 The default address is `127.0.0.1:6996`. `--model`, `--model-dir PATH` and
@@ -13,7 +13,7 @@ loaded weights. One job runs at a time, with other jobs queued in submission
 order. HTTP requests remain responsive while inference runs.
 
 For another port, use `--listen 127.0.0.1:9000`. For access from another machine,
-set `QWEN_IMAGER_API_TOKEN` and use `--listen 0.0.0.0:6996`; include
+set `IMAGEFORGER_API_TOKEN` and use `--listen 0.0.0.0:6996`; include
 `Authorization: Bearer YOUR_TOKEN` on every request, including `/health`.
 The token is also enforced on localhost when set. The service uses plain HTTP;
 use a TLS reverse proxy if you need encrypted transport.

@@ -24,6 +24,7 @@ impl AssetSource for Assets {
             "icons/sliders.svg" => Some(Cow::Borrowed(include_bytes!("assets/sliders.svg"))),
             "icons/workflow.svg" => Some(Cow::Borrowed(include_bytes!("assets/workflow.svg"))),
             "icons/trash.svg" => Some(Cow::Borrowed(include_bytes!("assets/trash.svg"))),
+            "icons/server.svg" => Some(Cow::Borrowed(include_bytes!("assets/server.svg"))),
             _ => None,
         })
     }
@@ -40,6 +41,7 @@ impl AssetSource for Assets {
             "icons/sliders.svg",
             "icons/workflow.svg",
             "icons/trash.svg",
+            "icons/server.svg",
         ]
         .into_iter()
         .filter(|asset| asset.starts_with(path))
@@ -54,6 +56,7 @@ fn main() {
         .run(|cx: &mut App| {
             gpui_component::init(cx);
             cx.set_global(settings::Settings::load());
+            cx.set_global(settings::Backend::Local);
             Theme::change(ThemeMode::Dark, None, cx);
             // Bound after gpui_component so Cmd-Enter in the prompt generates
             // instead of inserting a newline like Enter.
@@ -78,7 +81,7 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     window_min_size: Some(size(px(900.), px(600.))),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("Qwen Image 2.1".into()),
+                        title: Some("ImageForger".into()),
                         ..TitleBar::title_bar_options()
                     }),
                     app_owns_titlebar_drag: true,

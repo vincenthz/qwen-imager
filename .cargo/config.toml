@@ -1,2 +1,2 @@
 [alias]
-bundle-app = "bundle --release --format osx --no-default-features --features gui --bin QwenImager"
+bundle-app = "bundle --release --format osx --no-default-features --features gui --bin ImageForger"

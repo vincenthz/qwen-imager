@@ -1,4 +1,4 @@
-//! Native Qwen Image 2.1 inference on Apple Metal.
+//! ImageForger: native image generation and editing on Apple Metal.
 //!
 //! Run [`Generator::generate`] on a worker thread. Callbacks execute synchronously
 //! on that thread; forward owned [`Event`] values to your UI through a channel.
@@ -14,6 +14,7 @@ mod ops;
 mod pipeline;
 mod preview;
 mod quant;
+pub mod remote;
 mod shared;
 mod text;
 mod vae;

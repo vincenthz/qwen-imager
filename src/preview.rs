@@ -234,7 +234,7 @@ impl DecoderWorker {
     ) -> Result<Self> {
         let (jobs, receiver) = mpsc::sync_channel::<Job>(1);
         let thread = thread::Builder::new()
-            .name("qwen-preview".into())
+            .name("image-forger-preview".into())
             .spawn(move || {
                 while let Ok(job) = receiver.recv() {
                     if job.lifetime.is_cancelled() {

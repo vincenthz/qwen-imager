@@ -1,12 +1,12 @@
 [package]
-name = "qwen-imager"
+name = "image-forger"
 version = "0.1.0"
 edition = "2024"
-description = "Qwen Image 2.1 inference on Apple Metal"
+description = "ImageForger: image generation and editing on Apple Metal"
 
-[package.metadata.bundle.bin.QwenImager]
-name = "QwenImager"
-identifier = "app.qwen-imager.desktop"
+[package.metadata.bundle.bin.ImageForger]
+name = "ImageForger"
+identifier = "app.image-forger.desktop"
 icon = ["assets/app-icon.icns"]
 category = "Photography"
 short_description = "Create and edit photos locally with generative AI."
@@ -18,12 +18,12 @@ cli = ["dep:clap", "dep:axum", "dep:tokio"]
 gui = ["dep:gpui", "dep:gpui-platform", "dep:gpui-component", "dep:async-channel", "dep:rfd"]
 
 [[bin]]
-name = "qwen-imager-cli"
+name = "image-forger-cli"
 path = "src/main.rs"
 required-features = ["cli"]
 
 [[bin]]
-name = "QwenImager"
+name = "ImageForger"
 path = "src/gui/main.rs"
 required-features = ["gui"]
 
@@ -50,6 +50,7 @@ rand_distr = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+ureq = "2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
