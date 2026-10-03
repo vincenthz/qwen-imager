@@ -7,6 +7,7 @@ use gpui::{
 };
 use gpui_component::{
     Disableable, Icon, Sizable as _,
+    scroll::ScrollableElement as _,
     button::{Button, ButtonVariants as _},
     input::{Input, InputState},
     setting::{
@@ -177,41 +178,28 @@ fn servers_field(
     cx: &mut App,
 ) -> gpui::AnyElement {
     let servers = cx.global::<Settings>().servers.clone();
+    let add = {
+        let panel = panel.clone();
+        let input = input.clone();
+        move |window: &mut Window, cx: &mut App| {
+            let address = input.read(cx).value().trim().to_string();
+            if address.is_empty() {
+                return;
+            }
+            commit(&panel, cx, |s| {
+                if !s.servers.iter().any(|existing| existing == &address) {
+                    s.servers.push(address);
+                }
+            });
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+    };
+
     div()
         .flex()
         .flex_col()
-        .gap_2()
+        .gap_3()
         .w_full()
-        .children(servers.iter().enumerate().map(|(index, server)| {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_sm()
-                        .child(server.clone()),
-                )
-                .child(
-                    Button::new(("remove-server", index))
-                        .xsmall()
-                        .icon(Icon::default().path("icons/trash.svg"))
-                        .tooltip("Remove server")
-                        .on_click({
-                            let panel = panel.clone();
-                            move |_, _, cx| {
-                                commit(&panel, cx, |s| {
-                                    if index < s.servers.len() {
-                                        s.servers.remove(index);
-                                    }
-                                });
-                            }
-                        }),
-                )
-        }))
         .child(
             div()
                 .flex()
@@ -220,27 +208,63 @@ fn servers_field(
                 .child(Input::new(input).flex_1())
                 .child(
                     Button::new("add-server")
-                        .xsmall()
-                        .label("Add")
-                        .on_click({
-                            let panel = panel.clone();
-                            let input = input.clone();
-                            move |_, window, cx| {
-                                let address = input.read(cx).value().trim().to_string();
-                                if address.is_empty() {
-                                    return;
-                                }
-                                commit(&panel, cx, |s| {
-                                    if !s.servers.iter().any(|existing| existing == &address) {
-                                        s.servers.push(address);
-                                    }
-                                });
-                                input.update(cx, |input, cx| {
-                                    input.set_value("", window, cx);
-                                });
-                            }
-                        }),
+                        .primary()
+                        .label("Add host")
+                        .on_click(move |_, window, cx| add(window, cx)),
                 ),
+        )
+        .child(
+            div()
+                .id("server-list")
+                .flex()
+                .flex_col()
+                .h(px(320.))
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(0x303640))
+                .overflow_y_scrollbar()
+                .when(servers.is_empty(), |list| {
+                    list.child(
+                        div()
+                            .p_3()
+                            .text_sm()
+                            .text_color(rgb(0x8b93a1))
+                            .child("No hosts. Inference runs on this Mac."),
+                    )
+                })
+                .children(servers.iter().enumerate().map(|(index, server)| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .when(index > 0, |row| row.border_t_1().border_color(rgb(0x303640)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_sm()
+                                .child(server.clone()),
+                        )
+                        .child(
+                            Button::new(("remove-server", index))
+                                .xsmall()
+                                .ghost()
+                                .icon(Icon::default().path("icons/trash.svg"))
+                                .tooltip("Remove host")
+                                .on_click({
+                                    let panel = panel.clone();
+                                    let server = server.clone();
+                                    move |_, _, cx| {
+                                        commit(&panel, cx, |s| {
+                                            s.servers.retain(|existing| existing != &server)
+                                        });
+                                    }
+                                }),
+                        )
+                })),
         )
         .into_any_element()
 }
@@ -423,21 +447,16 @@ impl Render for SettingsPanel {
                                 SettingPage::new("Compute")
                                     .group(
                                         SettingGroup::new()
-                                            .title("Compute servers")
+                                            .title("Compute hosts")
+                                            .description("Remote ImageForger servers, as host or host:port.")
                                             .item(
-                                                SettingItem::new(
-                                                    "Servers",
-                                                    SettingField::render({
-                                                        let panel = panel.clone();
-                                                        let input = self.server_input.clone();
-                                                        move |_, _window, cx| {
-                                                            servers_field(&panel, &input, cx)
-                                                        }
-                                                    }),
-                                                )
-                                                .description(
-                                                    "Remote ImageForger servers, as host or host:port.",
-                                                ),
+                                                SettingItem::render({
+                                                    let panel = panel.clone();
+                                                    let input = self.server_input.clone();
+                                                    move |_, _window, cx| {
+                                                        servers_field(&panel, &input, cx)
+                                                    }
+                                                }),
                                             )
                                     )
                             )
