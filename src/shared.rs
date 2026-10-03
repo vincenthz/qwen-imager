@@ -5,7 +5,7 @@ use candle_core::{DType, Device, Shape, Storage, Tensor, metal_backend::MetalSto
 use candle_nn::{VarBuilder, var_builder::SimpleBackend};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex},
 };
 
 #[derive(Default)]
@@ -16,9 +16,10 @@ pub(crate) struct SharedWeights {
 #[derive(Default)]
 struct State {
     resident: HashMap<String, Arc<SharedTensors>>,
-    // Share encoders while they are in use, then release them. Keeping the
-    // entire text encoder resident would add ~16 GiB to idle memory use.
-    encoder: Weak<SharedTensors>,
+    // Keep the text encoder resident across generation runs. The GUI reuses one
+    // shared model for many runs, so the ~16 GiB of idle memory is traded for
+    // skipping the 8B-parameter weights' reload whenever the prompt changes.
+    encoder: Option<Arc<SharedTensors>>,
 }
 
 impl SharedWeights {
@@ -34,7 +35,7 @@ impl SharedWeights {
             .lock()
             .map_err(|_| anyhow::anyhow!("shared model lock poisoned"))?;
         let existing = if component == "text_encoder" {
-            state.encoder.upgrade()
+            state.encoder.clone()
         } else {
             state.resident.get(component).cloned()
         };
@@ -50,7 +51,7 @@ impl SharedWeights {
                     tensors: Mutex::new(HashMap::new()),
                 });
                 if component == "text_encoder" {
-                    state.encoder = Arc::downgrade(&tensors);
+                    state.encoder = Some(tensors.clone());
                 } else {
                     state.resident.insert(component.to_owned(), tensors.clone());
                 }
