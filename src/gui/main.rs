@@ -2,6 +2,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{Root, Theme, ThemeMode, TitleBar};
 use std::borrow::Cow;
 
+mod models;
 mod settings;
 mod timing;
 mod window;
@@ -15,6 +16,8 @@ struct Assets;
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
         Ok(match path {
+            "icons/download.svg" => Some(Cow::Borrowed(include_bytes!("assets/download.svg"))),
+            "icons/downloaded.svg" => Some(Cow::Borrowed(include_bytes!("assets/downloaded.svg"))),
             "icons/save.svg" => Some(Cow::Borrowed(include_bytes!("assets/save.svg"))),
             "icons/image.svg" => Some(Cow::Borrowed(include_bytes!("assets/image.svg"))),
             "icons/bell.svg" => Some(Cow::Borrowed(include_bytes!("assets/bell.svg"))),
@@ -32,6 +35,8 @@ impl AssetSource for Assets {
 
     fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
         Ok([
+            "icons/download.svg",
+            "icons/downloaded.svg",
             "icons/save.svg",
             "icons/image.svg",
             "icons/bell.svg",
@@ -56,8 +61,9 @@ fn main() {
         .with_assets(Assets)
         .run(|cx: &mut App| {
             gpui_component::init(cx);
-            cx.set_global(settings::Settings::load());
-            cx.set_global(settings::Backend::Local);
+            let settings = settings::Settings::load();
+            cx.set_global(settings.backend.clone());
+            cx.set_global(settings);
             Theme::change(ThemeMode::Dark, None, cx);
             // Bound after gpui_component so Cmd-Enter in the prompt generates
             // instead of inserting a newline like Enter.

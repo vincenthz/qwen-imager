@@ -4,7 +4,7 @@ use std::{
 };
 
 use gpui::{
-    Context, Entity, MouseButton, ScrollHandle, Subscription, Window, div, prelude::*, rgb, rgba,
+    Context, Entity, MouseButton, ScrollHandle, Subscription, Window, div, prelude::*, px, relative, rgb, rgba,
 };
 use gpui_component::{
     Disableable, Icon, Selectable, Sizable as _, TitleBar,
@@ -15,7 +15,8 @@ use gpui_component::{
 use image_forger::{Checkpoint, ModelOptions, SharedModel};
 
 use crate::{
-    settings::{Backend, Settings, SettingsEvent, SettingsPanel},
+    models::{Models, ModelState},
+    settings::{Backend, Settings, SettingsEvent, SettingsPanel, model_label, select_backend},
     window::{ImageWindow, WorkspaceActivity},
 };
 
@@ -48,6 +49,9 @@ pub struct Workspaces {
     activity: TabActivity,
     tab_scroll: ScrollHandle,
     model: SharedModel,
+    downloads: Entity<Models>,
+    _downloads_subscription: Subscription,
+    _backend_subscription: Subscription,
     settings: Option<(Entity<SettingsPanel>, Subscription)>,
 }
 
@@ -61,11 +65,16 @@ fn shared_model(checkpoint: Checkpoint) -> SharedModel {
 
 impl Workspaces {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let downloads = cx.new(Models::new);
+        let subscription = cx.observe(&downloads, |_, _, cx| cx.notify());
         let mut workspaces = Self {
             tabs: Vec::new(),
             activity: TabActivity::default(),
             tab_scroll: ScrollHandle::new(),
             settings: None,
+            downloads,
+            _downloads_subscription: subscription,
+            _backend_subscription: cx.observe_global::<Backend>(|_, cx| cx.notify()),
             model: shared_model(cx.global::<Settings>().model),
         };
         workspaces.add(window, cx);
@@ -75,7 +84,7 @@ impl Workspaces {
     fn add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let index = self.tabs.len();
         let generator = Arc::new(Mutex::new(self.model.generator()));
-        let view = cx.new(|cx| ImageWindow::new(window, cx, generator));
+        let view = cx.new(|cx| ImageWindow::new(window, cx, generator, self.downloads.clone()));
         let subscription = cx.subscribe(&view, move |workspaces, _, _: &WorkspaceActivity, cx| {
             workspaces.activity.received(index);
             cx.notify();
@@ -87,13 +96,13 @@ impl Workspaces {
         self.select(index, window, cx);
     }
 
-    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() {
+    fn open_settings(&mut self, models_page: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() && !models_page {
             return;
         }
         // The hidden workspace inputs must not receive keyboard events.
         window.blur(cx);
-        let panel = cx.new(|cx| SettingsPanel::new(window, cx));
+        let panel = cx.new(|cx| SettingsPanel::new(window, cx, self.downloads.clone(), models_page));
         let subscription = cx.subscribe_in(&panel, window, |workspaces, _, event, window, cx| {
             match event {
                 SettingsEvent::Saved(previous) => {
@@ -122,7 +131,7 @@ impl Workspaces {
                 .then(|| Arc::new(Mutex::new(self.model.generator())));
             tab.view.update(cx, |view, cx| {
                 if let Some(generator) = generator {
-                    view.set_generator(generator, window, cx);
+                    view.set_generator(generator, cx);
                 }
                 view.apply_defaults(previous, window, cx)
             });
@@ -157,6 +166,23 @@ impl Workspaces {
         cx.notify();
     }
 
+    fn download_indicators(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div().flex().items_center().gap_1()
+            .children(self.downloads.read(cx).entries.iter().enumerate().map(|(index, entry)| {
+                let state = &entry.state;
+                div().flex().flex_col().gap(px(1.))
+                    .child(Button::new(("model-status", index)).ghost().xsmall()
+                        .icon(Icon::default().path(if matches!(state, ModelState::Ready) { "icons/downloaded.svg" } else { "icons/download.svg" }).text_color(rgb(state.color())))
+                        .label(model_label(entry.checkpoint))
+                        .tooltip(format!("{}: {} — open model downloads", model_label(entry.checkpoint), state.label()))
+                        .on_click(cx.listener(|view, _, window, cx| view.open_settings(true, window, cx))))
+                    .child(div().h(px(3.)).w_full().rounded_md().overflow_hidden()
+                        .when(state.is_downloading(), |bar| bar.bg(rgb(0x303640)))
+                        .when_some(state.fraction(), |bar, fraction| bar.child(
+                            div().h_full().w(relative(fraction)).bg(rgb(0x8aa6ff)))))
+            }))
+    }
+
     fn open_unread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(&index) = self.activity.unread.iter().next() {
             self.select(index, window, cx);
@@ -188,12 +214,14 @@ impl Render for Workspaces {
                             .gap_1()
                             .pr_2()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(self.download_indicators(cx))
                             .child(
                                 Button::new("compute-backend")
                                     .ghost()
                                     .xsmall()
                                     .icon(Icon::default().path("icons/server.svg"))
-                                    .tooltip("Compute backend")
+                                    .label(if matches!(cx.global::<Backend>(), Backend::Local) { "Local" } else { "Remote" })
+                                    .tooltip(match cx.global::<Backend>() { Backend::Local => "Compute on this Mac".into(), Backend::Remote { address } => format!("Compute on {address}") })
                                     .dropdown_menu(move |menu, _, cx| {
                                         let current = cx.global::<Backend>().clone();
                                         let servers = cx.global::<Settings>().servers.clone();
@@ -201,7 +229,7 @@ impl Render for Workspaces {
                                             PopupMenuItem::new("Local")
                                                 .checked(current == Backend::Local)
                                                 .on_click(|_, _, cx| {
-                                                    cx.set_global(Backend::Local);
+                                                    select_backend(Backend::Local, cx);
                                                 }),
                                         );
                                         for server in servers {
@@ -213,7 +241,7 @@ impl Render for Workspaces {
                                                 PopupMenuItem::new(server)
                                                     .checked(checked)
                                                     .on_click(move |_, _, cx| {
-                                                        cx.set_global(backend.clone());
+                                                        select_backend(backend.clone(), cx);
                                                     }),
                                             );
                                         }
@@ -247,7 +275,7 @@ impl Render for Workspaces {
                                         if view.settings.is_some() {
                                             view.close_settings(window, cx);
                                         } else {
-                                            view.open_settings(window, cx);
+                                            view.open_settings(false, window, cx);
                                         }
                                     })),
                             ),

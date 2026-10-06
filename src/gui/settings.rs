@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::Context as _;
 use gpui::{
-    App, Context, Entity, EventEmitter, Global, SharedString, WeakEntity, Window, div, prelude::*,
-    px, rgb,
+    App, Context, Entity, EventEmitter, Global, SharedString, Subscription, WeakEntity, Window, div, prelude::*,
+    px, relative, rgb,
 };
 use gpui_component::{
     Disableable, Icon, Sizable as _,
@@ -11,16 +11,17 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     input::{Input, InputState},
     setting::{
-        NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage,
+        NumberFieldOptions, SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage,
         Settings as SettingsComponent,
     },
 };
 use image_forger::Checkpoint;
+use crate::models::{Models, ModelState};
 use serde::{Deserialize, Serialize};
 
 /// Which machine runs inference. [`Backend::Local`] uses this Mac; a remote
 /// backend delegates to a `image-forger` server over HTTP.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Backend {
     #[default]
     Local,
@@ -30,6 +31,27 @@ pub enum Backend {
 }
 
 impl Global for Backend {}
+
+/// Settings accepts host names as well as full URLs. Bare hosts use the server's
+/// default port; an explicit HTTP(S) URL retains its scheme, port and path.
+pub fn server_url(address: &str) -> String {
+    let address = address.trim().trim_end_matches('/');
+    if address.starts_with("http://") || address.starts_with("https://") {
+        address.into()
+    } else if !address.contains(':') || address.ends_with(']') {
+        format!("http://{address}:6996")
+    } else {
+        format!("http://{address}")
+    }
+}
+
+pub fn select_backend(backend: Backend, cx: &mut App) {
+    let mut settings = cx.global::<Settings>().clone();
+    settings.backend = backend.clone();
+    let _ = settings.save();
+    cx.set_global(settings);
+    cx.set_global(backend);
+}
 
 /// Application-wide preferences, persisted between launches.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -50,6 +72,8 @@ pub struct Settings {
     pub model: Checkpoint,
     /// Remote compute servers, as `host` or `host:port` addresses.
     pub servers: Vec<String>,
+    /// Last selected compute backend; local model files are optional for remote hosts.
+    pub backend: Backend,
 }
 
 impl Default for Settings {
@@ -63,6 +87,7 @@ impl Default for Settings {
             bf16_attention: false,
             model: Checkpoint::Original,
             servers: Vec::new(),
+            backend: Backend::Local,
         }
     }
 }
@@ -140,16 +165,20 @@ pub enum SettingsEvent {
 
 pub struct SettingsPanel {
     server_input: Entity<InputState>,
+    models: Entity<Models>,
+    models_page: bool,
+    _models_subscription: Subscription,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsPanel {}
 
 impl SettingsPanel {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>, models: Entity<Models>, models_page: bool) -> Self {
         let server_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("host or host:port")
         });
-        Self { server_input }
+        let subscription = cx.observe(&models, |_, _, cx| cx.notify());
+        Self { server_input, models, models_page, _models_subscription: subscription }
     }
 }
 
@@ -164,6 +193,7 @@ fn commit(
     let mut next = previous.clone();
     mutate(&mut next);
     let _ = next.save();
+    cx.set_global(next.backend.clone());
     cx.set_global(next);
     let _ = panel.update(cx, |_, cx| cx.emit(SettingsEvent::Saved(previous)));
 }
@@ -259,7 +289,10 @@ fn servers_field(
                                     let server = server.clone();
                                     move |_, _, cx| {
                                         commit(&panel, cx, |s| {
-                                            s.servers.retain(|existing| existing != &server)
+                                            s.servers.retain(|existing| existing != &server);
+                                            if s.backend == (Backend::Remote { address: server.clone() }) {
+                                                s.backend = Backend::Local;
+                                            }
                                         });
                                     }
                                 }),
@@ -316,6 +349,37 @@ fn output_directory_field(panel: WeakEntity<SettingsPanel>, cx: &mut App) -> gpu
         .into_any_element()
 }
 
+fn models_field(models: &Entity<Models>, cx: &mut App) -> gpui::AnyElement {
+    div().flex().flex_col().gap_4().w_full()
+        .children(models.read(cx).entries.iter().enumerate().map(|(index, entry)| {
+            let download = models.clone();
+            let cancel = models.clone();
+            let state = &entry.state;
+            div().flex().flex_col().gap_2().p_3().rounded_md().border_1().border_color(rgb(0x303640))
+                .child(div().flex().items_center().gap_2()
+                    .child(Icon::default().path(if matches!(state, ModelState::Ready) { "icons/downloaded.svg" } else { "icons/download.svg" }).text_color(rgb(state.color())))
+                    .child(div().flex_1().text_sm().child(format!("{} · about {} GB", model_label(entry.checkpoint), entry.checkpoint.download_gb()))))
+                .child(div().text_xs().text_color(rgb(state.color())).child(state.label()))
+                .when_some(state.fraction(), |row, fraction| row.child(
+                    div().h(px(4.)).w_full().rounded_md().overflow_hidden().bg(rgb(0x303640))
+                        .child(div().h_full().w(relative(fraction)).bg(rgb(0x8aa6ff)))))
+                .child(div().flex().gap_2()
+                    .when(state.is_downloading(), |row| row.child(
+                        Button::new(("cancel-model", index)).small()
+                            .label(if state.is_cancelling() { "Cancelling…" } else { "Cancel" })
+                            .disabled(state.is_cancelling())
+                            .on_click(move |_, _, cx| cancel.update(cx, |models, cx| models.cancel(index, cx)))))
+                    .when(!state.is_downloading(), |row| row.child(
+                        Button::new(("download-model", index)).small()
+                            .label(match state { ModelState::Ready => "Downloaded", ModelState::Checking => "Checking…", ModelState::Cancelled => "Resume", ModelState::Failed(_) => "Retry", _ => "Download" })
+                            .disabled(!state.can_download())
+                            .on_click(move |_, _, cx| download.update(cx, |models, cx| models.download(index, cx))))))
+        }))
+        .child(Button::new("refresh-models").small().label("Refresh local cache")
+            .on_click({ let models = models.clone(); move |_, _, cx| models.update(cx, |models, cx| models.refresh(cx)) }))
+        .into_any_element()
+}
+
 impl Render for SettingsPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let panel = cx.weak_entity();
@@ -364,6 +428,7 @@ impl Render for SettingsPanel {
                     .w_full()
                     .child(
                         SettingsComponent::new("settings")
+                            .default_selected_index(SelectIndex { page_ix: if self.models_page { 3 } else { 0 }, group_ix: None })
                             .page(
                                 SettingPage::new("General")
                                     .group(
@@ -580,6 +645,17 @@ impl Render for SettingsPanel {
                                             )
                                     )
                             )
+                            .page(
+                                SettingPage::new("Models").group(
+                                    SettingGroup::new()
+                                        .title("Local models")
+                                        .description("Optional for remote compute. Downloads continue when Settings is closed. Progress is for the current file.")
+                                        .item(SettingItem::render({
+                                            let models = self.models.clone();
+                                            move |_, _, cx| models_field(&models, cx)
+                                        }))
+                                )
+                            )
                     )
             )
     }
@@ -598,6 +674,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn server_addresses_support_bare_hosts_ports_and_full_urls() {
+        assert_eq!(server_url("render.local"), "http://render.local:6996");
+        assert_eq!(server_url(" 192.168.1.5:8080 "), "http://192.168.1.5:8080");
+        assert_eq!(server_url("[::1]"), "http://[::1]:6996");
+        assert_eq!(server_url("[::1]:8080"), "http://[::1]:8080");
+        assert_eq!(server_url("https://render.local/api/"), "https://render.local/api");
+        assert_eq!(server_url("http://render.local"), "http://render.local");
+    }
+
+    #[test]
     fn settings_round_trip_and_fill_missing_fields_with_defaults() {
         let settings = Settings {
             steps: 30,
@@ -608,6 +694,7 @@ mod tests {
             bf16_attention: true,
             model: Checkpoint::Mlx4Bit,
             servers: vec!["192.168.1.5:6996".into()],
+            backend: Backend::Remote { address: "192.168.1.5:6996".into() },
         };
         let json = serde_json::to_vec(&settings).unwrap();
         assert!(String::from_utf8_lossy(&json).contains(r#""model":"mlx-4bit""#));

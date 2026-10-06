@@ -36,18 +36,32 @@ in `assets/app-icon-prompt.txt`. To rebuild the bundled `assets/app-icon.icns`
 with all standard and Retina sizes, run `sh scripts/build-app-icon.sh` on macOS,
 then `cargo bundle-app` again.
 
-The window checks the Hugging Face cache at startup without network access. If
-the model is missing or incomplete, it shows an explanation and a **Download**
-button instead of the generation controls. Clicking Download starts fetching
-missing files and displays a progress bar with bytes and percentage for the
-current file. The generation interface appears when the download finishes;
-fully cached models open it directly. Download errors remain visible and you
-can retry with Download. The download size depends on the **Model** setting
-(about 32 GB for BF16, 18 GB for MLX 8-bit, 11 GB for MLX 4-bit); `HF_HOME` and
+The window opens immediately, with no local model setup required. You can edit
+prompts, load references, and use the workflow canvas while the app checks the
+Hugging Face cache in the background, without network access or GPU allocation.
+For remote compute, add a server in **Settings → Compute**, then select it from
+the **Local / Remote** menu in the title bar. No local model is required for remote
+generation. The selected backend is remembered between launches. Bare host names
+use `http://host:6996`; `host:port` and full HTTP(S) URLs are also supported.
+
+To generate on this Mac, open **Settings → Models** and click **Download** for the
+desired checkpoint (about 32 GB for BF16, 18 GB for MLX 8-bit, 11 GB for MLX 4-bit).
+Downloads are optional and only start when requested. They continue while Settings
+is closed or you switch workspaces or compute hosts. Each model has its own
+download, cancel, resume, and retry controls. Existing cached files are reused;
+**Refresh local cache** detects files downloaded outside the app. `HF_HOME` and
 `HF_HUB_CACHE` work as they do in the CLI.
 
-The top bar starts with a **gear** icon that opens **Settings**, followed by
-**Workspace 1** and any additional workspaces.
+Named model icons in the title bar show local availability: green check marks for
+downloaded models, blue download icons with a progress bar during downloads, grey
+icons for unavailable models, and orange for errors. Hover for status details or
+click an icon to open **Settings → Models**. Progress bars and percentages describe
+the **current file**, not the entire model; while its size is unknown, Settings
+shows a connecting message. Local generation requires the selected checkpoint to
+be downloaded, but missing files never block access to the interface.
+
+The title bar also has a **gear** icon for **Settings** and a **bell** for unread
+workspace activity. **Workspace 1** and additional workspaces appear beneath it.
 Click **+** to create and select a new workspace. Each workspace retains its own
 prompt, settings, reference images and drawings, preview, and finished result.
 Switching tabs keeps background generation running. A **bell** appears on a
@@ -97,7 +111,11 @@ Settings are saved in `~/Library/Application Support/ImageForger/settings.json`:
   soon as it is idle; one still generating finishes with the previous model
   first, and both models stay in memory until it does. Switching drops the
   workspace's cached prompt and reference encodings. If the selected model is
-  not fully downloaded, the workspace shows the Download screen.
+  not fully downloaded, local Generate points to **Settings → Models**; remote
+  generation uses the remote server's model.
+- **Compute hosts** and the selected **Local / Remote** backend. Removing the
+  selected remote host switches future generations to Local; a running generation
+  continues on the backend it started with.
 
 Enter a prompt and click **Generate** to its right, or press ⌘↩. Enter starts a
 new line; the prompt grows to 12 lines, then scrolls, and leading and trailing

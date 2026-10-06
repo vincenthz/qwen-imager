@@ -11,7 +11,7 @@ use std::{
 use anyhow::Context as _;
 
 use crate::{
-    settings::{Backend, Settings, digits_input, model_label, parse_size, parse_steps},
+    settings::{Backend, Settings, digits_input, parse_size, parse_steps, server_url},
     timing::{GenerationTiming, format_duration},
 };
 
@@ -26,8 +26,8 @@ use gpui_component::{
     input::{Input, InputState, Textarea, TextareaState},
 };
 use image_forger::{
-    AttentionPrecision, CancellationToken, Cancelled, DownloadProgress, Event, Generation,
-    Generator, ModelOptions, PauseControl, PreviewControl, Request, RgbaImage, Stage,
+    AttentionPrecision, CancellationToken, Cancelled, Event, Generation,
+    Generator, PauseControl, PreviewControl, Request, RgbaImage, Stage,
 };
 
 gpui::actions!(image_window, [Generate]);
@@ -186,9 +186,6 @@ struct Stroke {
 
 enum Message {
     PreviewRequested,
-    Checked(image_forger::Result<()>),
-    Download(DownloadProgress),
-    Prepared(image_forger::Result<()>),
     Inference(Event),
     Complete(image_forger::Result<Generation>),
 }
@@ -281,10 +278,7 @@ pub struct ImageWindow {
     preview_pending: bool,
     preview_step: Option<usize>,
     busy: bool,
-    ready: bool,
-    checking_model: bool,
-    // The model setting changed while busy; recheck its files once idle.
-    stale_model: bool,
+    models: Entity<crate::models::Models>,
     loading_image: bool,
     references: Vec<ReferenceImage>,
     // Completed generations for this workspace, newest last.
@@ -329,6 +323,7 @@ impl ImageWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
         generator: Arc<Mutex<Generator>>,
+        models: Entity<crate::models::Models>,
     ) -> Self {
         let prompt = cx.new(|cx| {
             TextareaState::new(window, cx)
@@ -341,7 +336,7 @@ impl ImageWindow {
         let seed = cx.new(|cx| {
             digits_input(window, cx, rand::random_range(0..(1_u64 << 30)).to_string())
         });
-        let mut view = Self {
+        Self {
             mode: Mode::Advanced,
             workflow: cx.new(crate::workflow::WorkflowCanvas::new),
             prompt,
@@ -356,9 +351,7 @@ impl ImageWindow {
             preview_pending: false,
             preview_step: None,
             busy: false,
-            ready: false,
-            checking_model: true,
-            stale_model: false,
+            models,
             loading_image: false,
             references: Vec::new(),
             history: Vec::new(),
@@ -371,7 +364,7 @@ impl ImageWindow {
             square_crop: false,
             canvas_bounds: Rc::default(),
             cancellation: CancellationToken::default(),
-            status: "Checking model files…".into(),
+            status: "Enter a prompt. Select a remote host or download a local model in Settings.".into(),
             progress: 0.,
             image: None,
             rendered: None,
@@ -383,19 +376,11 @@ impl ImageWindow {
             timing: None,
             ticker: None,
             generator,
-        };
-        view.check_model(window, cx);
-        view
+        }
     }
 
     pub fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // A different workspace may have downloaded the model in the meantime.
-        if !self.ready && !self.busy {
-            self.checking_model = true;
-            self.cancellation = CancellationToken::default();
-            self.check_model(window, cx);
-        }
-        if self.ready && !self.busy {
+        if !self.busy {
             self.prompt.update(cx, |input, cx| input.focus(window, cx));
         }
         cx.notify();
@@ -406,24 +391,11 @@ impl ImageWindow {
     pub fn set_generator(
         &mut self,
         generator: Arc<Mutex<Generator>>,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // An in-flight run owns a clone of the old generator until it completes.
         self.generator = generator;
-        self.stale_model = true;
-        self.recheck_if_stale(window, cx);
-    }
-
-    fn recheck_if_stale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.stale_model || self.busy {
-            return;
-        }
-        self.stale_model = false;
-        self.ready = false;
-        self.checking_model = true;
-        self.status = String::new();
-        self.cancellation = CancellationToken::default();
-        self.check_model(window, cx);
+        cx.notify();
     }
 
     pub fn deactivate(&mut self) {
@@ -453,52 +425,15 @@ impl ImageWindow {
         cx.notify();
     }
 
-    fn check_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.busy = true;
-        let cancellation = self.cancellation.clone();
-        let checkpoint = cx.global::<Settings>().model;
-        let sender = self.listen(window, cx);
-        thread::spawn(move || {
-            // Startup only checks local files, including every indexed weight shard.
-            // Downloads are authorized exclusively by the Download button below.
-            let mut generator = Generator::new(ModelOptions {
-                offline: true,
-                checkpoint,
-                ..Default::default()
-            });
-            let result = generator.prepare(&cancellation, |_| {});
-            let _ = sender.send_blocking(Message::Checked(result));
-        });
-    }
-
-    fn prepare(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.ready {
+    fn generate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.loading_image || self.mode == Mode::Workflow {
             return;
         }
-        self.busy = true;
-        self.cancellation = CancellationToken::default();
-        self.status = "Preparing download…".into();
-        self.progress = 0.;
-        let cancellation = self.cancellation.clone();
-        let checkpoint = cx.global::<Settings>().model;
-        let sender = self.listen(window, cx);
-        thread::spawn(move || {
-            let mut generator = Generator::new(ModelOptions {
-                checkpoint,
-                ..Default::default()
-            });
-            let result = generator.prepare(&cancellation, |progress| {
-                if sender.send_blocking(Message::Download(progress)).is_err() {
-                    cancellation.cancel();
-                }
-            });
-            let _ = sender.send_blocking(Message::Prepared(result));
-        });
-        cx.notify();
-    }
-
-    fn generate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.loading_image || !self.ready || self.mode == Mode::Workflow {
+        if let Some(message) = self.models.read(cx).generation_blocker(
+            cx.global::<Backend>(), cx.global::<Settings>().model,
+        ) {
+            self.status = message;
+            cx.notify();
             return;
         }
         // Trailing blank lines would otherwise change the prompt's encoding.
@@ -635,7 +570,7 @@ impl ImageWindow {
                     Backend::Remote { address } => {
                         let cancel = cancellation.clone();
                         let sender = sender.clone();
-                        image_forger::remote::run(&request, address, &cancellation, move |event| {
+                        image_forger::remote::run(&request, &server_url(address), &cancellation, move |event| {
                             if sender.send_blocking(Message::Inference(event)).is_err() {
                                 cancel.cancel();
                             }
@@ -666,7 +601,7 @@ impl ImageWindow {
     }
 
     fn load_image(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.busy || self.loading_image || !self.ready || self.references.len() >= MAX_REFERENCES
+        if self.busy || self.loading_image || self.references.len() >= MAX_REFERENCES
         {
             return;
         }
@@ -1046,7 +981,7 @@ impl ImageWindow {
         if self.cancellation.is_cancelled()
             && matches!(
                 message,
-                Message::Download(_) | Message::Inference(_) | Message::PreviewRequested
+                Message::Inference(_) | Message::PreviewRequested
             )
         {
             return;
@@ -1062,41 +997,6 @@ impl ImageWindow {
                 if !self.status.ends_with(DECODING_PREVIEW) {
                     self.status.push_str(DECODING_PREVIEW);
                 }
-            }
-            Message::Checked(result) => {
-                self.checking_model = false;
-                self.busy = false;
-                self.ready = result.is_ok();
-                self.status = if self.ready {
-                    "Model ready. Enter a prompt to begin.".into()
-                } else {
-                    String::new()
-                };
-                self.progress = if self.ready { 1. } else { 0. };
-            }
-            Message::Download(progress) => {
-                self.progress = progress.total.filter(|&n| n > 0).map_or(0., |total| {
-                    (progress.downloaded as f64 / total as f64).clamp(0., 1.) as f32
-                });
-                self.status = match progress.total {
-                    Some(total) => format!(
-                        "Downloading {} — {:.1} / {:.1} MB ({:.0}%)",
-                        progress.file,
-                        progress.downloaded as f64 / 1_000_000.,
-                        total as f64 / 1_000_000.,
-                        self.progress * 100.
-                    ),
-                    None => format!("Connecting to download {}…", progress.file),
-                };
-            }
-            Message::Prepared(result) => {
-                self.busy = false;
-                self.ready = result.is_ok();
-                self.status = match result {
-                    Ok(()) => "Model ready. Enter a prompt to begin.".into(),
-                    Err(error) => error_status(error),
-                };
-                self.progress = if self.ready { 1. } else { 0. };
             }
             Message::Inference(event) => match event {
                 Event::Started { steps, .. } => {
@@ -1183,10 +1083,6 @@ impl ImageWindow {
                 }
             }
         }
-        if self.stale_model && !self.busy {
-            // Defer so the check's new channel does not replace this one mid-message.
-            cx.defer_in(window, |view, window, cx| view.recheck_if_stale(window, cx));
-        }
         if activity {
             cx.emit(WorkspaceActivity);
         }
@@ -1241,12 +1137,7 @@ impl ImageWindow {
         self.paused = false;
         self.timing = None;
         self.ticker = None;
-        self.status = if self.ready {
-            "Cancelling after the current operation…"
-        } else {
-            "Cancelling after the current file finishes downloading…"
-        }
-        .into();
+        self.status = "Cancelling after the current operation…".into();
         cx.notify();
     }
 
@@ -1320,41 +1211,6 @@ impl Drop for ImageWindow {
 
 impl Render for ImageWindow {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.ready {
-            return div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .p_5()
-                .bg(rgb(0x15171b))
-                .text_color(rgb(0xe4e7ec))
-                .child(
-                    div().w_full().max_w(px(460.)).flex().flex_col().gap_4()
-                        .map(|content| {
-                            if self.checking_model {
-                                return content.child("Checking local model files…");
-                            }
-                            content
-                                .child(format!("The {} image model is not fully available on this Mac. Download it to start generating images. It needs about {} GB of disk space; files already downloaded will be reused.", model_label(cx.global::<Settings>().model), cx.global::<Settings>().model.download_gb()))
-                                .child(div().child(
-                                    Button::new("download")
-                                        .primary()
-                                        .label(if self.busy {
-                                            if self.cancellation.is_cancelled() { "Cancelling…" } else { "Cancel" }
-                                        } else { "Download" })
-                                        .disabled(self.busy && self.cancellation.is_cancelled())
-                                        .on_click(cx.listener(|view, _, window, cx| {
-                                            if view.busy { view.cancel(cx); } else { view.prepare(window, cx); }
-                                        }))))
-                                .when(self.busy, |content| content.child(
-                                    div().h(px(6.)).w_full().rounded_md().overflow_hidden().bg(rgb(0x303640))
-                                        .child(div().h_full().w(relative(self.progress.clamp(0., 1.))).bg(rgb(0x8aa6ff)))))
-                                .when(!self.status.is_empty(), |content| content.child(
-                                    div().text_sm().text_color(rgb(0x9da6b5)).child(self.status.clone())))
-                        }),
-                );
-        }
         let mode = self.mode;
         div()
             .size_full()
