@@ -140,7 +140,7 @@ enum Tool {
 }
 
 /// The workspace layout. Simple keeps only a prompt; Advanced exposes the full
-/// editing workflow; Workflow is a placeholder for a future node-based editor.
+/// editing controls; Workflow provides a node-based canvas.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 enum Mode {
     #[default]
@@ -268,6 +268,7 @@ impl ReferenceImage {
 
 pub struct ImageWindow {
     mode: Mode,
+    workflow: Entity<crate::workflow::WorkflowCanvas>,
     prompt: Entity<TextareaState>,
     steps: Entity<InputState>,
     size: Entity<InputState>,
@@ -342,6 +343,7 @@ impl ImageWindow {
         });
         let mut view = Self {
             mode: Mode::Advanced,
+            workflow: cx.new(crate::workflow::WorkflowCanvas::new),
             prompt,
             steps,
             size,
@@ -1364,7 +1366,7 @@ impl Render for ImageWindow {
             .child(match mode {
                 Mode::Simple => self.simple(cx).into_any_element(),
                 Mode::Advanced => self.advanced(cx).into_any_element(),
-                Mode::Workflow => self.workflow().into_any_element(),
+                Mode::Workflow => self.workflow.clone().into_any_element(),
             })
     }
 }
@@ -1960,30 +1962,6 @@ impl ImageWindow {
                     .when_some(self.timing.as_ref(), |row, timing| {
                         row.child(div().text_color(rgb(0x9da6b5)).child(timing.label()))
                     }),
-            )
-    }
-
-    fn workflow(&self) -> impl IntoElement {
-        div()
-            .flex_1()
-            .min_w_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .p_5()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_2()
-                    .child(div().text_lg().child("Workflow mode"))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x9da6b5))
-                            .child("A node-based editing workflow is coming soon."),
-                    ),
             )
     }
 }

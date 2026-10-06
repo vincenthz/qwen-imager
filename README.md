@@ -62,6 +62,24 @@ Concurrent runs share GPU time and each needs its own working memory; starting
 more runs does not multiply GPU capacity. Workspaces live for the current app session;
 closing the app cancels their work. Save images you want to keep before quitting.
 
+The **Workflow** tab opens an infinite canvas for arranging a graph of **Prompt**,
+**Image**, **Generate**, and **Output** nodes. Each workspace starts with a connected
+Prompt → Generate → Output graph. Add nodes from the toolbar, drag cards to move
+them, and drag between matching colored dots to connect them (purple for text,
+green for images). Connections can start at either end. Generate accepts one prompt
+and up to 10 image inputs, in connection order; Output accepts one image. Connecting
+a new source to a single-source input replaces its previous connection. Invalid
+connections, duplicates, and loops are rejected.
+
+Drag the background or scroll to pan; hold **⌘** or **Ctrl** while scrolling to zoom
+around the pointer. The **−**, **+**, and **Fit all** controls help navigate larger
+graphs. Select a node and use **Disconnect** to remove its connections or **Remove**
+(also Delete/Backspace while the canvas is focused) to delete it. Escape cancels a
+connection and clears selection. Graphs and viewport positions stay with their
+workspace when switching tabs or modes, for the current app session only. This is
+the workflow editor foundation: node configuration and graph execution are not yet
+available; generate images using Simple or Advanced mode.
+
 Settings are saved in `~/Library/Application Support/ImageForger/settings.json`:
 
 - **Steps** and **Size (px)** for new workspaces (defaults 20 and 512). Idle

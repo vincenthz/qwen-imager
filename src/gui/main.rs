@@ -5,6 +5,7 @@ use std::borrow::Cow;
 mod settings;
 mod timing;
 mod window;
+mod workflow;
 mod workspaces;
 
 actions!(img_gen_gui, [Quit]);
