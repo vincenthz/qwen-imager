@@ -30,7 +30,7 @@ use std::{
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 
 const JSON_LIMIT: usize = 64 * 1024;
-const UPLOAD_LIMIT: usize = 64 * 1024 * 1024;
+const UPLOAD_LIMIT: usize = 16 * 1024 * 1024;
 const IMAGE_PIXEL_LIMIT: u64 = 16_000_000;
 const JOB_PIXEL_LIMIT: u64 = 32_000_000;
 const REFERENCE_MEMORY_UNIT: usize = 64 * 1024;
@@ -702,6 +702,19 @@ fn decode_references(
     Ok((images, permits))
 }
 
+fn upload_error(status: StatusCode, message: String) -> ApiError {
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        ApiError(
+            status,
+            format!(
+                "Multipart upload exceeds the 16 MiB limit ({UPLOAD_LIMIT} bytes total, including images, parameters, and form headers)"
+            ),
+        )
+    } else {
+        ApiError(status, message)
+    }
+}
+
 async fn submit(
     State(service): State<Arc<Service>>,
     mut request: axum::extract::Request,
@@ -719,18 +732,18 @@ async fn submit(
                 "two reference uploads are already in progress; retry shortly".into(),
             )
         })?;
-        request
-            .extensions_mut()
-            .insert(DefaultBodyLimit::max(UPLOAD_LIMIT));
+        // `apply` replaces Axum's internal limit. Inserting DefaultBodyLimit
+        // itself into extensions leaves the router's 64 KiB JSON limit active.
+        DefaultBodyLimit::max(UPLOAD_LIMIT).apply(&mut request);
         let mut form = Multipart::from_request(request, &())
             .await
-            .map_err(|e| ApiError(e.status(), e.body_text()))?;
+            .map_err(|e| upload_error(e.status(), e.body_text()))?;
         let mut parameters = None;
         let mut files = Vec::new();
         while let Some(mut field) = form
             .next_field()
             .await
-            .map_err(|e| ApiError(e.status(), e.body_text()))?
+            .map_err(|e| upload_error(e.status(), e.body_text()))?
         {
             match field.name() {
                 Some("parameters") => {
@@ -744,7 +757,7 @@ async fn submit(
                     while let Some(chunk) = field
                         .chunk()
                         .await
-                        .map_err(|e| ApiError(e.status(), e.body_text()))?
+                        .map_err(|e| upload_error(e.status(), e.body_text()))?
                     {
                         if data.len() + chunk.len() > JSON_LIMIT {
                             return Err(ApiError(
@@ -770,7 +783,7 @@ async fn submit(
                         field
                             .bytes()
                             .await
-                            .map_err(|e| ApiError(e.status(), e.body_text()))?,
+                            .map_err(|e| upload_error(e.status(), e.body_text()))?,
                     );
                 }
                 _ => {
@@ -1313,7 +1326,7 @@ mod tests {
         Bytes::from(out.into_inner())
     }
 
-    async fn multipart(app: &Router, fields: &[(&str, Bytes)]) -> (StatusCode, serde_json::Value) {
+    fn multipart_body(fields: &[(&str, Bytes)]) -> Vec<u8> {
         let mut body = Vec::new();
         for (name, data) in fields {
             body.extend_from_slice(
@@ -1326,6 +1339,11 @@ mod tests {
             body.extend_from_slice(b"\r\n");
         }
         body.extend_from_slice(b"--test-boundary--\r\n");
+        body
+    }
+
+    async fn multipart(app: &Router, fields: &[(&str, Bytes)]) -> (StatusCode, serde_json::Value) {
+        let body = multipart_body(fields);
         let response = app
             .clone()
             .oneshot(
@@ -1456,6 +1474,43 @@ mod tests {
             .0,
             StatusCode::TOO_MANY_REQUESTS
         );
+    }
+
+    #[test]
+    fn reference_uploads_accept_sixteen_mib_and_reject_larger_bodies() {
+        runtime().block_on(async {
+            const SIXTEEN_MIB: usize = 16 * 1024 * 1024;
+            let params = ("parameters", Bytes::from_static(br#"{"prompt":"edit"}"#));
+            let pixel = encoded(&RgbaImage::new(1, 1), image::ImageFormat::Png);
+            let overhead = multipart_body(&[params.clone(), ("images", Bytes::new())]).len();
+            for (body_size, expected) in [
+                (128 * 1024, StatusCode::ACCEPTED),
+                (SIXTEEN_MIB, StatusCode::ACCEPTED),
+                (SIXTEEN_MIB + 1, StatusCode::PAYLOAD_TOO_LARGE),
+            ] {
+                // Padding after the PNG isolates the wire-size limit from the
+                // independent decoded-image dimensions and memory limits.
+                let mut image = pixel.to_vec();
+                image.resize(body_size - overhead, 0);
+                let fields = [params.clone(), ("images", Bytes::from(image))];
+                assert_eq!(multipart_body(&fields).len(), body_size);
+                let service = Service::new(1, None);
+                let app = router(service.clone());
+                let (code, view) = multipart(&app, &fields).await;
+                assert_eq!(code, expected, "{body_size} bytes: {view}");
+                if code == StatusCode::ACCEPTED {
+                    assert_eq!(service.store.lock().unwrap().queue.len(), 1);
+                } else {
+                    assert!(view["error"].as_str().unwrap().contains("16 MiB"));
+                    assert!(service.store.lock().unwrap().queue.is_empty());
+                    assert_eq!(
+                        service.reference_memory.available_permits(),
+                        REFERENCE_MEMORY_LIMIT / REFERENCE_MEMORY_UNIT
+                    );
+                }
+                assert_eq!(service.uploads.available_permits(), 2);
+            }
+        });
     }
 
     #[test]

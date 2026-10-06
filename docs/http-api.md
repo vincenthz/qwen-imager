@@ -127,7 +127,11 @@ resized by the inference pipeline in the same way as local CLI/GUI inputs.
 
 Upload limits:
 
-- Up to **10 images**, with **64 MiB** maximum for the entire multipart body.
+- Up to **10 images**, with **16 MiB** (16,777,216 bytes) maximum for the entire
+  multipart body by default, including images, parameters, and form headers.
+  An oversized upload returns `413` with the limit in its error message. The GUI
+  uploads references as PNG, so the transmitted size can differ from the original
+  JPEG or HEIC file size.
 - The `parameters` field is limited to **64 KiB**; duplicate `parameters` fields
   and unknown form fields are rejected. Parameters may appear before or after image fields.
 - Each image is limited to **16 million pixels** and **8192 pixels per side**;
