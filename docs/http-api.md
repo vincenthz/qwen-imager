@@ -18,6 +18,19 @@ set `IMAGEFORGER_API_TOKEN` and use `--listen 0.0.0.0:6996`; include
 The token is also enforced on localhost when set. The service uses plain HTTP;
 use a TLS reverse proxy if you need encrypted transport.
 
+In the desktop GUI, add the service address in **Settings → Compute**, paste the
+same `IMAGEFORGER_API_TOKEN` into that host's masked **API token** field (without
+the `Bearer` prefix), and click **Save & test**. The token is saved in macOS
+Keychain, separately from the settings file. The test calls authenticated
+`GET /health` without submitting a job or loading model weights. Select the host
+from the title bar's **Local / Remote** menu to generate. The GUI authenticates
+submission, polling, preview, and final-image requests; no local model download
+is required. **Clear token** removes the credential from Keychain. Removing a
+host from the list retains its credential for re-adding the same endpoint.
+
+HTTP redirects are not followed by the GUI client; configure the final service
+URL, including its HTTPS scheme or reverse-proxy path, directly in Settings.
+
 ## Submit and retrieve an image
 
 ```sh

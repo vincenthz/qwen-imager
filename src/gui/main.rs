@@ -2,6 +2,7 @@ use gpui::{prelude::*, *};
 use gpui_component::{Root, Theme, ThemeMode, TitleBar};
 use std::borrow::Cow;
 
+mod credentials;
 mod models;
 mod settings;
 mod timing;

@@ -18,6 +18,95 @@ use crate::{CancellationToken, Event, Generation, Request, Stage};
 const BOUNDARY: &str = "----image-forger-boundary";
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// An authenticated connection. Never derive Debug: it holds a secret.
+struct Client {
+    base: String,
+    authorization: Option<String>,
+    agent: ureq::Agent,
+}
+
+impl Client {
+    fn new(base_url: &str, token: Option<&str>) -> Result<Self> {
+        let base = base_url.trim().trim_end_matches('/').to_owned();
+        ensure!(
+            base.starts_with("http://") || base.starts_with("https://"),
+            "Use an HTTP or HTTPS server URL"
+        );
+        let token = token.map(str::trim).filter(|token| !token.is_empty());
+        ensure!(
+            token.is_none_or(|token| token.bytes().all(|byte| byte.is_ascii_graphic())),
+            "API token must contain only visible ASCII characters, without spaces or line breaks"
+        );
+        Ok(Self {
+            base,
+            authorization: token.map(|token| format!("Bearer {token}")),
+            // Do not forward credentials to a redirect destination.
+            agent: ureq::AgentBuilder::new()
+                .redirects(0)
+                .timeout_connect(Duration::from_secs(10))
+                .timeout_read(Duration::from_secs(60))
+                .timeout_write(Duration::from_secs(60))
+                .build(),
+        })
+    }
+
+    fn request(&self, method: &str, path: &str) -> ureq::Request {
+        let request = self.agent.request(method, &format!("{}{path}", self.base));
+        if let Some(authorization) = &self.authorization {
+            request.set("Authorization", authorization)
+        } else {
+            request
+        }
+    }
+
+    fn response(&self, result: Result<ureq::Response, ureq::Error>) -> Result<ureq::Response> {
+        match result {
+            Err(ureq::Error::Status(401 | 403, _)) => anyhow::bail!(
+                "Authentication rejected. Set this host's API token in Settings → Compute to match IMAGEFORGER_API_TOKEN on the server."
+            ),
+            Err(ureq::Error::Status(code, _)) => anyhow::bail!("Server returned HTTP {code}"),
+            Err(ureq::Error::Transport(_)) => anyhow::bail!(
+                "Could not reach the server. Check its address, network connection, and TLS configuration."
+            ),
+            Ok(response) => {
+                ensure!(
+                    !(300..400).contains(&response.status()),
+                    "Server redirected the request. Configure the final server URL in Settings → Compute."
+                );
+                Ok(response)
+            }
+        }
+    }
+
+    fn get(&self, path: &str) -> Result<ureq::Response> {
+        self.response(self.request("GET", path).call())
+    }
+
+    fn fetch_bytes(&self, path: &str) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        self.get(path)?.into_reader().read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+
+/// Check connectivity and authentication without loading a model or submitting a job.
+/// Returns the checkpoint reported by the service.
+pub fn test_connection(base_url: &str, token: Option<&str>) -> Result<String> {
+    let client = Client::new(base_url, token)?;
+    let health: serde_json::Value = client
+        .get("/health")?
+        .into_json()
+        .context("reading server health")?;
+    ensure!(
+        health["status"] == "ok",
+        "Server is not ready to accept jobs"
+    );
+    Ok(health["model"]
+        .as_str()
+        .context("Response is not an ImageForger service")?
+        .into())
+}
+
 /// Run one generation against the remote server at `base_url` (e.g.
 /// `http://host:6996`). Emits [`Event::Started`], [`Event::Progress`],
 /// [`Event::StepFinished`] and [`Event::Preview`] as they arrive.
@@ -25,21 +114,33 @@ pub fn run(
     request: &Request,
     base_url: &str,
     cancellation: &CancellationToken,
+    on_event: impl FnMut(Event),
+) -> Result<Generation> {
+    run_authenticated(request, base_url, None, cancellation, on_event)
+}
+
+/// Like [`run`], using the host's optional Bearer token on every HTTP request.
+pub fn run_authenticated(
+    request: &Request,
+    base_url: &str,
+    token: Option<&str>,
+    cancellation: &CancellationToken,
     mut on_event: impl FnMut(Event),
 ) -> Result<Generation> {
+    let client = Client::new(base_url, token)?;
     let started = Instant::now();
-    let image = run_inner(request, base_url, cancellation, &mut on_event)?;
+    let image = run_inner(request, &client, cancellation, &mut on_event)?;
     let elapsed = started.elapsed();
     Ok(Generation { image, elapsed })
 }
 
 fn run_inner(
     request: &Request,
-    base_url: &str,
+    client: &Client,
     cancellation: &CancellationToken,
     on_event: &mut impl FnMut(Event),
 ) -> Result<Arc<RgbaImage>> {
-    let base = base_url.trim_end_matches('/');
+    cancellation.check()?;
     let (preview_mode, preview_every) = match request.preview_every {
         Some(every) => ("auto", every.get()),
         None if request.preview_control.is_some() => ("auto", 5),
@@ -58,15 +159,15 @@ fn run_inner(
     });
 
     let body = multipart(&parameters, &request.images)?;
-    let response = ureq::post(&format!("{base}/jobs"))
-        .set("Content-Type", &format!("multipart/form-data; boundary={BOUNDARY}"))
-        .send_bytes(&body)
-        .with_context(|| format!("submitting job to {base}"))?;
-    ensure!(
-        response.status() / 100 == 2,
-        "server rejected the job (HTTP {})",
-        response.status()
-    );
+    let response = client.response(
+        client
+            .request("POST", "/jobs")
+            .set(
+                "Content-Type",
+                &format!("multipart/form-data; boundary={BOUNDARY}"),
+            )
+            .send_bytes(&body),
+    )?;
 
     let view: serde_json::Value = response.into_json().context("reading job response")?;
     let id = view["id"]
@@ -88,9 +189,8 @@ fn run_inner(
 
     loop {
         cancellation.check()?;
-        let status: serde_json::Value = ureq::get(&format!("{base}/jobs/{id}"))
-            .call()
-            .with_context(|| format!("polling job {id}"))?
+        let status: serde_json::Value = client
+            .get(&format!("/jobs/{id}"))?
             .into_json()
             .context("reading job status")?;
 
@@ -124,7 +224,7 @@ fn run_inner(
         let current_preview = status["preview_step"].as_u64().map(|s| s as usize);
         if current_preview != preview_step {
             if let Some(step) = current_preview
-                && let Ok(bytes) = fetch_bytes(&format!("{base}/jobs/{id}/preview"))
+                && let Ok(bytes) = client.fetch_bytes(&format!("/jobs/{id}/preview"))
                 && let Ok(image) = decode_png(&bytes)
             {
                 on_event(Event::Preview {
@@ -138,13 +238,15 @@ fn run_inner(
 
         match status["status"].as_str() {
             Some("succeeded") => {
-                let bytes = fetch_bytes(&format!("{base}/jobs/{id}/image"))?;
+                let bytes = client.fetch_bytes(&format!("/jobs/{id}/image"))?;
                 return decode_png(&bytes);
             }
             Some("failed") => {
                 anyhow::bail!(
                     "{}",
-                    status["error"].as_str().unwrap_or("remote generation failed")
+                    status["error"]
+                        .as_str()
+                        .unwrap_or("remote generation failed")
                 );
             }
             Some("cancelled") => return Err(crate::Cancelled.into()),
@@ -186,20 +288,6 @@ fn encode_png(image: &RgbaImage) -> Result<Vec<u8>> {
     Ok(cursor.into_inner())
 }
 
-fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
-    let response = ureq::get(url)
-        .call()
-        .with_context(|| format!("GET {url}"))?;
-    ensure!(
-        response.status() / 100 == 2,
-        "GET {url} returned HTTP {}",
-        response.status()
-    );
-    let mut bytes = Vec::new();
-    response.into_reader().read_to_end(&mut bytes)?;
-    Ok(bytes)
-}
-
 fn decode_png(bytes: &[u8]) -> Result<Arc<RgbaImage>> {
     let image = image::load_from_memory(bytes)
         .context("decoding server image")?
@@ -218,5 +306,204 @@ fn map_stage(stage: &str, reference_index: Option<u64>) -> Option<Stage> {
         "denoiser_loading" => Some(Stage::DenoiserLoading),
         "decoding" => Some(Stage::Decoding),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{io::Write, net::TcpListener, thread};
+
+    struct Reply {
+        method: &'static str,
+        path: &'static str,
+        token: Option<&'static str>,
+        status: u16,
+        body: Vec<u8>,
+    }
+
+    /// A small real HTTP fixture: verifies headers on each request, without a
+    /// GPU, model files, or calls to an external service.
+    fn server(replies: Vec<Reply>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let worker = thread::spawn(move || {
+            for reply in replies {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "client did not send the expected request"
+                            );
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let header_end = loop {
+                    let mut buffer = [0u8; 4096];
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+                assert_eq!(
+                    headers.lines().next().unwrap(),
+                    format!("{} {} HTTP/1.1", reply.method, reply.path)
+                );
+                let authorization = headers.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("authorization")
+                        .then(|| value.trim().to_owned())
+                });
+                assert_eq!(
+                    authorization,
+                    reply.token.map(|token| format!("Bearer {token}"))
+                );
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                while bytes.len() < header_end + length {
+                    let mut buffer = [0u8; 4096];
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 {} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply.status,
+                    reply.body.len()
+                )
+                .unwrap();
+                stream.write_all(&reply.body).unwrap();
+            }
+        });
+        (url, worker)
+    }
+
+    #[test]
+    fn authenticated_generation_covers_submission_status_preview_and_image() {
+        let png = encode_png(&RgbaImage::new(2, 2)).unwrap();
+        let replies = vec![
+            Reply {
+                method: "POST",
+                path: "/jobs",
+                token: Some("test-secret"),
+                status: 202,
+                body: br#"{"id":"1","width":2,"height":2}"#.to_vec(),
+            },
+            Reply {
+                method: "GET",
+                path: "/jobs/1",
+                token: Some("test-secret"),
+                status: 200,
+                body: br#"{"status":"succeeded","completed_steps":1,"preview_step":1}"#.to_vec(),
+            },
+            Reply {
+                method: "GET",
+                path: "/jobs/1/preview",
+                token: Some("test-secret"),
+                status: 200,
+                body: png.clone(),
+            },
+            Reply {
+                method: "GET",
+                path: "/jobs/1/image",
+                token: Some("test-secret"),
+                status: 200,
+                body: png,
+            },
+        ];
+        let (url, worker) = server(replies);
+        let mut request = Request::new("test");
+        request.steps = 1;
+        let mut saw_preview = false;
+        let result = run_authenticated(
+            &request,
+            &url,
+            Some("test-secret"),
+            &CancellationToken::default(),
+            |event| {
+                if matches!(event, Event::Preview { .. }) {
+                    saw_preview = true;
+                }
+            },
+        )
+        .unwrap();
+        worker.join().unwrap();
+        assert_eq!(result.image.dimensions(), (2, 2));
+        assert!(saw_preview);
+    }
+
+    #[test]
+    fn connection_check_uses_optional_authentication_without_submitting_jobs() {
+        for token in [None, Some("test-secret")] {
+            let (url, worker) = server(vec![Reply {
+                method: "GET",
+                path: "/health",
+                token,
+                status: 200,
+                body: br#"{"status":"ok","model":"test-model"}"#.to_vec(),
+            }]);
+            assert_eq!(test_connection(&url, token).unwrap(), "test-model");
+            worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn rejected_credentials_give_actionable_errors_without_exposing_tokens() {
+        for (token, code) in [
+            (None, 401),
+            (Some("wrong-secret"), 401),
+            (Some("wrong-secret"), 403),
+        ] {
+            let (url, worker) = server(vec![Reply {
+                method: "GET",
+                path: "/health",
+                token,
+                status: code,
+                body: b"do not reflect this response".to_vec(),
+            }]);
+            let error = test_connection(&url, token).unwrap_err().to_string();
+            worker.join().unwrap();
+            assert!(error.contains("Settings → Compute"));
+            assert!(!error.contains("wrong-secret"));
+            assert!(!error.contains("do not reflect"));
+        }
+    }
+
+    #[test]
+    fn tokens_with_header_control_characters_are_rejected() {
+        assert!(Client::new("http://localhost:6996", Some("token\r\nInjected: value")).is_err());
+        assert!(Client::new("http://localhost:6996", Some("Bearer token")).is_err());
+        let client = Client::new("http://localhost:6996", Some("  test-secret  ")).unwrap();
+        assert_eq!(
+            client.request("GET", "/health").header("Authorization"),
+            Some("Bearer test-secret")
+        );
+        let client = Client::new("http://localhost:6996", Some("  ")).unwrap();
+        assert!(
+            client
+                .request("GET", "/health")
+                .header("Authorization")
+                .is_none()
+        );
     }
 }

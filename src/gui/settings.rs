@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
+use crate::credentials::HostCredentials;
 
 use anyhow::Context as _;
 use gpui::{
@@ -165,6 +166,7 @@ pub enum SettingsEvent {
 
 pub struct SettingsPanel {
     server_input: Entity<InputState>,
+    credentials: HashMap<String, Entity<HostCredentials>>,
     models: Entity<Models>,
     models_page: bool,
     _models_subscription: Subscription,
@@ -178,7 +180,11 @@ impl SettingsPanel {
             InputState::new(window, cx).placeholder("host or host:port")
         });
         let subscription = cx.observe(&models, |_, _, cx| cx.notify());
-        Self { server_input, models, models_page, _models_subscription: subscription }
+        let credentials = cx.global::<Settings>().servers.clone().into_iter().map(|address| {
+            let editor = cx.new(|cx| HostCredentials::new(address.clone(), window, cx));
+            (address, editor)
+        }).collect();
+        Self { server_input, credentials, models, models_page, _models_subscription: subscription }
     }
 }
 
@@ -205,6 +211,7 @@ fn rounded_size(value: f64) -> u32 {
 fn servers_field(
     panel: &WeakEntity<SettingsPanel>,
     input: &Entity<InputState>,
+    credentials: &HashMap<String, Entity<HostCredentials>>,
     cx: &mut App,
 ) -> gpui::AnyElement {
     let servers = cx.global::<Settings>().servers.clone();
@@ -218,8 +225,14 @@ fn servers_field(
             }
             commit(&panel, cx, |s| {
                 if !s.servers.iter().any(|existing| existing == &address) {
-                    s.servers.push(address);
+                    s.servers.push(address.clone());
                 }
+            });
+            let _ = panel.update(cx, |panel, cx| {
+                panel.credentials.entry(address.clone()).or_insert_with(|| {
+                    cx.new(|cx| HostCredentials::new(address, window, cx))
+                });
+                cx.notify();
             });
             input.update(cx, |input, cx| input.set_value("", window, cx));
         }
@@ -263,27 +276,12 @@ fn servers_field(
                     )
                 })
                 .children(servers.iter().enumerate().map(|(index, server)| {
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
+                    div().flex().flex_col().gap_2().px_3().py_3()
                         .when(index > 0, |row| row.border_t_1().border_color(rgb(0x303640)))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_sm()
-                                .child(server.clone()),
-                        )
-                        .child(
-                            Button::new(("remove-server", index))
-                                .xsmall()
-                                .ghost()
-                                .icon(Icon::default().path("icons/trash.svg"))
-                                .tooltip("Remove host")
+                        .child(div().flex().items_center().gap_2()
+                            .child(div().flex_1().min_w_0().truncate().text_sm().child(server.clone()))
+                            .child(Button::new(("remove-server", index)).xsmall().ghost()
+                                .icon(Icon::default().path("icons/trash.svg")).tooltip("Remove host")
                                 .on_click({
                                     let panel = panel.clone();
                                     let server = server.clone();
@@ -294,9 +292,10 @@ fn servers_field(
                                                 s.backend = Backend::Local;
                                             }
                                         });
+                                        let _ = panel.update(cx, |panel, _| { panel.credentials.remove(&server); });
                                     }
-                                }),
-                        )
+                                })))
+                        .when_some(credentials.get(server), |row, editor| row.child(editor.clone()))
                 })),
         )
         .into_any_element()
@@ -513,13 +512,14 @@ impl Render for SettingsPanel {
                                     .group(
                                         SettingGroup::new()
                                             .title("Compute hosts")
-                                            .description("Remote ImageForger servers, as host or host:port.")
+                                            .description("Add a host or HTTP(S) URL. Paste its IMAGEFORGER_API_TOKEN below, then Save & test. Tokens are stored in macOS Keychain.")
                                             .item(
                                                 SettingItem::render({
                                                     let panel = panel.clone();
                                                     let input = self.server_input.clone();
+                                                    let credentials = self.credentials.clone();
                                                     move |_, _window, cx| {
-                                                        servers_field(&panel, &input, cx)
+                                                        servers_field(&panel, &input, &credentials, cx)
                                                     }
                                                 }),
                                             )

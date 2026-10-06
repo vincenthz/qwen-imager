@@ -429,8 +429,36 @@ impl ImageWindow {
         if self.busy || self.loading_image || self.mode == Mode::Workflow {
             return;
         }
+        let backend = cx.global::<Backend>().clone();
+        if let Backend::Remote { address } = &backend {
+            self.busy = true;
+            self.cancellation = CancellationToken::default();
+            self.status = "Reading remote credentials…".into();
+            let read = crate::credentials::read_token(address, cx);
+            cx.spawn_in(window, async move |view, cx| {
+                let token = read.await;
+                let _ = view.update_in(cx, |view, window, cx| {
+                    view.busy = false;
+                    if view.cancellation.is_cancelled() {
+                        view.status = "Cancelled before connecting.".into();
+                    } else {
+                        match token {
+                            Ok(token) => view.start_generation(backend, token, window, cx),
+                            Err(_) => view.status = "Could not read the API token from Keychain. Open Settings → Compute to save it again.".into(),
+                        }
+                    }
+                    cx.notify();
+                });
+            }).detach();
+            cx.notify();
+        } else {
+            self.start_generation(backend, None, window, cx);
+        }
+    }
+
+    fn start_generation(&mut self, backend: Backend, token: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(message) = self.models.read(cx).generation_blocker(
-            cx.global::<Backend>(), cx.global::<Settings>().model,
+            &backend, cx.global::<Settings>().model,
         ) {
             self.status = message;
             cx.notify();
@@ -520,7 +548,6 @@ impl ImageWindow {
         let cancellation = self.cancellation.clone();
         let sender = self.listen(window, cx);
         let generator = self.generator.clone();
-        let backend = cx.global::<Backend>().clone();
         let references: Vec<_> = self
             .references
             .iter()
@@ -570,7 +597,7 @@ impl ImageWindow {
                     Backend::Remote { address } => {
                         let cancel = cancellation.clone();
                         let sender = sender.clone();
-                        image_forger::remote::run(&request, &server_url(address), &cancellation, move |event| {
+                        image_forger::remote::run_authenticated(&request, &server_url(address), token.as_deref(), &cancellation, move |event| {
                             if sender.send_blocking(Message::Inference(event)).is_err() {
                                 cancel.cancel();
                             }

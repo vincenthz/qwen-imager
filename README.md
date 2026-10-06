@@ -44,6 +44,18 @@ the **Local / Remote** menu in the title bar. No local model is required for rem
 generation. The selected backend is remembered between launches. Bare host names
 use `http://host:6996`; `host:port` and full HTTP(S) URLs are also supported.
 
+Under each host in **Settings → Compute**, enter the server's
+`IMAGEFORGER_API_TOKEN` in the masked **API token** field (the token alone, without
+`Bearer`), then click **Save & test**. This stores the token in macOS Keychain and
+checks the server's authenticated `/health` endpoint without starting a generation.
+A successful check shows the server's model. The GUI sends the token with job
+submission, status polling, preview downloads, and final-image downloads. Tokens
+are stored separately for each server URL and never written to `settings.json`.
+Use **Clear token** to delete a saved credential; removing a host from the list
+keeps its Keychain entry so re-adding that endpoint restores it. Leave the token
+blank only for a service that does not require authentication. Authentication
+errors point back to **Settings → Compute** to update the credential.
+
 To generate on this Mac, open **Settings → Models** and click **Download** for the
 desired checkpoint (about 32 GB for BF16, 18 GB for MLX 8-bit, 11 GB for MLX 4-bit).
 Downloads are optional and only start when requested. They continue while Settings
