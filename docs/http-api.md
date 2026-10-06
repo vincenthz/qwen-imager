@@ -31,6 +31,37 @@ host from the list retains its credential for re-adding the same endpoint.
 HTTP redirects are not followed by the GUI client; configure the final service
 URL, including its HTTPS scheme or reverse-proxy path, directly in Settings.
 
+## Service diagnostics
+
+The service writes JSON log lines to stderr for startup, completed HTTP requests,
+job queueing/start/completion/cancellation, and shutdown. Each completed request
+includes its method, path (without query parameters), peer address, HTTP status,
+elapsed milliseconds, and any available rejection reason. Responses include an
+`X-Request-ID` header matching the request ID in the logs, including authentication
+failures. Job lifecycle records include the job ID; submission request logs include
+the new job's `Location` header.
+
+Enable additional request-start and generation-stage/step logs with
+`--http-debug` (also available as `--debug`):
+
+```sh
+./target/release/image-forger-cli --serve --offline --http-debug 2>imageforger-http.log
+```
+
+The same flag works with a remote listen address and token authentication. Logs
+indicate whether authentication is required/present without recording the
+Authorization header. Request bodies, prompts, and image contents are not logged.
+HTTP diagnostics redact the configured token and URL user-info/query credentials.
+Errors starting the service include context such as the address being bound.
+
+GUI failures appear in persistent root notifications. Click **Details** for the
+operation, timestamp, HTTP method/target/status and request ID when available,
+and underlying causes (for example, connection refused, DNS/TLS failure, a server
+validation error, or a Keychain error). **Copy details** copies this report for
+troubleshooting. The same GUI error report is written to stderr as
+`gui.operation_failed`. Notifications remain available when changing workspaces
+or closing Settings; cancelling an operation does not trigger an error alert.
+
 ## Submit and retrieve an image
 
 ```sh

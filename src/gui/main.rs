@@ -3,6 +3,7 @@ use gpui_component::{Root, Theme, ThemeMode, TitleBar};
 use std::borrow::Cow;
 
 mod credentials;
+mod errors;
 mod models;
 mod settings;
 mod timing;
@@ -62,6 +63,7 @@ fn main() {
         .with_assets(Assets)
         .run(|cx: &mut App| {
             gpui_component::init(cx);
+            cx.set_global(errors::ErrorReports::default());
             let settings = settings::Settings::load();
             cx.set_global(settings.backend.clone());
             cx.set_global(settings);

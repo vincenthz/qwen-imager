@@ -444,7 +444,10 @@ impl ImageWindow {
                     } else {
                         match token {
                             Ok(token) => view.start_generation(backend, token, window, cx),
-                            Err(_) => view.status = "Could not read the API token from Keychain. Open Settings → Compute to save it again.".into(),
+                            Err(error) => {
+                                crate::errors::report("Reading credentials before remote generation", &error, cx);
+                                view.status = format!("Could not read remote credentials: {error:#}");
+                            },
                         }
                     }
                     cx.notify();
@@ -460,6 +463,7 @@ impl ImageWindow {
         if let Some(message) = self.models.read(cx).generation_blocker(
             &backend, cx.global::<Settings>().model,
         ) {
+            crate::errors::report("Starting generation", &anyhow::anyhow!(message.clone()), cx);
             self.status = message;
             cx.notify();
             return;
@@ -469,6 +473,7 @@ impl ImageWindow {
         let size = match parse_size(&self.size.read(cx).value()) {
             Ok(size) => size,
             Err(error) => {
+                crate::errors::report("Validating generation settings", &anyhow::anyhow!(error), cx);
                 self.status = error.into();
                 cx.notify();
                 return;
@@ -480,6 +485,7 @@ impl ImageWindow {
         request.steps = match parse_steps(&self.steps.read(cx).value()) {
             Ok(steps) => steps,
             Err(error) => {
+                crate::errors::report("Validating generation settings", &anyhow::anyhow!(error), cx);
                 self.status = error.into();
                 cx.notify();
                 return;
@@ -488,6 +494,7 @@ impl ImageWindow {
         if !self.automatic_seed {
             let Ok(seed) = self.seed.read(cx).value().parse::<u64>() else {
                 self.status = "Enter a seed from 0 to 18446744073709551615.".into();
+                crate::errors::report("Validating generation seed", &anyhow::anyhow!(self.status.clone()), cx);
                 cx.notify();
                 return;
             };
@@ -506,6 +513,7 @@ impl ImageWindow {
             AttentionPrecision::Float32
         };
         if let Err(error) = request.dimensions() {
+            crate::errors::report("Validating generation dimensions", &error, cx);
             self.status = error.to_string();
             cx.notify();
             return;
@@ -675,7 +683,10 @@ impl ImageWindow {
                         view.progress = 0.;
                     }
                     Ok(None) => {} // Cancelling the picker preserves existing references.
-                    Err(error) => view.status = format!("Could not load image: {error:#}"),
+                    Err(error) => {
+                        crate::errors::report("Loading reference images", &error, cx);
+                        view.status = format!("Could not load image: {error:#}");
+                    },
                 }
                 cx.notify();
             });
@@ -1106,7 +1117,10 @@ impl ImageWindow {
                         self.progress = 1.;
                         self.status = format!("Complete — {}", format_duration(generated.elapsed));
                     }
-                    Err(error) => self.status = error_status(error),
+                    Err(error) => {
+                        if !error.is::<Cancelled>() { crate::errors::report("Generating image", &error, cx); }
+                        self.status = error_status(error);
+                    },
                 }
             }
         }
@@ -1211,7 +1225,7 @@ impl ImageWindow {
                 );
                 cx.background_executor()
                     .spawn(async move {
-                        image.save_with_format(&path, image::ImageFormat::Png)?;
+                        image.save_with_format(&path, image::ImageFormat::Png).with_context(|| format!("writing PNG to {}", path.display()))?;
                         Ok::<_, anyhow::Error>(Some(format!("Saved {}", path.display())))
                     })
                     .await
@@ -1220,7 +1234,10 @@ impl ImageWindow {
             let _ = view.update(cx, |view, cx| {
                 match result {
                     Ok(Some(status)) => view.status = status,
-                    Err(error) => view.status = format!("Could not save: {error:#}"),
+                    Err(error) => {
+                        crate::errors::report("Saving generated image", &error, cx);
+                        view.status = format!("Could not save: {error:#}");
+                    },
                     Ok(None) => return,
                 }
                 cx.notify();

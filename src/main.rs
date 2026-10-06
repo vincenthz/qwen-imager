@@ -20,6 +20,14 @@ struct Args {
     /// Run a persistent HTTP generation service
     #[arg(long, conflicts_with_all = ["output", "images", "ratio", "scale", "steps", "seed", "noise_source_size", "attention", "metrics", "preview_dir", "preview_every"])]
     serve: bool,
+    /// Log HTTP request starts and generation stage/step progress to stderr
+    #[arg(
+        long,
+        visible_alias = "debug",
+        requires = "serve",
+        conflicts_with = "prompt"
+    )]
+    http_debug: bool,
     /// HTTP listen address; remote access requires IMAGEFORGER_API_TOKEN
     #[arg(
         long,
@@ -112,7 +120,8 @@ fn main() -> anyhow::Result<()> {
                 offline: args.offline,
                 checkpoint,
             },
-        );
+            args.http_debug,
+        ).inspect_err(|error| image_forger::diagnostics::log("ERROR", "http.service_failed", serde_json::json!({"operation": "starting or running the HTTP service", "error": image_forger::diagnostics::redact(&format!("{error:#}"), &[])})));
     }
     ensure!(
         args.output
@@ -125,8 +134,7 @@ fn main() -> anyhow::Result<()> {
         .images
         .iter()
         .map(|p| {
-            image_forger::image_input::open(p)
-                .with_context(|| format!("opening {}", p.display()))
+            image_forger::image_input::open(p).with_context(|| format!("opening {}", p.display()))
         })
         .collect::<anyhow::Result<_>>()?;
     request.ratio = args.ratio;
@@ -253,6 +261,17 @@ mod tests {
         let server = Args::try_parse_from(["cli", "--serve", "--offline"]).unwrap();
         assert!(server.serve);
         assert!(server.prompt.is_none());
+        assert!(
+            Args::try_parse_from(["cli", "--serve", "--http-debug"])
+                .unwrap()
+                .http_debug
+        );
+        assert!(
+            Args::try_parse_from(["cli", "--serve", "--debug"])
+                .unwrap()
+                .http_debug
+        );
+        assert!(Args::try_parse_from(["cli", "a teapot", "--http-debug"]).is_err());
         assert!(Args::try_parse_from(["cli"]).is_err());
         assert!(Args::try_parse_from(["cli", "--serve", "--steps", "8"]).is_err());
         assert!(Args::try_parse_from(["cli", "a teapot", "--listen", "127.0.0.1:9000"]).is_err());

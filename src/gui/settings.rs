@@ -49,7 +49,10 @@ pub fn server_url(address: &str) -> String {
 pub fn select_backend(backend: Backend, cx: &mut App) {
     let mut settings = cx.global::<Settings>().clone();
     settings.backend = backend.clone();
-    let _ = settings.save();
+    if let Err(error) = settings.save() {
+        crate::errors::report("Saving compute backend settings", &error, cx);
+        return;
+    }
     cx.set_global(settings);
     cx.set_global(backend);
 }
@@ -198,7 +201,10 @@ fn commit(
     let previous = cx.global::<Settings>().clone();
     let mut next = previous.clone();
     mutate(&mut next);
-    let _ = next.save();
+    if let Err(error) = next.save() {
+        crate::errors::report("Saving application settings", &error, cx);
+        return;
+    }
     cx.set_global(next.backend.clone());
     cx.set_global(next);
     let _ = panel.update(cx, |_, cx| cx.emit(SettingsEvent::Saved(previous)));
@@ -228,6 +234,7 @@ fn servers_field(
                     s.servers.push(address.clone());
                 }
             });
+            if !cx.global::<Settings>().servers.contains(&address) { return; }
             let _ = panel.update(cx, |panel, cx| {
                 panel.credentials.entry(address.clone()).or_insert_with(|| {
                     cx.new(|cx| HostCredentials::new(address, window, cx))
@@ -292,7 +299,9 @@ fn servers_field(
                                                 s.backend = Backend::Local;
                                             }
                                         });
-                                        let _ = panel.update(cx, |panel, _| { panel.credentials.remove(&server); });
+                                        if !cx.global::<Settings>().servers.contains(&server) {
+                                            let _ = panel.update(cx, |panel, _| { panel.credentials.remove(&server); });
+                                        }
                                     }
                                 })))
                         .when_some(credentials.get(server), |row, editor| row.child(editor.clone()))

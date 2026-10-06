@@ -222,7 +222,16 @@ impl Models {
                                     *progress = Some(value);
                                 }
                             }
-                            Message::Complete(state) => entry.state = state,
+                            Message::Complete(state) => {
+                                if let ModelState::Failed(error) = &state {
+                                    crate::errors::report(
+                                        format!("Downloading {}", model_label(entry.checkpoint)),
+                                        &anyhow::anyhow!(error.clone()),
+                                        cx,
+                                    );
+                                }
+                                entry.state = state;
+                            }
                         }
                         cx.notify();
                     })

@@ -56,6 +56,14 @@ keeps its Keychain entry so re-adding that endpoint restores it. Leave the token
 blank only for a service that does not require authentication. Authentication
 errors point back to **Settings → Compute** to update the credential.
 
+Failures also appear as persistent notifications managed by the window root.
+Click **Details** to inspect the failed operation and its underlying causes, then
+**Copy details** to copy the diagnostic report. Remote errors include the HTTP
+method, target, status, and server request ID when available. Reports are also
+written to stderr. The HTTP service logs requests and job lifecycle events;
+use `--serve --http-debug` for additional request-start and generation-progress
+logs. See [Service diagnostics](docs/http-api.md#service-diagnostics).
+
 To generate on this Mac, open **Settings → Models** and click **Download** for the
 desired checkpoint (about 32 GB for BF16, 18 GB for MLX 8-bit, 11 GB for MLX 4-bit).
 Downloads are optional and only start when requested. They continue while Settings

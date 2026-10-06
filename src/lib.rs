@@ -7,6 +7,7 @@
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 compile_error!("img-gen requires an Apple Silicon Mac with Metal.");
 
+pub mod diagnostics;
 mod dit;
 pub mod image_input;
 mod noise;

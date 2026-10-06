@@ -1,14 +1,16 @@
 //! HTTP transport for the existing blocking generator. GPU work stays on one
 //! persistent thread; HTTP handlers only touch small job metadata/CPU images.
+use anyhow::Context as _;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, FromRequest, Multipart, Path, State},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Multipart, Path, State},
     http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use image_forger::diagnostics::{log, redact};
 use image_forger::{
     CancellationToken, Checkpoint, Event, Generator, ModelOptions, PreviewControl, Request,
     RgbaImage, Stage,
@@ -19,7 +21,10 @@ use std::{
     io::Cursor,
     net::SocketAddr,
     num::NonZeroUsize,
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
@@ -53,9 +58,14 @@ struct ReferenceInfo {
 type ApiResult<T> = Result<T, ApiError>;
 #[derive(Debug)]
 struct ApiError(StatusCode, String);
+#[derive(Clone)]
+struct ErrorDetail(String);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(serde_json::json!({"error": self.1}))).into_response()
+        let detail = ErrorDetail(self.1.clone());
+        let mut response = (self.0, Json(serde_json::json!({"error": self.1}))).into_response();
+        response.extensions_mut().insert(detail);
+        response
     }
 }
 fn conflict(message: &str) -> ApiError {
@@ -307,16 +317,19 @@ struct Service {
     reference_memory: Arc<Semaphore>,
     uploads: Arc<Semaphore>,
     checkpoint: Checkpoint,
+    http_debug: bool,
+    next_request: AtomicU64,
 }
 impl Service {
     #[cfg(test)]
     fn new(max_jobs: usize, authorization: Option<HeaderValue>) -> Arc<Self> {
-        Self::with_checkpoint(max_jobs, authorization, Checkpoint::default())
+        Self::with_checkpoint(max_jobs, authorization, Checkpoint::default(), false)
     }
     fn with_checkpoint(
         max_jobs: usize,
         authorization: Option<HeaderValue>,
         checkpoint: Checkpoint,
+        http_debug: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             store: Mutex::new(Store {
@@ -333,6 +346,8 @@ impl Service {
             )),
             uploads: Arc::new(Semaphore::new(2)),
             checkpoint,
+            http_debug,
+            next_request: AtomicU64::new(1),
         })
     }
     fn job(&self, id: u64) -> ApiResult<SharedJob> {
@@ -414,6 +429,11 @@ impl Service {
                 _reference_memory: reference_memory,
             },
         ));
+        log(
+            "INFO",
+            "job.queued",
+            serde_json::json!({"job_id": id, "width": width, "height": height, "queue_depth": store.queue.len()}),
+        );
         self.wake.notify_one();
         Ok(view)
     }
@@ -454,6 +474,11 @@ impl Service {
             }
         }
         let view = job.view();
+        log(
+            "INFO",
+            "job.cancel_requested",
+            serde_json::json!({"job_id": id, "status": job.status}),
+        );
         drop(job);
         store.queue.retain(|(queued, _)| *queued != id);
         Ok(view)
@@ -481,9 +506,25 @@ impl Service {
 fn worker(service: Arc<Service>, options: ModelOptions) {
     let mut generator = Generator::new(options.clone());
     while let Some((job, request)) = service.next() {
-        let cancel = job.lock().unwrap().cancel.clone();
+        let (id, cancel) = {
+            let job = job.lock().unwrap();
+            (job.id, job.cancel.clone())
+        };
+        log(
+            "INFO",
+            "job.started",
+            serde_json::json!({"job_id": id, "model": options.checkpoint.name()}),
+        );
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            generator.generate(&request, &cancel, |event| job.lock().unwrap().event(event))
+            generator.generate(&request, &cancel, |event| {
+                let mut job = job.lock().unwrap();
+                let previous_stage = job.stage;
+                let step_finished = matches!(event, Event::StepFinished { .. });
+                job.event(event);
+                if service.http_debug && (job.stage != previous_stage || step_finished) {
+                    log("DEBUG", "job.progress", serde_json::json!({"job_id": id, "stage": job.stage, "completed": job.stage_completed, "total": job.stage_total}));
+                }
+            })
         }));
         let result = match result {
             Ok(result) => result,
@@ -494,7 +535,29 @@ fn worker(service: Arc<Service>, options: ModelOptions) {
                 ))
             }
         };
-        job.lock().unwrap().finish(result);
+        let mut job = job.lock().unwrap();
+        let last_stage = job.stage;
+        job.finish(result);
+        let secret = service
+            .authorization
+            .as_ref()
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        if let Some(error) = &mut job.error {
+            *error = redact(
+                error,
+                &[secret, secret.strip_prefix("Bearer ").unwrap_or("")],
+            );
+        }
+        log(
+            if job.status == Status::Failed {
+                "ERROR"
+            } else {
+                "INFO"
+            },
+            "job.finished",
+            serde_json::json!({"job_id": id, "status": job.status, "last_stage": last_stage, "completed_steps": job.completed_steps, "elapsed_s": job.elapsed_s, "error": job.error}),
+        );
     }
 }
 
@@ -503,21 +566,87 @@ async fn guard(
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if let Some(expected) = &service.authorization
+    let request_id = service
+        .next_request
+        .fetch_add(1, Ordering::Relaxed)
+        .to_string();
+    let started = Instant::now();
+    let method = request.method().to_string();
+    let secret = service
+        .authorization
+        .as_ref()
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let path = redact(
+        request.uri().path(),
+        &[secret, secret.strip_prefix("Bearer ").unwrap_or("")],
+    );
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.to_string());
+    let auth_present = request.headers().contains_key(header::AUTHORIZATION);
+    if service.http_debug {
+        log(
+            "DEBUG",
+            "http.request_started",
+            serde_json::json!({"request_id": request_id, "method": method, "path": path, "peer": peer, "auth_present": auth_present}),
+        );
+    }
+    let mut response = if let Some(expected) = &service.authorization
         && request.headers().get(header::AUTHORIZATION) != Some(expected)
     {
-        return ApiError(
+        ApiError(
             StatusCode::UNAUTHORIZED,
             "a valid Bearer token is required".into(),
         )
-        .into_response();
-    }
-    let mut response = next.run(request).await;
+        .into_response()
+    } else {
+        next.run(request).await
+    };
+    let secret = service
+        .authorization
+        .as_ref()
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let reason = response
+        .extensions()
+        .get::<ErrorDetail>()
+        .map(|detail| {
+            redact(
+                &detail.0,
+                &[secret, secret.strip_prefix("Bearer ").unwrap_or("")],
+            )
+        })
+        .or_else(|| {
+            response.status().is_client_error().then(|| {
+                response
+                    .status()
+                    .canonical_reason()
+                    .unwrap_or("Request rejected")
+                    .into()
+            })
+        });
+    log(
+        if response.status().is_server_error() {
+            "ERROR"
+        } else if response.status().is_client_error() {
+            "WARN"
+        } else {
+            "INFO"
+        },
+        "http.request_finished",
+        serde_json::json!({"request_id": request_id, "method": method, "path": path, "peer": peer, "status": response.status().as_u16(), "elapsed_ms": started.elapsed().as_millis(), "error": reason, "location": response.headers().get(header::LOCATION).and_then(|v| v.to_str().ok())}),
+    );
+    response
+        .headers_mut()
+        .insert("x-request-id", HeaderValue::from_str(&request_id).unwrap());
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
+
 async fn health(State(service): State<Arc<Service>>) -> Json<serde_json::Value> {
     let store = service.store.lock().unwrap();
     Json(
@@ -547,7 +676,8 @@ fn decode_references(
         limits.max_image_width = Some(8192);
         limits.max_image_height = Some(8192);
         limits.max_alloc = Some(128 * 1024 * 1024);
-        let decoder = image_forger::image_input::ImageInput::new(&bytes, limits).map_err(invalid)?;
+        let decoder =
+            image_forger::image_input::ImageInput::new(&bytes, limits).map_err(invalid)?;
         let (width, height) = decoder.dimensions();
         let pixels = u64::from(width) * u64::from(height);
         total_pixels += pixels;
@@ -766,7 +896,12 @@ fn router(service: Arc<Service>) -> Router {
         .with_state(service)
 }
 
-pub fn run(address: SocketAddr, max_jobs: usize, options: ModelOptions) -> anyhow::Result<()> {
+pub fn run(
+    address: SocketAddr,
+    max_jobs: usize,
+    options: ModelOptions,
+    http_debug: bool,
+) -> anyhow::Result<()> {
     let token = std::env::var("IMAGEFORGER_API_TOKEN").ok();
     anyhow::ensure!(
         token.as_ref().is_none_or(|t| !t.trim().is_empty()),
@@ -778,26 +913,30 @@ pub fn run(address: SocketAddr, max_jobs: usize, options: ModelOptions) -> anyho
     );
     let authorization = token
         .map(|t| HeaderValue::from_str(&format!("Bearer {t}")))
-        .transpose()?;
+        .transpose()
+        .context("validating IMAGEFORGER_API_TOKEN as an HTTP header")?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
-        .build()?;
+        .build()
+        .context("creating HTTP service runtime")?;
     runtime.block_on(async {
-        let listener = tokio::net::TcpListener::bind(address).await?;
-        let service = Service::with_checkpoint(max_jobs, authorization, options.checkpoint);
+        let listener = tokio::net::TcpListener::bind(address).await.with_context(|| format!("binding HTTP listener to {address}"))?;
+        let service = Service::with_checkpoint(max_jobs, authorization, options.checkpoint, http_debug);
+        log("INFO", "http.listening", serde_json::json!({"address": listener.local_addr()?.to_string(), "model": options.checkpoint.name(), "offline": options.offline, "auth_required": service.authorization.is_some(), "max_jobs": max_jobs, "http_debug": http_debug}));
         let worker_service = service.clone();
-        let thread = std::thread::Builder::new().name("generation".into()).spawn(move || worker(worker_service, options))?;
-        eprintln!("ImageForger HTTP service listening on http://{} (one generation at a time, {max_jobs} retained jobs)", listener.local_addr()?);
+        let thread = std::thread::Builder::new().name("generation".into()).spawn(move || worker(worker_service, options)).context("starting generation worker")?;
         let shutdown_service = service.clone();
-        let result = axum::serve(listener, router(service.clone())).with_graceful_shutdown(async move {
-            if let Err(error) = tokio::signal::ctrl_c().await { eprintln!("shutdown signal error: {error}"); }
+        let result = axum::serve(listener, router(service.clone()).into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(async move {
+            if let Err(error) = tokio::signal::ctrl_c().await { log("ERROR", "http.shutdown_signal_failed", serde_json::json!({"error": error.to_string()})); }
+            log("INFO", "http.shutdown_requested", serde_json::json!({}));
             shutdown_service.shutdown();
         }).await;
         service.shutdown();
         tokio::task::spawn_blocking(move || thread.join()).await?
             .map_err(|_| anyhow::anyhow!("generation thread panicked"))?;
-        result?;
+        result.context("serving HTTP requests")?;
+        log("INFO", "http.stopped", serde_json::json!({}));
         Ok(())
     })
 }
@@ -927,6 +1066,60 @@ mod tests {
                 call(&app, "GET", "/jobs/2", "").await.1["status"],
                 "cancelled"
             );
+        });
+    }
+
+    #[test]
+    fn request_ids_and_error_details_cover_auth_validation_and_success() {
+        runtime().block_on(async {
+            let app = router(Service::new(
+                2,
+                Some(HeaderValue::from_static("Bearer test-secret")),
+            ));
+            let mut ids = std::collections::BTreeSet::new();
+            for (method, path, token, expected) in [
+                ("GET", "/health", "", StatusCode::UNAUTHORIZED),
+                ("GET", "/health", "Bearer test-secret", StatusCode::OK),
+                (
+                    "GET",
+                    "/missing",
+                    "Bearer test-secret",
+                    StatusCode::NOT_FOUND,
+                ),
+                (
+                    "POST",
+                    "/jobs",
+                    "Bearer test-secret",
+                    StatusCode::BAD_REQUEST,
+                ),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        HttpRequest::builder()
+                            .method(method)
+                            .uri(path)
+                            .header(header::AUTHORIZATION, token)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from("{}"))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected);
+                assert!(
+                    ids.insert(
+                        response.headers()["x-request-id"]
+                            .to_str()
+                            .unwrap()
+                            .to_owned()
+                    )
+                );
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+                if expected.is_client_error() {
+                    assert!(response.extensions().get::<ErrorDetail>().is_some());
+                }
+            }
         });
     }
 

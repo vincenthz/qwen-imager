@@ -52,6 +52,7 @@ pub struct Workspaces {
     downloads: Entity<Models>,
     _downloads_subscription: Subscription,
     _backend_subscription: Subscription,
+    _error_subscription: Subscription,
     settings: Option<(Entity<SettingsPanel>, Subscription)>,
 }
 
@@ -75,6 +76,7 @@ impl Workspaces {
             downloads,
             _downloads_subscription: subscription,
             _backend_subscription: cx.observe_global::<Backend>(|_, cx| cx.notify()),
+            _error_subscription: cx.observe_global_in::<crate::errors::ErrorReports>(window, |_, window, cx| crate::errors::present(window, cx)),
             model: shared_model(cx.global::<Settings>().model),
         };
         workspaces.add(window, cx);

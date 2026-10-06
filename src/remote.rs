@@ -13,6 +13,7 @@ use anyhow::{Context as _, Result, ensure};
 use image::RgbaImage;
 use std::sync::Arc;
 
+use crate::diagnostics::{endpoint, log, redact};
 use crate::{CancellationToken, Event, Generation, Request, Stage};
 
 const BOUNDARY: &str = "----image-forger-boundary";
@@ -59,19 +60,76 @@ impl Client {
         }
     }
 
-    fn response(&self, result: Result<ureq::Response, ureq::Error>) -> Result<ureq::Response> {
+    fn safe(&self, message: &str) -> String {
+        let authorization = self.authorization.as_deref().unwrap_or("");
+        let message = message.replace(&self.base, &endpoint(&self.base));
+        redact(
+            &message,
+            &[
+                authorization,
+                authorization.strip_prefix("Bearer ").unwrap_or(""),
+            ],
+        )
+    }
+
+    fn response(
+        &self,
+        method: &str,
+        path: &str,
+        result: Result<ureq::Response, ureq::Error>,
+    ) -> Result<ureq::Response> {
+        let operation = format!("{method} {}", endpoint(&format!("{}{path}", self.base)));
         match result {
-            Err(ureq::Error::Status(401 | 403, _)) => anyhow::bail!(
-                "Authentication rejected. Set this host's API token in Settings → Compute to match IMAGEFORGER_API_TOKEN on the server."
-            ),
-            Err(ureq::Error::Status(code, _)) => anyhow::bail!("Server returned HTTP {code}"),
-            Err(ureq::Error::Transport(_)) => anyhow::bail!(
-                "Could not reach the server. Check its address, network connection, and TLS configuration."
-            ),
+            Err(ureq::Error::Status(code, response)) => {
+                let request_id = response
+                    .header("x-request-id")
+                    .unwrap_or("unavailable")
+                    .to_owned();
+                let reason = if code == 401 || code == 403 {
+                    "Authentication rejected. Set this host's API token in Settings → Compute to match IMAGEFORGER_API_TOKEN on the server.".into()
+                } else {
+                    let mut body = String::new();
+                    let _ = response.into_reader().take(8192).read_to_string(&mut body);
+                    serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|body| body["error"].as_str().map(str::to_owned))
+                        .unwrap_or_else(|| {
+                            if body.trim().is_empty() {
+                                "The server returned no error description".into()
+                            } else {
+                                body
+                            }
+                        })
+                };
+                anyhow::bail!(
+                    "{}",
+                    self.safe(&format!(
+                        "{operation} failed: HTTP {code} (request ID {request_id})
+{reason}"
+                    ))
+                )
+            }
+            Err(ureq::Error::Transport(error)) => {
+                let mut causes = format!(
+                    "{operation} failed: {:?}: {}",
+                    error.kind(),
+                    error.message().unwrap_or("HTTP transport error")
+                );
+                let mut source = std::error::Error::source(&error);
+                while let Some(cause) = source {
+                    causes.push_str(&format!(
+                        "
+Caused by: {cause}"
+                    ));
+                    source = cause.source();
+                }
+                anyhow::bail!("{}", self.safe(&causes))
+            }
             Ok(response) => {
                 ensure!(
                     !(300..400).contains(&response.status()),
-                    "Server redirected the request. Configure the final server URL in Settings → Compute."
+                    "{operation}: HTTP {} redirect. Configure the final server URL in Settings → Compute.",
+                    response.status()
                 );
                 Ok(response)
             }
@@ -79,12 +137,20 @@ impl Client {
     }
 
     fn get(&self, path: &str) -> Result<ureq::Response> {
-        self.response(self.request("GET", path).call())
+        self.response("GET", path, self.request("GET", path).call())
     }
 
     fn fetch_bytes(&self, path: &str) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
-        self.get(path)?.into_reader().read_to_end(&mut bytes)?;
+        self.get(path)?
+            .into_reader()
+            .read_to_end(&mut bytes)
+            .with_context(|| {
+                format!(
+                    "reading image bytes from GET {}",
+                    endpoint(&format!("{}{path}", self.base))
+                )
+            })?;
         Ok(bytes)
     }
 }
@@ -96,14 +162,21 @@ pub fn test_connection(base_url: &str, token: Option<&str>) -> Result<String> {
     let health: serde_json::Value = client
         .get("/health")?
         .into_json()
-        .context("reading server health")?;
+        .with_context(|| format!("decoding GET {}/health response", endpoint(base_url)))?;
     ensure!(
         health["status"] == "ok",
-        "Server is not ready to accept jobs"
+        "GET {}/health: server is not ready to accept jobs (status: {})",
+        endpoint(base_url),
+        health["status"]
     );
     Ok(health["model"]
         .as_str()
-        .context("Response is not an ImageForger service")?
+        .with_context(|| {
+            format!(
+                "GET {}/health: response is missing the ImageForger model field",
+                endpoint(base_url)
+            )
+        })?
         .into())
 }
 
@@ -160,6 +233,8 @@ fn run_inner(
 
     let body = multipart(&parameters, &request.images)?;
     let response = client.response(
+        "POST",
+        "/jobs",
         client
             .request("POST", "/jobs")
             .set(
@@ -169,7 +244,9 @@ fn run_inner(
             .send_bytes(&body),
     )?;
 
-    let view: serde_json::Value = response.into_json().context("reading job response")?;
+    let view: serde_json::Value = response
+        .into_json()
+        .with_context(|| format!("decoding POST {}/jobs response", endpoint(&client.base)))?;
     let id = view["id"]
         .as_str()
         .context("job response is missing an id")?
@@ -192,7 +269,7 @@ fn run_inner(
         let status: serde_json::Value = client
             .get(&format!("/jobs/{id}"))?
             .into_json()
-            .context("reading job status")?;
+            .with_context(|| format!("decoding GET {}/jobs/{id} status", endpoint(&client.base)))?;
 
         if let (Some(stage), Some(completed), Some(total)) = (
             status["stage"].as_str(),
@@ -223,15 +300,22 @@ fn run_inner(
 
         let current_preview = status["preview_step"].as_u64().map(|s| s as usize);
         if current_preview != preview_step {
-            if let Some(step) = current_preview
-                && let Ok(bytes) = client.fetch_bytes(&format!("/jobs/{id}/preview"))
-                && let Ok(image) = decode_png(&bytes)
-            {
-                on_event(Event::Preview {
-                    step,
-                    total: request.steps,
-                    image,
-                });
+            if let Some(step) = current_preview {
+                match client
+                    .fetch_bytes(&format!("/jobs/{id}/preview"))
+                    .and_then(|bytes| decode_png(&bytes))
+                {
+                    Ok(image) => on_event(Event::Preview {
+                        step,
+                        total: request.steps,
+                        image,
+                    }),
+                    Err(error) => log(
+                        "WARN",
+                        "remote.preview_failed",
+                        serde_json::json!({"job_id": id, "step": step, "error": client.safe(&format!("{error:#}"))}),
+                    ),
+                }
             }
             preview_step = current_preview;
         }
@@ -239,7 +323,12 @@ fn run_inner(
         match status["status"].as_str() {
             Some("succeeded") => {
                 let bytes = client.fetch_bytes(&format!("/jobs/{id}/image"))?;
-                return decode_png(&bytes);
+                return decode_png(&bytes).with_context(|| {
+                    format!(
+                        "decoding final image for remote job {id} from {}",
+                        endpoint(&client.base)
+                    )
+                });
             }
             Some("failed") => {
                 anyhow::bail!(
@@ -387,7 +476,7 @@ mod tests {
                 }
                 write!(
                     stream,
-                    "HTTP/1.1 {} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {} Test\r\nContent-Length: {}\r\nX-Request-ID: fixture-42\r\nConnection: close\r\n\r\n",
                     reply.status,
                     reply.body.len()
                 )
@@ -487,6 +576,37 @@ mod tests {
             assert!(!error.contains("wrong-secret"));
             assert!(!error.contains("do not reflect"));
         }
+    }
+
+    #[test]
+    fn server_errors_include_operation_request_id_and_redacted_reason() {
+        let (url, worker) = server(vec![Reply {
+            method: "GET",
+            path: "/health",
+            token: Some("test-secret"),
+            status: 429,
+            body: br#"{"error":"job capacity reached; rejected test-secret"}"#.to_vec(),
+        }]);
+        let error = test_connection(&url, Some("test-secret"))
+            .unwrap_err()
+            .to_string();
+        worker.join().unwrap();
+        assert!(error.contains(&format!("GET {url}/health")));
+        assert!(error.contains("HTTP 429"));
+        assert!(error.contains("request ID fixture-42"));
+        assert!(error.contains("job capacity reached"));
+        assert!(!error.contains("test-secret"));
+        assert!(error.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn connection_failure_retains_the_transport_cause_and_target() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let error = test_connection(&url, None).unwrap_err().to_string();
+        assert!(error.contains(&format!("GET {url}/health")));
+        assert!(error.contains("Caused by:"), "{error}");
     }
 
     #[test]

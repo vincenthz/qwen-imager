@@ -75,7 +75,15 @@ impl HostCredentials {
                             input.set_value(token.unwrap_or_default(), window, cx)
                         });
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        crate::errors::report(
+                            format!(
+                                "Reading API credentials for {}",
+                                image_forger::diagnostics::endpoint(&server_url(&view.address))
+                            ),
+                            &error,
+                            cx,
+                        );
                         view.failed = true;
                         view.status = "Could not read Keychain. Try saving the token again.".into();
                     }
@@ -102,6 +110,11 @@ impl HostCredentials {
         if !token.bytes().all(|byte| byte.is_ascii_graphic()) {
             self.status = "Paste the token only, without Bearer, spaces, or line breaks.".into();
             self.failed = true;
+            crate::errors::report(
+                "Validating API token",
+                &anyhow::anyhow!(self.status.clone()),
+                cx,
+            );
             cx.notify();
             return;
         }
@@ -115,8 +128,16 @@ impl HostCredentials {
         };
         let url = server_url(&self.address);
         cx.spawn_in(window, async move |view, cx| {
-            if save.await.is_err() {
+            if let Err(error) = save.await {
                 let _ = view.update(cx, |view, cx| {
+                    crate::errors::report(
+                        format!(
+                            "Saving API credentials for {}",
+                            image_forger::diagnostics::endpoint(&server_url(&view.address))
+                        ),
+                        &error,
+                        cx,
+                    );
                     view.busy = false;
                     view.failed = true;
                     view.status =
@@ -138,7 +159,17 @@ impl HostCredentials {
                 view.failed = result.is_err();
                 view.status = match result {
                     Ok(model) => format!("Connected · {model}"),
-                    Err(error) => format!("Credentials saved. {error:#}"),
+                    Err(error) => {
+                        crate::errors::report(
+                            format!(
+                                "Testing connection to {}",
+                                image_forger::diagnostics::endpoint(&server_url(&view.address))
+                            ),
+                            &error,
+                            cx,
+                        );
+                        format!("Credentials saved. {error:#}")
+                    }
                 };
                 cx.notify();
             });
@@ -165,6 +196,14 @@ impl HostCredentials {
                         .update(cx, |input, cx| input.set_value("", window, cx));
                     view.status = "Token removed from Keychain".into();
                 } else {
+                    crate::errors::report(
+                        format!(
+                            "Removing API credentials for {}",
+                            image_forger::diagnostics::endpoint(&server_url(&view.address))
+                        ),
+                        result.as_ref().unwrap_err(),
+                        cx,
+                    );
                     view.status = "Could not remove the token from Keychain.".into();
                 }
                 cx.notify();
