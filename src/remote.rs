@@ -13,6 +13,7 @@ use anyhow::{Context as _, Result, ensure};
 use image::RgbaImage;
 use std::sync::Arc;
 
+use crate::content_crypto::{self, Identity, Session};
 use crate::diagnostics::{endpoint, log, redact};
 use crate::{CancellationToken, Event, Generation, Request, Stage};
 
@@ -24,6 +25,7 @@ struct Client {
     base: String,
     authorization: Option<String>,
     agent: ureq::Agent,
+    crypto: Option<Session>,
 }
 
 impl Client {
@@ -40,6 +42,7 @@ impl Client {
         );
         Ok(Self {
             base,
+            crypto: None,
             authorization: token.map(|token| format!("Bearer {token}")),
             // Do not forward credentials to a redirect destination.
             agent: ureq::AgentBuilder::new()
@@ -142,7 +145,12 @@ Caused by: {cause}"
 
     fn fetch_bytes(&self, path: &str) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
-        self.get(path)?
+        let response = self.get(path)?;
+        ensure!(
+            response.header("Content-Type") == Some(content_crypto::CONTENT_TYPE),
+            "Server returned unencrypted image content"
+        );
+        response
             .into_reader()
             .read_to_end(&mut bytes)
             .with_context(|| {
@@ -151,7 +159,10 @@ Caused by: {cause}"
                     endpoint(&format!("{}{path}", self.base))
                 )
             })?;
-        Ok(bytes)
+        self.crypto
+            .as_ref()
+            .context("Missing content encryption identity")?
+            .open_response(&format!("GET {path}"), &bytes)
     }
 }
 
@@ -180,16 +191,55 @@ pub fn test_connection(base_url: &str, token: Option<&str>) -> Result<String> {
         .into())
 }
 
+/// Verify possession of the pinned private key with an encrypted challenge.
+pub fn test_pinned_connection(
+    base_url: &str,
+    token: Option<&str>,
+    pinned_identity: &str,
+) -> Result<String> {
+    let client = Client::new(base_url, token)?;
+    let session = Identity::generate()?.session(content_crypto::public_key(pinned_identity)?)?;
+    let body = session.seal_request("POST /identity", b"identity")?;
+    let response = client.response(
+        "POST",
+        "/identity",
+        client
+            .request("POST", "/identity")
+            .set("Content-Type", content_crypto::CONTENT_TYPE)
+            .send_bytes(&body),
+    )?;
+    ensure!(
+        response.header("Content-Type") == Some(content_crypto::CONTENT_TYPE),
+        "Server did not verify its pinned identity"
+    );
+    let mut bytes = Vec::new();
+    response.into_reader().take(65536).read_to_end(&mut bytes)?;
+    let plaintext = session.open_response("POST /identity", &bytes)?;
+    let view: serde_json::Value = serde_json::from_slice(&plaintext)?;
+    Ok(view["model"]
+        .as_str()
+        .context("Identity response missing model")?
+        .into())
+}
+
 /// Run one generation against the remote server at `base_url` (e.g.
 /// `http://host:6996`). Emits [`Event::Started`], [`Event::Progress`],
 /// [`Event::StepFinished`] and [`Event::Preview`] as they arrive.
 pub fn run(
     request: &Request,
     base_url: &str,
+    pinned_identity: &str,
     cancellation: &CancellationToken,
     on_event: impl FnMut(Event),
 ) -> Result<Generation> {
-    run_authenticated(request, base_url, None, cancellation, on_event)
+    run_authenticated(
+        request,
+        base_url,
+        None,
+        pinned_identity,
+        cancellation,
+        on_event,
+    )
 }
 
 /// Like [`run`], using the host's optional Bearer token on every HTTP request.
@@ -197,10 +247,13 @@ pub fn run_authenticated(
     request: &Request,
     base_url: &str,
     token: Option<&str>,
+    pinned_identity: &str,
     cancellation: &CancellationToken,
     mut on_event: impl FnMut(Event),
 ) -> Result<Generation> {
-    let client = Client::new(base_url, token)?;
+    let mut client = Client::new(base_url, token)?;
+    client.crypto =
+        Some(Identity::generate()?.session(content_crypto::public_key(pinned_identity)?)?);
     let started = Instant::now();
     let image = run_inner(request, &client, cancellation, &mut on_event)?;
     let elapsed = started.elapsed();
@@ -217,7 +270,7 @@ fn run_inner(
     let (preview_mode, preview_every) = match request.preview_every {
         Some(every) => ("auto", every.get()),
         None if request.preview_control.is_some() => ("auto", 5),
-        None => ("off", 0),
+        None => ("off", 5),
     };
 
     let parameters = serde_json::json!({
@@ -232,15 +285,17 @@ fn run_inner(
     });
 
     let body = multipart(&parameters, &request.images)?;
+    let body = client
+        .crypto
+        .as_ref()
+        .context("Missing pinned server identity")?
+        .seal_request("POST /jobs", &body)?;
     let response = client.response(
         "POST",
         "/jobs",
         client
             .request("POST", "/jobs")
-            .set(
-                "Content-Type",
-                &format!("multipart/form-data; boundary={BOUNDARY}"),
-            )
+            .set("Content-Type", content_crypto::CONTENT_TYPE)
             .send_bytes(&body),
     )?;
 
@@ -414,11 +469,18 @@ mod tests {
     /// A small real HTTP fixture: verifies headers on each request, without a
     /// GPU, model files, or calls to an external service.
     fn server(replies: Vec<Reply>) -> (String, thread::JoinHandle<()>) {
+        server_with_identity(replies, None)
+    }
+    fn server_with_identity(
+        replies: Vec<Reply>,
+        identity: Option<Identity>,
+    ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
         let worker = thread::spawn(move || {
-            for reply in replies {
+            let mut crypto = None;
+            for mut reply in replies {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 let mut stream = loop {
                     match listener.accept() {
@@ -433,6 +495,7 @@ mod tests {
                         Err(error) => panic!("accept: {error}"),
                     }
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
@@ -474,9 +537,32 @@ mod tests {
                     assert!(n > 0);
                     bytes.extend_from_slice(&buffer[..n]);
                 }
+                if let Some(identity) = &identity {
+                    if reply.method == "POST" {
+                        let wire = &bytes[header_end..header_end + length];
+                        assert!(
+                            !wire
+                                .windows(b"private-test-prompt".len())
+                                .any(|w| w == b"private-test-prompt")
+                        );
+                        let (session, plain) = identity.open_request(wire, "POST /jobs").unwrap();
+                        assert!(
+                            plain
+                                .windows(b"private-test-prompt".len())
+                                .any(|w| w == b"private-test-prompt")
+                        );
+                        crypto = Some(session);
+                    } else if reply.path.ends_with("/image") || reply.path.ends_with("/preview") {
+                        reply.body = crypto
+                            .as_ref()
+                            .unwrap()
+                            .seal_response(&format!("GET {}", reply.path), &reply.body)
+                            .unwrap();
+                    }
+                }
                 write!(
                     stream,
-                    "HTTP/1.1 {} Test\r\nContent-Length: {}\r\nX-Request-ID: fixture-42\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {} Test\r\nContent-Type: application/vnd.imageforger.encrypted-v1\r\nContent-Length: {}\r\nX-Request-ID: fixture-42\r\nConnection: close\r\n\r\n",
                     reply.status,
                     reply.body.len()
                 )
@@ -520,14 +606,17 @@ mod tests {
                 body: png,
             },
         ];
-        let (url, worker) = server(replies);
-        let mut request = Request::new("test");
+        let identity = Identity::generate().unwrap();
+        let pin = identity.public_hex();
+        let (url, worker) = server_with_identity(replies, Some(identity));
+        let mut request = Request::new("private-test-prompt");
         request.steps = 1;
         let mut saw_preview = false;
         let result = run_authenticated(
             &request,
             &url,
             Some("test-secret"),
+            &pin,
             &CancellationToken::default(),
             |event| {
                 if matches!(event, Event::Preview { .. }) {

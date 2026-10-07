@@ -29,6 +29,7 @@ required-features = ["gui"]
 
 [dependencies]
 anyhow = "1"
+cryptoxide = { version = "0.6.5", default-features = false, features = ["chacha", "poly1305", "x25519", "hkdf", "sha2"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "multipart"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "sync"], optional = true }
 async-channel = { version = "2", optional = true }

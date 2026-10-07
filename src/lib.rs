@@ -16,6 +16,7 @@ mod pipeline;
 mod preview;
 mod quant;
 pub mod remote;
+pub mod content_crypto;
 mod shared;
 mod text;
 mod vae;

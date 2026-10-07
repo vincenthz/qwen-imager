@@ -2,3 +2,6 @@
 Cargo.lock
 output/
 *.png
+
+# Default server private identity
+imageforger.key

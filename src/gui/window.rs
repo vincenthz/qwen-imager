@@ -468,6 +468,17 @@ impl ImageWindow {
             cx.notify();
             return;
         }
+        let pinned_identity = match &backend {
+            Backend::Remote { address } => match cx.global::<Settings>().server_identities.get(&server_url(address)) {
+                Some(pin) => pin.clone(),
+                None => {
+                    self.status = "Pin this server's identity in Settings → Compute before generating.".into();
+                    cx.notify();
+                    return;
+                }
+            },
+            Backend::Local => String::new(),
+        };
         // Trailing blank lines would otherwise change the prompt's encoding.
         let mut request = Request::new(self.prompt.read(cx).value().trim());
         let size = match parse_size(&self.size.read(cx).value()) {
@@ -605,7 +616,7 @@ impl ImageWindow {
                     Backend::Remote { address } => {
                         let cancel = cancellation.clone();
                         let sender = sender.clone();
-                        image_forger::remote::run_authenticated(&request, &server_url(address), token.as_deref(), &cancellation, move |event| {
+                        image_forger::remote::run_authenticated(&request, &server_url(address), token.as_deref(), &pinned_identity, &cancellation, move |event| {
                             if sender.send_blocking(Message::Inference(event)).is_err() {
                                 cancel.cancel();
                             }

@@ -4,7 +4,7 @@ Build and start the same CLI in server mode:
 
 ```sh
 cargo build --release --bin image-forger-cli
-./target/release/image-forger-cli --serve --offline
+./target/release/image-forger-cli --serve --offline --key-file imageforger.key
 ```
 
 The default address is `127.0.0.1:6996`. `--model`, `--model-dir PATH` and
@@ -15,14 +15,22 @@ order. HTTP requests remain responsive while inference runs.
 For another port, use `--listen 127.0.0.1:9000`. For access from another machine,
 set `IMAGEFORGER_API_TOKEN` and use `--listen 0.0.0.0:6996`; include
 `Authorization: Bearer YOUR_TOKEN` on every request, including `/health`.
-The token is also enforced on localhost when set. The service uses plain HTTP;
-use a TLS reverse proxy if you need encrypted transport.
+The token is also enforced on localhost when set. Prompts and images are always
+content-encrypted, including over plain HTTP. Bearer tokens and status/control
+metadata remain outside this encryption; HTTPS can also protect those fields.
+The CLI loads or creates `--key-file PATH` (default `imageforger.key`), prints its
+64-character hexadecimal X25519 public identity, and requires Unix key-file
+permissions of `0600` or stricter. Back up the private key securely and keep it
+across restarts. Invalid files fail closed rather than rotating the identity.
 
 In the desktop GUI, add the service address in **Settings → Compute**, paste the
 same `IMAGEFORGER_API_TOKEN` into that host's masked **API token** field (without
-the `Bearer` prefix), and click **Save & test**. The token is saved in macOS
+the `Bearer` prefix), paste the public identity from the server console into the
+identity field, and click **Save & test**. The token is saved in macOS
 Keychain, separately from the settings file. The test calls authenticated
-`GET /health` without submitting a job or loading model weights. Select the host
+`POST /identity` and verifies an encrypted response from the pinned key without
+submitting a job or loading model weights. Pins are saved per normalized endpoint
+in settings, and are never discovered or silently replaced over HTTP. Select the host
 from the title bar's **Local / Remote** menu to generate. The GUI authenticates
 submission, polling, preview, and final-image requests; no local model download
 is required. **Clear token** removes the credential from Keychain. Removing a
@@ -62,68 +70,89 @@ troubleshooting. The same GUI error report is written to stderr as
 `gui.operation_failed`. Notifications remain available when changing workspaces
 or closing Settings; cancelling an operation does not trigger an error alert.
 
+## Content encryption v1
+
+This is a breaking change for older HTTP clients: plaintext JSON and multipart
+submissions receive `415`; there is no plaintext fallback. Use the GUI or the Rust
+`image_forger::remote::run_authenticated(request, url, token, pinned_identity,
+cancellation, on_event)` API. It creates a new OS-random X25519 client key for each
+generation, encrypts the upload, and decrypts previews and the final image. Only
+that request's client context can read its images. Restarting the GUI loses those
+in-memory keys; download/save results before closing it.
+
+Cryptoxide supplies X25519, HKDF-SHA256, and ChaCha20-Poly1305. The remote public
+identity must be copied through a trusted channel. This static-server exchange
+does not provide forward secrecy if the server private key is later compromised.
+Content encryption protects transmission, not local image files, saved workspaces,
+or the generation server's memory.
+
+All encrypted HTTP bodies use `Content-Type: application/vnd.imageforger.encrypted-v1`.
+Byte concatenations below have no separators; integers are big-endian.
+
+1. Each request context has a fresh client identity, 32 random salt bytes, and a
+   Unix-seconds timestamp. Its 76-byte header is ASCII `IFC1` + client public key
+   (32 bytes) + salt (32 bytes) + timestamp (8 bytes).
+2. Compute X25519(client private, pinned server public); reject an all-zero shared
+   secret. HKDF-Extract uses the salt and shared secret. HKDF-Expand's info is
+   ASCII `ImageForger content v1 X25519 HKDF-SHA256 ChaCha20-Poly1305` + server
+   public key + the complete header. Expand to 64 bytes: upload key first,
+   download key second, each 32 bytes.
+3. A request body is header + nonce (12 bytes) + ciphertext + tag (16 bytes).
+   The nonce is four zero bytes + a monotonically increasing 64-bit counter,
+   starting at zero in each new context. AEAD additional data is the UTF-8
+   method and canonical API path: `POST /jobs` or `POST /identity`.
+4. Each response has a new random 32-byte message salt. HKDF-Expand of the download
+   key with info ASCII `ImageForger response v1` + message salt produces its
+   32-byte message key. This also avoids reusing a key/nonce pair after a server
+   restart or replayed identity challenge. The response body is message salt +
+   nonce (12 bytes) + ciphertext + tag (16 bytes). Its nonce follows the same
+   counter layout. Additional data is `GET /jobs/{id}/preview`,
+   `GET /jobs/{id}/image`, or `POST /identity`, as appropriate.
+5. Authenticate before parsing or decoding plaintext. Clients reject unencrypted
+   image/identity responses, incorrect pins, changed bodies, and substituted
+   image paths. Reverse proxy prefixes are not part of the additional data.
+
+`POST /identity` encrypts the literal ASCII `identity`; its encrypted response
+contains JSON with the `model` field. It proves possession of the pinned private
+key. `GET /health` remains ordinary authenticated JSON and is only a health check.
+
+The timestamp must be within five minutes of the server clock. Accepted upload
+contexts cannot be reused: the server retains a bounded replay cache (4096
+entries, up to ten minutes). A full cache returns `429`; duplicate uploads return
+`409`. This cache is in memory and resets on server restart. New attempts should
+create a fresh request context.
+
 ## Submit and retrieve an image
 
-```sh
-curl -sS http://127.0.0.1:6996/jobs \
-  -H 'Content-Type: application/json' \
-  -d '{"prompt":"a clown at the circus, with a red teapot, and a dog on a bike","scale":0.25,"steps":8,"seed":42}'
+The plaintext inside `POST /jobs` is a multipart form with boundary
+`----image-forger-boundary`. Include exactly one `parameters` field containing
+JSON, for example:
+
+```json
+{"prompt":"Change the background to a sunset beach","scale":0.25,"steps":8,"seed":42}
 ```
 
-This immediately returns `202 Accepted`, a `Location` header, and a job object
-with an `id` such as `"1"`. Use that ID in subsequent requests:
+Repeat the `images` field for each reference, in input order; omit it for text-only
+jobs. The complete multipart body is encrypted before transmission, including the
+prompt, images, and form headers. PNG, JPEG, WebP, and HEIC/HEIF are accepted,
+detected from the decrypted bytes. Alpha and photo orientation are preserved.
+Filenames are not server paths and uploads are not written to disk.
+
+Submission returns ordinary `202` JSON with a job ID and `Location`. Poll
+`GET /jobs/{id}` for metadata. `POST /jobs/{id}/preview` requests a manual preview;
+`GET /jobs/{id}/preview` and `GET /jobs/{id}/image` return encrypted PNG bytes.
+Decrypt using the original request context before opening/saving the PNG.
+Fetching a preview does not request decoding. A pending decode returns `409` if
+another is requested. `preview_step` and `X-Preview-Step` identify its snapshot.
+
+Status/control calls still work with ordinary HTTP clients:
 
 ```sh
-# Poll status (once per second is sufficient for most clients).
-curl -sS http://127.0.0.1:6996/jobs/1
-
-# Request a preview from the most recent fully completed step.
-curl -sS -X POST http://127.0.0.1:6996/jobs/1/preview
-
-# Once preview_url is non-null, fetch the latest decoded preview.
-curl --fail http://127.0.0.1:6996/jobs/1/preview -o preview.png
-
-# Once status is "succeeded", fetch the final RGBA image.
-curl --fail http://127.0.0.1:6996/jobs/1/image -o final.png
+curl --fail http://127.0.0.1:6996/jobs/1 -H "Authorization: Bearer $IMAGEFORGER_API_TOKEN"
 ```
 
-`GET /preview` only retrieves the latest available image; it does not request a
-decode. `POST /preview` schedules background decoding while sampling continues.
-A request made before the first completed step waits for that step. Repeated
-requests while one decode is outstanding return `409`. A preview can lag behind
-`completed_steps`; `preview_step` and the PNG's `X-Preview-Step` header identify
-its snapshot. Early previews may look rough. Decoding uses additional GPU time
-and memory, especially at 2048px.
-
-## Upload reference images for editing
-
-Send a multipart form to the same `POST /jobs` endpoint. Include exactly one
-`parameters` field containing the usual JSON, and repeat the `images` field for
-each reference image:
-
-```sh
-curl --fail-with-body http://127.0.0.1:6996/jobs \
-  -F 'parameters={"prompt":"Change the background to a sunset beach","scale":0.25,"steps":8,"seed":42}' \
-  -F 'images=@reference.png'
-
-# References keep the order of the images fields.
-curl --fail-with-body http://127.0.0.1:6996/jobs \
-  -F 'parameters={"prompt":"Put the character from the first image into the scene from the second","scale":0.25,"steps":8}' \
-  -F 'images=@character.png' \
-  -F 'images=@scene.jpg'
-```
-
-Let curl set the multipart Content-Type and boundary. Authenticated workers
-require the same Bearer header used for JSON requests. PNG, JPEG, WebP, and HEIC/HEIF are
-accepted, detected from the uploaded bytes. Alpha is preserved where the format
-supports it, and photo orientation is applied. The filenames are not used as server paths, and uploads are not
-written to disk.
-
-The response is the usual `202` job object. Use the existing status, preview,
-image, and cancellation endpoints. `references` lists each input's oriented
-`width` and `height` in upload order. Without `ratio`, the output follows the
-last reference's aspect ratio; an explicit ratio overrides it. References are
-resized by the inference pipeline in the same way as local CLI/GUI inputs.
+`references` lists each input's oriented dimensions. Without `ratio`, output
+follows the last reference's aspect ratio; an explicit ratio overrides it.
 
 Upload limits:
 
@@ -149,9 +178,9 @@ with completed jobs; clients should keep their own copies for resubmission.
 
 ## Parameters
 
-The JSON body accepts these fields. Unknown fields are rejected, and the maximum
-body size is 64 KiB. These same fields go in the multipart `parameters` field
-when uploading reference images. Server file paths are never accepted.
+The encrypted multipart `parameters` field accepts these fields. Unknown fields
+are rejected and the maximum parameters size is 64 KiB. Server file paths are
+never accepted.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -175,6 +204,7 @@ image endpoints in all modes. Preview settings must be chosen at submission.
 `POST /jobs/{id}/preview` return the same job-object shape:
 
 - `id`, `parameters`, `width`, `height`, `created_unix_ms` identify the request.
+  `parameters` omits `prompt` in every status/list/control response.
 - `references` contains the original dimensions of each uploaded image, in order
   (empty for text-only jobs). `reference_index` is the zero-based image currently
   being vision-encoded, or `null` outside that stage.
@@ -188,7 +218,8 @@ image endpoints in all modes. Preview settings must be chosen at submission.
   increasing on completion.
 - `preview_pending`, `preview_step`, and `preview_url` describe preview readiness.
 - `image_url` is non-null only on success; `status_url` is always present.
-- `error` contains the inference failure message, or `null`.
+- `error` contains a generic inference failure message, or `null`; underlying
+  failures stay in server diagnostics so status cannot echo private content.
 
 Image URLs are relative to the server. Fetch a new preview when `preview_step`
 changes. The server retains only the latest preview and encodes each snapshot
@@ -200,11 +231,12 @@ as PNG lazily, off the inference thread. Repeated fetches reuse the encoded PNG.
 | --- | --- |
 | `GET /health` | Service availability, model ID and pinned revision, queue size, and capacity; does not load/test the model |
 | `GET /jobs` | `{"jobs": [...]}` for all retained jobs, oldest first |
-| `POST /jobs` | Submit JSON or multipart images + parameters; `202` with job and `Location` |
+| `POST /identity` | Encrypted proof of the pinned server identity |
+| `POST /jobs` | Submit encrypted multipart images + parameters; `202` with job and `Location` |
 | `GET /jobs/{id}` | Current job status |
 | `POST /jobs/{id}/preview` | Request a manual preview; `202` if accepted |
-| `GET /jobs/{id}/preview` | Latest preview PNG, or `409` until available |
-| `GET /jobs/{id}/image` | Final PNG, or `409` until successful |
+| `GET /jobs/{id}/preview` | Encrypted latest preview PNG, or `409` until available |
+| `GET /jobs/{id}/image` | Encrypted final PNG, or `409` until successful |
 | `POST /jobs/{id}/cancel` | Cancel queued/running job; harmless on terminal jobs |
 | `DELETE /jobs/{id}` | Forget a terminal job and release its images; `204` |
 
@@ -219,7 +251,7 @@ can still report `succeeded` if cancellation arrived too late.
 Requests and images live in process memory and disappear on restart. Download
 images before deleting a job or stopping the server. Ctrl-C stops accepting
 work, cancels pending/running jobs, and waits for the generation worker to exit.
-No files are written by the service itself.
+The identity key file is created when missing; image content is kept in memory.
 
 Validation errors return `400` or `422`; oversized bodies return `413`; missing
 jobs return `404`; unavailable images or invalid state transitions return `409`.
@@ -230,16 +262,9 @@ transport failures.
 
 ## Verification
 
-The normal test suite covers request validation, authorization, queue capacity,
-FIFO dispatch, cancellation, progress updates, and RGBA PNG responses without
-loading the model. For an end-to-end check with cached weights and Metal access:
-
-```sh
-python3 scripts/smoke-http-references.py
-```
-
-This starts a temporary loopback server, uploads two generated test fixtures,
-checks reference progress and manual previews, and compares the final PNG with
-the equivalent local CLI edit. It stops the service before running the CLI
-comparison. Images, status history, and logs go to `output/http-reference-smoke/`.
-Use `--output PATH` to choose another directory.
+`cargo test --all-features` covers encryption round trips, tampering, wrong pins,
+low-order X25519 inputs, expired/replayed uploads, private key-file reuse,
+plaintext rejection, prompt/error redaction, and real loopback client/server
+preview and image transfers without loading model weights. Tests that bind
+loopback sockets need local network permissions. Existing Metal/model tests
+remain opt-in.

@@ -46,11 +46,17 @@ use `http://host:6996`; `host:port` and full HTTP(S) URLs are also supported.
 
 Under each host in **Settings → Compute**, enter the server's
 `IMAGEFORGER_API_TOKEN` in the masked **API token** field (the token alone, without
-`Bearer`), then click **Save & test**. This stores the token in macOS Keychain and
-checks the server's authenticated `/health` endpoint without starting a generation.
+`Bearer`). Paste the server's printed 64-character public identity into the identity
+field, then click **Save & test**. This stores the token in macOS Keychain and
+verifies the pinned identity with an encrypted `/identity` challenge without starting a generation.
 A successful check shows the server's model. The GUI sends the token with job
 submission, status polling, preview downloads, and final-image downloads. Tokens
 are stored separately for each server URL and never written to `settings.json`.
+Public identity pins are saved in settings; they must be entered explicitly and are
+never learned from an untrusted connection. Prompts, uploaded references, previews,
+and final images use cryptoxide X25519/HKDF-SHA256/ChaCha20-Poly1305 encryption.
+Each generation gets a fresh in-memory client identity. Status metadata remains
+ordinary Bearer-authenticated HTTP and never includes the prompt.
 Use **Clear token** to delete a saved credential; removing a host from the list
 keeps its Keychain entry so re-adding that endpoint restores it. Leave the token
 blank only for a service that does not require authentication. Authentication
@@ -376,16 +382,18 @@ Run a persistent generation service with the CLI:
 
 ```sh
 cargo build --release --bin image-forger-cli
-./target/release/image-forger-cli --serve --offline --listen 127.0.0.1:6996
+./target/release/image-forger-cli --serve --offline --listen 127.0.0.1:6996 --key-file imageforger.key
 ```
 
-Submit JSON prompts or multipart reference images with JSON parameters to
+The server loads or creates an owner-only X25519 key file and prints its public
+identity for pinning in the GUI. Preserve this file across restarts.
+Submit encrypted multipart prompts and reference images to
 `POST /jobs`, poll `GET /jobs/{id}`, request a background
 preview with `POST /jobs/{id}/preview`, and retrieve preview/final PNGs with
 `GET /jobs/{id}/preview` and `GET /jobs/{id}/image`. Jobs run sequentially and
 reuse loaded models; HTTP stays responsive during inference. Manual previews
 are the default. The bounded queue supports cancellation and explicit cleanup.
-See the [HTTP API reference](docs/http-api.md) for parameters, curl examples,
+See the [HTTP API reference](docs/http-api.md) for the encryption wire format, parameters,
 remote access, and lifecycle details.
 
 ## CLI

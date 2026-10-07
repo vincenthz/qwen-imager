@@ -76,6 +76,8 @@ pub struct Settings {
     pub model: Checkpoint,
     /// Remote compute servers, as `host` or `host:port` addresses.
     pub servers: Vec<String>,
+    /// Public X25519 identities, explicitly pinned per normalized endpoint.
+    pub server_identities: HashMap<String, String>,
     /// Last selected compute backend; local model files are optional for remote hosts.
     pub backend: Backend,
 }
@@ -91,6 +93,7 @@ impl Default for Settings {
             bf16_attention: false,
             model: Checkpoint::Original,
             servers: Vec::new(),
+            server_identities: HashMap::new(),
             backend: Backend::Local,
         }
     }
@@ -116,7 +119,7 @@ impl Settings {
             .unwrap_or_default()
     }
 
-    fn save(&self) -> anyhow::Result<()> {
+    pub(crate) fn save(&self) -> anyhow::Result<()> {
         let path = Self::path().context("HOME is not set")?;
         std::fs::create_dir_all(path.parent().unwrap())?;
         std::fs::write(&path, serde_json::to_vec_pretty(self)?)
@@ -295,6 +298,7 @@ fn servers_field(
                                     move |_, _, cx| {
                                         commit(&panel, cx, |s| {
                                             s.servers.retain(|existing| existing != &server);
+                                            s.server_identities.remove(&server_url(&server));
                                             if s.backend == (Backend::Remote { address: server.clone() }) {
                                                 s.backend = Backend::Local;
                                             }
@@ -521,7 +525,7 @@ impl Render for SettingsPanel {
                                     .group(
                                         SettingGroup::new()
                                             .title("Compute hosts")
-                                            .description("Add a host or HTTP(S) URL. Paste its IMAGEFORGER_API_TOKEN below, then Save & test. Tokens are stored in macOS Keychain.")
+                                            .description("Add a host or HTTP(S) URL. Paste its IMAGEFORGER_API_TOKEN and server identity from the server console, then Save & test. Tokens are stored in macOS Keychain.")
                                             .item(
                                                 SettingItem::render({
                                                     let panel = panel.clone();
@@ -703,6 +707,7 @@ mod tests {
             bf16_attention: true,
             model: Checkpoint::Mlx4Bit,
             servers: vec!["192.168.1.5:6996".into()],
+            server_identities: HashMap::from([("http://192.168.1.5:6996".into(), "ab".repeat(32))]),
             backend: Backend::Remote { address: "192.168.1.5:6996".into() },
         };
         let json = serde_json::to_vec(&settings).unwrap();

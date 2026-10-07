@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use image_forger::content_crypto::{self, Identity, Session};
 use image_forger::diagnostics::{log, redact};
 use image_forger::{
     CancellationToken, Checkpoint, Event, Generator, ModelOptions, PreviewControl, Request,
@@ -210,11 +211,14 @@ struct Job {
     output: Option<Arc<Image>>,
     control: Option<PreviewControl>,
     cancel: CancellationToken,
+    crypto: Option<Arc<Session>>,
 }
 impl Job {
     fn view(&self) -> serde_json::Value {
+        let mut parameters = serde_json::to_value(&self.parameters).unwrap();
+        parameters.as_object_mut().unwrap().remove("prompt");
         serde_json::json!({
-            "id": self.id.to_string(), "status": self.status, "parameters": self.parameters,
+            "id": self.id.to_string(), "status": self.status, "parameters": parameters,
             "references": self.references,
             "width": self.width, "height": self.height, "created_unix_ms": self.created_ms,
             "stage": self.stage, "stage_completed": self.stage_completed, "stage_total": self.stage_total,
@@ -222,7 +226,7 @@ impl Job {
             "completed_steps": self.completed_steps, "total_steps": self.parameters.steps,
             "last_step_s": self.last_step_s,
             "elapsed_s": self.elapsed_s.or_else(|| self.started.map(|s| s.elapsed().as_secs_f64())),
-            "error": self.error, "preview_pending": self.preview_pending,
+            "error": self.error.as_ref().map(|_| "Generation failed; see server diagnostics"), "preview_pending": self.preview_pending,
             "preview_step": self.preview.as_ref().map(|p| p.step),
             "preview_url": self.preview.as_ref().map(|_| format!("/jobs/{}/preview", self.id)),
             "image_url": self.output.as_ref().map(|_| format!("/jobs/{}/image", self.id)),
@@ -319,17 +323,20 @@ struct Service {
     checkpoint: Checkpoint,
     http_debug: bool,
     next_request: AtomicU64,
+    identity: Option<Identity>,
+    seen_requests: Mutex<BTreeMap<Vec<u8>, u64>>,
 }
 impl Service {
     #[cfg(test)]
     fn new(max_jobs: usize, authorization: Option<HeaderValue>) -> Arc<Self> {
-        Self::with_checkpoint(max_jobs, authorization, Checkpoint::default(), false)
+        Self::with_checkpoint(max_jobs, authorization, Checkpoint::default(), false, None)
     }
     fn with_checkpoint(
         max_jobs: usize,
         authorization: Option<HeaderValue>,
         checkpoint: Checkpoint,
         http_debug: bool,
+        identity: Option<Identity>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store: Mutex::new(Store {
@@ -348,6 +355,8 @@ impl Service {
             checkpoint,
             http_debug,
             next_request: AtomicU64::new(1),
+            identity,
+            seen_requests: Mutex::new(BTreeMap::new()),
         })
     }
     fn job(&self, id: u64) -> ApiResult<SharedJob> {
@@ -414,6 +423,7 @@ impl Service {
             started: None,
             elapsed_s: None,
             error: None,
+            crypto: None,
             preview: None,
             preview_pending: false,
             output: None,
@@ -719,6 +729,63 @@ async fn submit(
     State(service): State<Arc<Service>>,
     mut request: axum::extract::Request,
 ) -> ApiResult<Response> {
+    let mut encrypted_upload = None;
+    let crypto = if let Some(identity) = &service.identity {
+        if request
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            != Some(content_crypto::CONTENT_TYPE)
+        {
+            return Err(ApiError(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "encrypted content is required".into(),
+            ));
+        }
+        encrypted_upload = Some(
+            service
+                .uploads
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| ApiError(StatusCode::TOO_MANY_REQUESTS, "uploads busy".into()))?,
+        );
+        let (mut parts, body) = request.into_parts();
+        let bytes = axum::body::to_bytes(body, UPLOAD_LIMIT + 104)
+            .await
+            .map_err(|_| {
+                ApiError(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "encrypted upload exceeds 16 MiB".into(),
+                )
+            })?;
+        let (session, plaintext) = identity.open_request(&bytes, "POST /jobs")
+            .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "content authentication failed or request expired; verify the pinned identity and clocks".into()))?;
+        let now = content_crypto::now().map_err(|_| conflict("server clock unavailable"))?;
+        {
+            let mut seen = service.seen_requests.lock().unwrap();
+            seen.retain(|_, expires| *expires >= now);
+            if seen.contains_key(&session.replay_id()) {
+                return Err(conflict("encrypted request already submitted"));
+            }
+            if seen.len() >= 4096 {
+                return Err(ApiError(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "encrypted request capacity reached; retry later".into(),
+                ));
+            }
+            seen.insert(session.replay_id(), now + 2 * content_crypto::MAX_AGE);
+        }
+        parts.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(content_crypto::MULTIPART_TYPE),
+        );
+        parts.headers.remove(header::CONTENT_LENGTH);
+        request = axum::extract::Request::from_parts(parts, plaintext.into());
+        Some(Arc::new(session))
+    } else {
+        None
+    };
+    let retained_service = service.clone();
     let multipart = request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -726,12 +793,16 @@ async fn submit(
         .and_then(|v| v.split(';').next())
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("multipart/form-data"));
     let view = if multipart {
-        let upload = service.uploads.clone().try_acquire_owned().map_err(|_| {
-            ApiError(
-                StatusCode::TOO_MANY_REQUESTS,
-                "two reference uploads are already in progress; retry shortly".into(),
-            )
-        })?;
+        let upload = if let Some(upload) = encrypted_upload {
+            upload
+        } else {
+            service.uploads.clone().try_acquire_owned().map_err(|_| {
+                ApiError(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "two reference uploads are already in progress; retry shortly".into(),
+                )
+            })?
+        };
         // `apply` replaces Axum's internal limit. Inserting DefaultBodyLimit
         // itself into extensions leaves the router's 64 KiB JSON limit active.
         DefaultBodyLimit::max(UPLOAD_LIMIT).apply(&mut request);
@@ -768,8 +839,11 @@ async fn submit(
                         data.extend_from_slice(&chunk);
                     }
                     parameters =
-                        Some(serde_json::from_slice::<Parameters>(&data).map_err(|e| {
-                            ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+                        Some(serde_json::from_slice::<Parameters>(&data).map_err(|_| {
+                            ApiError(
+                                StatusCode::UNPROCESSABLE_ENTITY,
+                                "invalid parameters JSON".into(),
+                            )
                         })?);
                 }
                 Some("images") => {
@@ -814,6 +888,8 @@ async fn submit(
             .map_err(|e| ApiError(e.status(), e.body_text()))?;
         service.submit(parameters)?
     };
+    let id = view["id"].as_str().unwrap().parse().unwrap();
+    retained_service.job(id)?.lock().unwrap().crypto = crypto;
     let location = view["status_url"].as_str().unwrap().to_owned();
     Ok((
         StatusCode::ACCEPTED,
@@ -875,29 +951,82 @@ async fn request_preview(
     job.preview_pending = true;
     Ok((StatusCode::ACCEPTED, Json(job.view())).into_response())
 }
+async fn image_response(service: Arc<Service>, id: u64, is_preview: bool) -> ApiResult<Response> {
+    let (image, crypto) = {
+        let job = service.job(id)?;
+        let job = job.lock().unwrap();
+        (
+            if is_preview {
+                job.preview.clone()
+            } else {
+                job.output.clone()
+            },
+            job.crypto.clone(),
+        )
+    };
+    let image = image.ok_or_else(|| conflict("image not available yet"))?;
+    let response = image.response().await?;
+    if let Some(crypto) = crypto {
+        let (mut parts, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .map_err(|_| conflict("image encoding failed"))?;
+        let path = format!(
+            "GET /jobs/{id}/{}",
+            if is_preview { "preview" } else { "image" }
+        );
+        let encrypted = crypto
+            .seal_response(&path, &bytes)
+            .map_err(|_| conflict("image encryption failed"))?;
+        parts.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(content_crypto::CONTENT_TYPE),
+        );
+        parts.headers.remove(header::CONTENT_LENGTH);
+        Ok(Response::from_parts(parts, encrypted.into()))
+    } else if service.identity.is_some() {
+        Err(conflict("job encryption context unavailable"))
+    } else {
+        Ok(response)
+    }
+}
 async fn preview(State(service): State<Arc<Service>>, Path(id): Path<u64>) -> ApiResult<Response> {
-    let image = service
-        .job(id)?
-        .lock()
-        .unwrap()
-        .preview
-        .clone()
-        .ok_or_else(|| conflict("no preview available yet"))?;
-    image.response().await
+    image_response(service, id, true).await
 }
 async fn image(State(service): State<Arc<Service>>, Path(id): Path<u64>) -> ApiResult<Response> {
-    let image = service
-        .job(id)?
-        .lock()
-        .unwrap()
-        .output
-        .clone()
-        .ok_or_else(|| conflict("final image is not ready; check job status"))?;
-    image.response().await
+    image_response(service, id, false).await
+}
+async fn identity_check(State(service): State<Arc<Service>>, bytes: Bytes) -> ApiResult<Response> {
+    let identity = service
+        .identity
+        .as_ref()
+        .ok_or_else(|| conflict("content encryption unavailable"))?;
+    let (session, plaintext) = identity
+        .open_request(&bytes, "POST /identity")
+        .map_err(|_| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                "identity verification failed".into(),
+            )
+        })?;
+    if plaintext != b"identity" {
+        return Err(conflict("invalid identity challenge"));
+    }
+    let body =
+        serde_json::to_vec(&serde_json::json!({"model": service.checkpoint.repo()})).unwrap();
+    let encrypted = session
+        .seal_response("POST /identity", &body)
+        .map_err(|_| conflict("identity verification failed"))?;
+    Ok((
+        [(header::CONTENT_TYPE, content_crypto::CONTENT_TYPE)],
+        encrypted,
+    )
+        .into_response())
 }
 fn router(service: Arc<Service>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/identity", post(identity_check))
         .route("/jobs", post(submit).get(list))
         .route("/jobs/{id}", get(status).delete(delete))
         .route("/jobs/{id}/cancel", post(cancel))
@@ -914,6 +1043,7 @@ pub fn run(
     max_jobs: usize,
     options: ModelOptions,
     http_debug: bool,
+    identity: Identity,
 ) -> anyhow::Result<()> {
     let token = std::env::var("IMAGEFORGER_API_TOKEN").ok();
     anyhow::ensure!(
@@ -935,7 +1065,7 @@ pub fn run(
         .context("creating HTTP service runtime")?;
     runtime.block_on(async {
         let listener = tokio::net::TcpListener::bind(address).await.with_context(|| format!("binding HTTP listener to {address}"))?;
-        let service = Service::with_checkpoint(max_jobs, authorization, options.checkpoint, http_debug);
+        let service = Service::with_checkpoint(max_jobs, authorization, options.checkpoint, http_debug, Some(identity));
         log("INFO", "http.listening", serde_json::json!({"address": listener.local_addr()?.to_string(), "model": options.checkpoint.name(), "offline": options.offline, "auth_required": service.authorization.is_some(), "max_jobs": max_jobs, "http_debug": http_debug}));
         let worker_service = service.clone();
         let thread = std::thread::Builder::new().name("generation".into()).spawn(move || worker(worker_service, options)).context("starting generation worker")?;
@@ -993,6 +1123,151 @@ mod tests {
             status,
             serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
         )
+    }
+
+    async fn encrypted_call(app: &Router, path: &str, body: Vec<u8>, token: &str) -> Response {
+        app.clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::CONTENT_TYPE, content_crypto::CONTENT_TYPE)
+                    .header(header::AUTHORIZATION, token)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn encrypted_api_enforces_authentication_and_hides_content() {
+        runtime().block_on(async {
+            let identity = Identity::generate().unwrap();
+            let client = Identity::generate().unwrap();
+            let session = client.session(identity.public()).unwrap();
+            let service = Service::with_checkpoint(4, Some(HeaderValue::from_static("Bearer secret")), Checkpoint::default(), false, Some(identity));
+            let app = router(service.clone());
+            let params = br#"{"prompt":"private-test-prompt","scale":0.25}"#;
+            let plain = [b"------image-forger-boundary\r\nContent-Disposition: form-data; name=\"parameters\"\r\n\r\n".as_slice(), params, b"\r\n------image-forger-boundary--\r\n"].concat();
+            let body = session.seal_request("POST /jobs", &plain).unwrap();
+            assert_eq!(encrypted_call(&app, "/jobs", body.clone(), "Bearer wrong").await.status(), StatusCode::UNAUTHORIZED);
+            let mut damaged = body.clone();
+            *damaged.last_mut().unwrap() ^= 1;
+            assert_eq!(encrypted_call(&app, "/jobs", damaged, "Bearer secret").await.status(), StatusCode::BAD_REQUEST);
+            let plaintext = app.clone().oneshot(HttpRequest::builder().method("POST").uri("/jobs")
+                .header(header::AUTHORIZATION, "Bearer secret").header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(params.as_slice())).unwrap()).await.unwrap();
+            assert_eq!(plaintext.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            let response = encrypted_call(&app, "/jobs", body.clone(), "Bearer secret").await;
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+            let view: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(view["parameters"].get("prompt").is_none());
+            assert!(!String::from_utf8_lossy(&bytes).contains("private-test-prompt"));
+            assert_eq!(encrypted_call(&app, "/jobs", body, "Bearer secret").await.status(), StatusCode::CONFLICT);
+            assert_eq!(service.store.lock().unwrap().queue.len(), 1);
+            {
+                let job = service.job(1).unwrap();
+                let mut job = job.lock().unwrap();
+                let pixels = Arc::new(RgbaImage::from_pixel(2, 2, image::Rgba([12, 34, 56, 78])));
+                job.preview = Some(Image::new(pixels.clone(), 1));
+                job.output = Some(Image::new(pixels, 1));
+                job.error = Some("error containing private-test-prompt".into());
+            }
+            for path in ["/jobs", "/jobs/1", "/jobs/1/preview", "/jobs/1/image"] {
+                let response = app.clone().oneshot(HttpRequest::builder().uri(path)
+                    .header(header::AUTHORIZATION, "Bearer secret").body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let content_type = response.headers()[header::CONTENT_TYPE].clone();
+                let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+                if path.ends_with("image") || path.ends_with("preview") {
+                    assert_eq!(content_type, content_crypto::CONTENT_TYPE);
+                    assert!(!bytes.starts_with(b"\x89PNG"));
+                    let png = session.open_response(&format!("GET {path}"), &bytes).unwrap();
+                    assert_eq!(image::load_from_memory(&png).unwrap().to_rgba8().get_pixel(0,0).0, [12,34,56,78]);
+                    assert!(session.open_response("GET /jobs/2/image", &bytes).is_err());
+                } else {
+                    assert!(!String::from_utf8_lossy(&bytes).contains("private-test-prompt"));
+                }
+            }
+            let challenge = session.seal_request("POST /identity", b"identity").unwrap();
+            let response = encrypted_call(&app, "/identity", challenge, "Bearer secret").await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
+            let plain = session.open_response("POST /identity", &bytes).unwrap();
+            assert!(serde_json::from_slice::<serde_json::Value>(&plain).unwrap()["model"].is_string());
+        });
+    }
+
+    #[test]
+    fn real_remote_client_verifies_identity_and_downloads_encrypted_images() {
+        runtime().block_on(async {
+            let identity = Identity::generate().unwrap();
+            let pin = identity.public_hex();
+            let service = Service::with_checkpoint(
+                4,
+                Some(HeaderValue::from_static("Bearer secret")),
+                Checkpoint::default(),
+                false,
+                Some(identity),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let app = router(service.clone());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let result = tokio::task::spawn_blocking(move || {
+                assert!(
+                    image_forger::remote::test_pinned_connection(
+                        &url,
+                        Some("secret"),
+                        &Identity::generate().unwrap().public_hex()
+                    )
+                    .is_err()
+                );
+                image_forger::remote::test_pinned_connection(&url, Some("secret"), &pin).unwrap();
+                let worker = std::thread::spawn(move || {
+                    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+                    loop {
+                        if let Ok(job) = service.job(1) {
+                            let mut job = job.lock().unwrap();
+                            assert_eq!(job.parameters.prompt, "private prompt");
+                            let pixels = Arc::new(RgbaImage::new(2, 2));
+                            job.preview = Some(Image::new(pixels.clone(), 1));
+                            job.output = Some(Image::new(pixels, 1));
+                            job.status = Status::Succeeded;
+                            break;
+                        }
+                        assert!(Instant::now() < deadline);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                });
+                let mut request = Request::new("private prompt");
+                request.images.push(RgbaImage::new(2, 2));
+                let mut saw_preview = false;
+                let generation = image_forger::remote::run_authenticated(
+                    &request,
+                    &url,
+                    Some("secret"),
+                    &pin,
+                    &CancellationToken::default(),
+                    |event| {
+                        if matches!(event, Event::Preview { .. }) {
+                            saw_preview = true;
+                        }
+                    },
+                )
+                .unwrap();
+                worker.join().unwrap();
+                assert!(saw_preview);
+                assert_eq!(generation.image.dimensions(), (2, 2));
+            })
+            .await;
+            server.abort();
+            result.unwrap();
+        });
     }
 
     #[test]
@@ -1294,7 +1569,10 @@ mod tests {
             .lock()
             .unwrap()
             .finish(Err(anyhow::anyhow!("test failure")));
-        assert_eq!(first.lock().unwrap().view()["error"], "test failure");
+        assert_eq!(
+            first.lock().unwrap().view()["error"],
+            "Generation failed; see server diagnostics"
+        );
         let (second, request) = service.next().unwrap();
         assert_eq!(second.lock().unwrap().id, 2);
         assert_eq!(request.preview_every.unwrap().get(), 5);

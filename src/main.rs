@@ -39,6 +39,9 @@ struct Args {
     /// Maximum retained jobs, including queued jobs; delete finished jobs to free slots
     #[arg(long, default_value = "32", value_parser = clap::value_parser!(u32).range(1..=128), requires = "serve", conflicts_with = "prompt")]
     max_jobs: u32,
+    /// Server X25519 identity file; creates a private key if missing
+    #[arg(long, default_value = "imageforger.key", requires = "serve", conflicts_with = "prompt")]
+    key_file: PathBuf,
     /// Output PNG
     #[arg(short, long, default_value = "out.png")]
     output: PathBuf,
@@ -112,6 +115,8 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let checkpoint = Checkpoint::from(args.model);
     if args.serve {
+        let identity = image_forger::content_crypto::Identity::load_or_create(&args.key_file)?;
+        eprintln!("Server identity (pin in Settings → Compute): {}", identity.public_hex());
         return server::run(
             args.listen,
             args.max_jobs as usize,
@@ -121,6 +126,7 @@ fn main() -> anyhow::Result<()> {
                 checkpoint,
             },
             args.http_debug,
+            identity,
         ).inspect_err(|error| image_forger::diagnostics::log("ERROR", "http.service_failed", serde_json::json!({"operation": "starting or running the HTTP service", "error": image_forger::diagnostics::redact(&format!("{error:#}"), &[])})));
     }
     ensure!(
@@ -261,6 +267,10 @@ mod tests {
         let server = Args::try_parse_from(["cli", "--serve", "--offline"]).unwrap();
         assert!(server.serve);
         assert!(server.prompt.is_none());
+        assert_eq!(server.key_file, PathBuf::from("imageforger.key"));
+        let server = Args::try_parse_from(["cli", "--serve", "--key-file", "identity.key"]).unwrap();
+        assert_eq!(server.key_file, PathBuf::from("identity.key"));
+        assert!(Args::try_parse_from(["cli", "a teapot", "--key-file", "identity.key"]).is_err());
         assert!(
             Args::try_parse_from(["cli", "--serve", "--http-debug"])
                 .unwrap()

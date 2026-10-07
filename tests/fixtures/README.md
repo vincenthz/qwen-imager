@@ -32,3 +32,12 @@ both in BF16. For each `q4`/`q8` prefix it stores the packed `u32` `weight`,
 BF16 `scales` and `biases` as MLX writes them, MLX's `dequantized` weight, and
 `y = quantized_matmul(x, weight, scales, biases, transpose=True)`. Tests check
 the Metal and CPU dequantization against both.
+
+`content-crypto-v1.json` is an independent wire-format vector generated with
+Node.js 26's built-in OpenSSL crypto. Test-only X25519 private keys are 32 bytes
+of `0x01` (server) and `0x02` (client). The request salt is 32 bytes of `0x03`,
+timestamp 1700000000, and nonce zero. The response salt is 32 bytes of `0x04`
+and nonce zero. Plaintexts are `private prompt` and `PNG test bytes`, with
+additional data `POST /jobs` and `GET /jobs/1/image`, respectively. It verifies
+both directions against an implementation independent of cryptoxide; Node is
+not needed to run the Rust test. See `docs/http-api.md` for the derivation.

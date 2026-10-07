@@ -7,7 +7,7 @@ use gpui_component::{
     input::{Input, InputState},
 };
 
-use crate::settings::server_url;
+use crate::settings::{Settings, server_url};
 
 fn key(address: &str) -> String {
     format!("ImageForger API token: {}", server_url(address))
@@ -44,6 +44,7 @@ fn clear_token(address: &str, cx: &mut App) -> Task<Result<()>> {
 pub struct HostCredentials {
     address: String,
     input: Entity<InputState>,
+    identity_input: Entity<InputState>,
     busy: bool,
     has_token: bool,
     status: String,
@@ -56,6 +57,17 @@ impl HostCredentials {
             let mut input = InputState::new(window, cx).placeholder("API token (without Bearer)");
             input.set_masked(true, window, cx);
             input
+        });
+        let pin = cx
+            .global::<Settings>()
+            .server_identities
+            .get(&server_url(&address))
+            .cloned()
+            .unwrap_or_default();
+        let identity_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Pinned server identity (64 hex characters)")
+                .default_value(pin)
         });
         let read = read_token(&address, cx);
         cx.spawn_in(window, async move |view, cx| {
@@ -95,6 +107,7 @@ impl HostCredentials {
         Self {
             address,
             input,
+            identity_input,
             busy: true,
             has_token: false,
             status: "Reading Keychain…".into(),
@@ -118,6 +131,29 @@ impl HostCredentials {
             cx.notify();
             return;
         }
+        let pin = self
+            .identity_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_ascii_lowercase();
+        if let Err(error) = image_forger::content_crypto::public_key(&pin) {
+            self.failed = true;
+            self.status = error.to_string();
+            cx.notify();
+            return;
+        }
+        let mut settings = cx.global::<Settings>().clone();
+        settings
+            .server_identities
+            .insert(server_url(&self.address), pin.clone());
+        if let Err(error) = settings.save() {
+            self.failed = true;
+            self.status = format!("Could not save server identity: {error:#}");
+            cx.notify();
+            return;
+        }
+        cx.set_global(settings);
         self.busy = true;
         self.failed = false;
         self.status = "Saving token and testing connection…".into();
@@ -150,7 +186,11 @@ impl HostCredentials {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    image_forger::remote::test_connection(&url, has_token.then_some(token.as_str()))
+                    image_forger::remote::test_pinned_connection(
+                        &url,
+                        has_token.then_some(token.as_str()),
+                        &pin,
+                    )
                 })
                 .await;
             let _ = view.update(cx, |view, cx| {
@@ -222,6 +262,7 @@ impl Render for HostCredentials {
             .gap_2()
             .w_full()
             .child(Input::new(&self.input).disabled(self.busy))
+            .child(Input::new(&self.identity_input).disabled(self.busy))
             .child(
                 div()
                     .flex()
