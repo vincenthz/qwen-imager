@@ -1,10 +1,11 @@
 use gpui::{prelude::*, *};
-use gpui_component::{Root, Theme, ThemeMode, TitleBar};
+use gpui_component::{Root, Theme, TitleBar};
 use std::borrow::Cow;
 
 mod credentials;
 mod errors;
 mod models;
+mod palette;
 mod settings;
 mod timing;
 mod window;
@@ -31,6 +32,8 @@ impl AssetSource for Assets {
             "icons/workflow.svg" => Some(Cow::Borrowed(include_bytes!("assets/workflow.svg"))),
             "icons/trash.svg" => Some(Cow::Borrowed(include_bytes!("assets/trash.svg"))),
             "icons/server.svg" => Some(Cow::Borrowed(include_bytes!("assets/server.svg"))),
+            "icons/sun.svg" => Some(Cow::Borrowed(include_bytes!("assets/sun.svg"))),
+            "icons/moon.svg" => Some(Cow::Borrowed(include_bytes!("assets/moon.svg"))),
             _ => None,
         })
     }
@@ -50,6 +53,8 @@ impl AssetSource for Assets {
             "icons/workflow.svg",
             "icons/trash.svg",
             "icons/server.svg",
+            "icons/sun.svg",
+            "icons/moon.svg",
         ]
         .into_iter()
         .filter(|asset| asset.starts_with(path))
@@ -66,8 +71,9 @@ fn main() {
             cx.set_global(errors::ErrorReports::default());
             let settings = settings::Settings::load();
             cx.set_global(settings.backend.clone());
+            let appearance = settings.appearance;
             cx.set_global(settings);
-            Theme::change(ThemeMode::Dark, None, cx);
+            Theme::change(appearance.mode(), None, cx);
             // Bound after gpui_component so Cmd-Enter in the prompt generates
             // instead of inserting a newline like Enter.
             cx.bind_keys([

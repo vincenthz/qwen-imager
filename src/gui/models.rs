@@ -1,11 +1,12 @@
 //! App-wide, CPU-only cache checks and explicitly requested model downloads.
 use std::thread;
 
-use gpui::{Context, Task};
+use gpui::{Context, Rgba, Task};
 use image_forger::{
     CancellationToken, Cancelled, Checkpoint, DownloadProgress, Generator, ModelOptions,
 };
 
+use crate::palette::Palette;
 use crate::settings::{Backend, model_label};
 
 #[derive(Clone, Debug)]
@@ -81,12 +82,12 @@ impl ModelState {
         }
     }
 
-    pub fn color(&self) -> u32 {
+    pub fn color(&self, palette: Palette) -> Rgba {
         match self {
-            Self::Ready => 0x75cfb8,
-            Self::Downloading { .. } => 0x8aa6ff,
-            Self::Failed(_) => 0xf1ae75,
-            _ => 0x9da6b5,
+            Self::Ready => palette.success,
+            Self::Downloading { .. } => palette.accent,
+            Self::Failed(_) => palette.warning,
+            _ => palette.muted,
         }
     }
 }

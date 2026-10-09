@@ -4,7 +4,7 @@ use std::{
 };
 
 use gpui::{
-    Context, Entity, MouseButton, ScrollHandle, Subscription, Window, div, prelude::*, px, relative, rgb, rgba,
+    Context, Entity, MouseButton, ScrollHandle, Subscription, Window, div, prelude::*, px, relative, rgba,
 };
 use gpui_component::{
     Disableable, Icon, Selectable, Sizable as _, TitleBar,
@@ -16,7 +16,10 @@ use image_forger::{Checkpoint, ModelOptions, SharedModel};
 
 use crate::{
     models::{Models, ModelState},
-    settings::{Backend, Settings, SettingsEvent, SettingsPanel, model_label, select_backend},
+    palette::{Appearance, palette},
+    settings::{
+        Backend, Settings, SettingsEvent, SettingsPanel, model_label, select_appearance, select_backend,
+    },
     window::{ImageWindow, WorkspaceActivity},
 };
 
@@ -174,14 +177,14 @@ impl Workspaces {
                 let state = &entry.state;
                 div().flex().flex_col().gap(px(1.))
                     .child(Button::new(("model-status", index)).ghost().xsmall()
-                        .icon(Icon::default().path(if matches!(state, ModelState::Ready) { "icons/downloaded.svg" } else { "icons/download.svg" }).text_color(rgb(state.color())))
+                        .icon(Icon::default().path(if matches!(state, ModelState::Ready) { "icons/downloaded.svg" } else { "icons/download.svg" }).text_color(state.color(palette(cx))))
                         .label(model_label(entry.checkpoint))
                         .tooltip(format!("{}: {} — open model downloads", model_label(entry.checkpoint), state.label()))
                         .on_click(cx.listener(|view, _, window, cx| view.open_settings(true, window, cx))))
                     .child(div().h(px(3.)).w_full().rounded_md().overflow_hidden()
-                        .when(state.is_downloading(), |bar| bar.bg(rgb(0x303640)))
+                        .when(state.is_downloading(), |bar| bar.bg(palette(cx).border))
                         .when_some(state.fraction(), |bar, fraction| bar.child(
-                            div().h_full().w(relative(fraction)).bg(rgb(0x8aa6ff)))))
+                            div().h_full().w(relative(fraction)).bg(palette(cx).accent))))
             }))
     }
 
@@ -199,14 +202,14 @@ impl Render for Workspaces {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x15171b))
-            .text_color(rgb(0xe4e7ec))
+            .bg(palette(cx).background)
+            .text_color(palette(cx).text)
             .child(
                 TitleBar::new()
                     .child(
                         div()
                             .text_sm()
-                            .text_color(rgb(0x9da6b5))
+                            .text_color(palette(cx).muted)
                             .child("ImageForger"),
                     )
                     .child(
@@ -266,6 +269,23 @@ impl Render for Workspaces {
                                         view.open_unread(window, cx)
                                     })),
                             )
+                            .child({
+                                let appearance = cx.global::<Settings>().appearance;
+                                Button::new("appearance")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::default().path(match appearance {
+                                        Appearance::Dark => "icons/sun.svg",
+                                        Appearance::Light => "icons/moon.svg",
+                                    }))
+                                    .tooltip(match appearance {
+                                        Appearance::Dark => "Switch to light theme",
+                                        Appearance::Light => "Switch to dark theme",
+                                    })
+                                    .on_click(move |_, _, cx| {
+                                        select_appearance(appearance.toggled(), cx)
+                                    })
+                            })
                             .child(
                                 Button::new("settings")
                                     .ghost()

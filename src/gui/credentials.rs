@@ -1,6 +1,7 @@
 //! Per-endpoint Bearer credentials live in Keychain, never in settings.json.
 use anyhow::{Context as _, Result};
-use gpui::{App, Context, Entity, Task, Window, div, prelude::*, rgb};
+use crate::palette::palette;
+use gpui::{App, Context, Entity, Task, Window, div, prelude::*};
 use gpui_component::{
     Disableable, Sizable,
     button::Button,
@@ -287,7 +288,7 @@ impl Render for HostCredentials {
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(if self.failed { 0xf1ae75 } else { 0x9da6b5 }))
+                    .text_color({ let p = palette(cx); if self.failed { p.warning } else { p.muted } })
                     .child(self.status.clone()),
             )
     }

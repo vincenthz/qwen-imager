@@ -4,10 +4,10 @@ use crate::credentials::HostCredentials;
 use anyhow::Context as _;
 use gpui::{
     App, Context, Entity, EventEmitter, Global, SharedString, Subscription, WeakEntity, Window, div, prelude::*,
-    px, relative, rgb,
+    px, relative,
 };
 use gpui_component::{
-    Disableable, Icon, Sizable as _,
+    Disableable, Icon, Sizable as _, Theme,
     scroll::ScrollableElement as _,
     button::{Button, ButtonVariants as _},
     input::{Input, InputState},
@@ -18,6 +18,7 @@ use gpui_component::{
 };
 use image_forger::Checkpoint;
 use crate::models::{Models, ModelState};
+use crate::palette::{Appearance, palette};
 use serde::{Deserialize, Serialize};
 
 /// Which machine runs inference. [`Backend::Local`] uses this Mac; a remote
@@ -57,6 +58,17 @@ pub fn select_backend(backend: Backend, cx: &mut App) {
     cx.set_global(backend);
 }
 
+pub fn select_appearance(appearance: Appearance, cx: &mut App) {
+    let mut settings = cx.global::<Settings>().clone();
+    settings.appearance = appearance;
+    if let Err(error) = settings.save() {
+        crate::errors::report("Saving appearance settings", &error, cx);
+    }
+    // Switch even if saving failed; only the next launch loses the choice.
+    cx.set_global(settings);
+    Theme::change(appearance.mode(), None, cx);
+}
+
 /// Application-wide preferences, persisted between launches.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -80,6 +92,8 @@ pub struct Settings {
     pub server_identities: HashMap<String, String>,
     /// Last selected compute backend; local model files are optional for remote hosts.
     pub backend: Backend,
+    /// Light or dark interface.
+    pub appearance: Appearance,
 }
 
 impl Default for Settings {
@@ -95,6 +109,7 @@ impl Default for Settings {
             servers: Vec::new(),
             server_identities: HashMap::new(),
             backend: Backend::Local,
+            appearance: Appearance::default(),
         }
     }
 }
@@ -274,20 +289,20 @@ fn servers_field(
                 .h(px(320.))
                 .rounded_md()
                 .border_1()
-                .border_color(rgb(0x303640))
+                .border_color(palette(cx).border)
                 .overflow_y_scrollbar()
                 .when(servers.is_empty(), |list| {
                     list.child(
                         div()
                             .p_3()
                             .text_sm()
-                            .text_color(rgb(0x8b93a1))
+                            .text_color(palette(cx).subtle)
                             .child("No hosts. Inference runs on this Mac."),
                     )
                 })
                 .children(servers.iter().enumerate().map(|(index, server)| {
                     div().flex().flex_col().gap_2().px_3().py_3()
-                        .when(index > 0, |row| row.border_t_1().border_color(rgb(0x303640)))
+                        .when(index > 0, |row| row.border_t_1().border_color(palette(cx).border))
                         .child(div().flex().items_center().gap_2()
                             .child(div().flex_1().min_w_0().truncate().text_sm().child(server.clone()))
                             .child(Button::new(("remove-server", index)).xsmall().ghost()
@@ -367,14 +382,14 @@ fn models_field(models: &Entity<Models>, cx: &mut App) -> gpui::AnyElement {
             let download = models.clone();
             let cancel = models.clone();
             let state = &entry.state;
-            div().flex().flex_col().gap_2().p_3().rounded_md().border_1().border_color(rgb(0x303640))
+            div().flex().flex_col().gap_2().p_3().rounded_md().border_1().border_color(palette(cx).border)
                 .child(div().flex().items_center().gap_2()
-                    .child(Icon::default().path(if matches!(state, ModelState::Ready) { "icons/downloaded.svg" } else { "icons/download.svg" }).text_color(rgb(state.color())))
+                    .child(Icon::default().path(if matches!(state, ModelState::Ready) { "icons/downloaded.svg" } else { "icons/download.svg" }).text_color(state.color(palette(cx))))
                     .child(div().flex_1().text_sm().child(format!("{} · about {} GB", model_label(entry.checkpoint), entry.checkpoint.download_gb()))))
-                .child(div().text_xs().text_color(rgb(state.color())).child(state.label()))
+                .child(div().text_xs().text_color(state.color(palette(cx))).child(state.label()))
                 .when_some(state.fraction(), |row, fraction| row.child(
-                    div().h(px(4.)).w_full().rounded_md().overflow_hidden().bg(rgb(0x303640))
-                        .child(div().h_full().w(relative(fraction)).bg(rgb(0x8aa6ff)))))
+                    div().h(px(4.)).w_full().rounded_md().overflow_hidden().bg(palette(cx).border)
+                        .child(div().h_full().w(relative(fraction)).bg(palette(cx).accent))))
                 .child(div().flex().gap_2()
                     .when(state.is_downloading(), |row| row.child(
                         Button::new(("cancel-model", index)).small()
@@ -410,8 +425,8 @@ impl Render for SettingsPanel {
             .max_h_full()
             .rounded_lg()
             .border_1()
-            .border_color(rgb(0x303640))
-            .bg(rgb(0x1c1f24))
+            .border_color(palette(cx).border)
+            .bg(palette(cx).panel)
             .shadow_lg()
             .overflow_hidden()
             .child(
@@ -422,7 +437,7 @@ impl Render for SettingsPanel {
                     .px_4()
                     .py_3()
                     .border_b_1()
-                    .border_color(rgb(0x303640))
+                    .border_color(palette(cx).border)
                     .child(div().text_lg().child("Settings"))
                     .child(
                         Button::new("settings-done")
@@ -709,6 +724,7 @@ mod tests {
             servers: vec!["192.168.1.5:6996".into()],
             server_identities: HashMap::from([("http://192.168.1.5:6996".into(), "ab".repeat(32))]),
             backend: Backend::Remote { address: "192.168.1.5:6996".into() },
+            appearance: Appearance::Light,
         };
         let json = serde_json::to_vec(&settings).unwrap();
         assert!(String::from_utf8_lossy(&json).contains(r#""model":"mlx-4bit""#));

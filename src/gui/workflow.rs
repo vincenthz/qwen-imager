@@ -2,6 +2,7 @@
 //! Graph execution is deliberately separate from the existing single-image runner.
 use std::{cell::Cell, collections::HashSet, rc::Rc};
 
+use crate::palette::{Palette, palette};
 use gpui::{
     Bounds, Context, CursorStyle, FocusHandle, MouseButton, MouseDownEvent, MouseMoveEvent,
     PathBuilder, Pixels, Point, Window, canvas, div, point, prelude::*, px, rgb, size,
@@ -480,7 +481,7 @@ impl WorkflowCanvas {
         cx.notify();
     }
 
-    fn card(&self, node: &Node) -> impl IntoElement {
+    fn card(&self, node: &Node, palette: Palette) -> impl IntoElement {
         let zoom = self.viewport.zoom;
         let p = self.viewport.screen(node.position);
         let selected = self.selected == Some(node.id);
@@ -492,9 +493,9 @@ impl WorkflowCanvas {
             .h(px(HEIGHT * zoom))
             .rounded(px(10. * zoom))
             .border_1()
-            .border_color(rgb(if selected { 0x8aa6ff } else { 0x414957 }))
-            .bg(rgb(0x232730))
-            .text_color(rgb(0xe4e7ec))
+            .border_color(if selected { palette.accent } else { palette.node_border })
+            .bg(palette.node)
+            .text_color(palette.text)
             .cursor(CursorStyle::OpenHand)
             .child(
                 div()
@@ -510,7 +511,7 @@ impl WorkflowCanvas {
                     .left(px(16. * zoom))
                     .top(px(35. * zoom))
                     .text_size(px(11. * zoom))
-                    .text_color(rgb(0x9da6b5))
+                    .text_color(palette.muted)
                     .child(node.kind.caption()),
             )
             .children(
@@ -540,7 +541,7 @@ impl WorkflowCanvas {
                                     .left(px(21. * zoom))
                                     .top(px(-2. * zoom))
                                     .text_size(px(11. * zoom))
-                                    .text_color(rgb(0xc4cad4))
+                                    .text_color(palette.strong_text)
                                     .child(*label),
                             )
                     }),
@@ -562,7 +563,7 @@ impl WorkflowCanvas {
                         .right(px(15. * zoom))
                         .top(px(70. * zoom))
                         .text_size(px(11. * zoom))
-                        .text_color(rgb(0xc4cad4))
+                        .text_color(palette.strong_text)
                         .child(match ty {
                             DataType::Text => "Text",
                             DataType::Image => "Image",
@@ -571,7 +572,7 @@ impl WorkflowCanvas {
             })
     }
 
-    fn wires(&self) -> impl IntoElement {
+    fn wires(&self, palette: Palette) -> impl IntoElement {
         let record = self.bounds.clone();
         let viewport = self.viewport;
         let mut wires: Vec<_> = self
@@ -614,7 +615,7 @@ impl WorkflowCanvas {
                                     bounds.origin + point(px(x), px(y)),
                                     size(px(1.5), px(1.5)),
                                 ),
-                                rgb(0x353b47),
+                                palette.grid,
                             ));
                             y += gap;
                         }
@@ -666,10 +667,10 @@ impl Render for WorkflowCanvas {
                     })))
                 .child(Button::new("workflow-remove").small().label("Remove").disabled(self.selected.is_none())
                     .on_click(cx.listener(|view, _, _, cx| view.delete_selected(cx)))))
-            .child(div().px_3().pb_2().text_xs().text_color(rgb(0x9da6b5))
+            .child(div().px_3().pb_2().text_xs().text_color(palette(cx).muted)
                 .child("Workflow canvas · Arrange and connect nodes. Configuration and execution are coming later."))
             .child(div().id("workflow-canvas").track_focus(&self.focus)
-                .relative().flex_1().min_h_0().overflow_hidden().bg(rgb(0x181b20)).cursor(CursorStyle::OpenHand)
+                .relative().flex_1().min_h_0().overflow_hidden().bg(palette(cx).canvas).cursor(CursorStyle::OpenHand)
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::begin))
                 .on_mouse_down(MouseButton::Middle, cx.listener(Self::begin))
                 .on_mouse_move(cx.listener(|view, event, _, cx| view.motion(event, cx)))
@@ -697,9 +698,9 @@ impl Render for WorkflowCanvas {
                     }
                     cx.stop_propagation();
                 }))
-                .child(self.wires())
-                .children(self.graph.nodes.iter().map(|node| self.card(node))))
-            .child(div().flex().flex_wrap().items_center().gap_2().p_3().text_xs().text_color(rgb(0x9da6b5))
+                .child(self.wires(palette(cx)))
+                .children(self.graph.nodes.iter().map(|node| self.card(node, palette(cx)))))
+            .child(div().flex().flex_wrap().items_center().gap_2().p_3().text_xs().text_color(palette(cx).muted)
                 .child(Button::new("workflow-zoom-out").small().label("−").tooltip("Zoom out")
                     .disabled(self.viewport.zoom <= MIN_ZOOM).on_click(cx.listener(|view, _, _, cx| view.zoom(1. / 1.2, cx))))
                 .child(format!("{:.0}%", self.viewport.zoom * 100.))
@@ -707,7 +708,7 @@ impl Render for WorkflowCanvas {
                     .disabled(self.viewport.zoom >= MAX_ZOOM).on_click(cx.listener(|view, _, _, cx| view.zoom(1.2, cx))))
                 .child(Button::new("workflow-fit").small().label("Fit all").on_click(cx.listener(|view, _, _, cx| view.fit(cx))))
                 .child("Drag background / scroll to pan · ⌘ or Ctrl + scroll to zoom"))
-            .child(div().px_3().pb_3().text_xs().text_color(rgb(0xb8c2d2)).child(self.message.clone()))
+            .child(div().px_3().pb_3().text_xs().text_color(palette(cx).message).child(self.message.clone()))
     }
 }
 

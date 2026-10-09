@@ -15,6 +15,7 @@ use crate::{
     timing::{GenerationTiming, format_duration},
 };
 
+use crate::palette::{Palette, palette};
 use gpui::{
     Bounds, Context, CursorStyle, DevicePixels, Entity, MouseButton, MouseDownEvent,
     MouseMoveEvent, ObjectFit, PathBuilder, Pixels, Point, RenderImage, Task,
@@ -1270,8 +1271,8 @@ impl Render for ImageWindow {
         div()
             .size_full()
             .flex()
-            .bg(rgb(0x15171b))
-            .text_color(rgb(0xe4e7ec))
+            .bg(palette(cx).background)
+            .text_color(palette(cx).text)
             .on_action(cx.listener(|view, _: &Generate, window, cx| view.generate(window, cx)))
             .child(self.sidebar(cx))
             .child(match mode {
@@ -1361,18 +1362,18 @@ impl ImageWindow {
                     .w_full()
                     .rounded_md()
                     .overflow_hidden()
-                    .bg(rgb(0x303640))
+                    .bg(palette(cx).border)
                     .child(
                         div()
                             .h_full()
                             .w(relative(self.progress.clamp(0., 1.)))
-                            .bg(rgb(0x8aa6ff)),
+                            .bg(palette(cx).accent),
                     ),
             )
             .child(div().flex().flex_wrap().items_center().justify_between().gap_2().text_sm()
                 .child(if self.paused { format!("Paused · {}", self.status) } else { self.status.clone() })
                 .map(|row| match &self.timing {
-                    Some(timing) => row.child(div().text_color(rgb(0x9da6b5)).child(timing.label())),
+                    Some(timing) => row.child(div().text_color(palette(cx).muted).child(timing.label())),
                     None => row,
                 })
                 .when(self.completed, |row| row.child(
@@ -1420,7 +1421,7 @@ impl ImageWindow {
                             cx.notify();
                         })))
                     .when_some(crop_region, |row, [_, _, width, height]| row.child(
-                        div().text_color(rgb(0x9da6b5)).child(format!("{width}×{height}"))))
+                        div().text_color(palette(cx).muted).child(format!("{width}×{height}"))))
                     .child(Button::new("apply-crop").label("Apply").disabled(crop_region.is_none())
                         .tooltip("Crop the reference to the selection")
                         .on_click(cx.listener(|view, _, window, cx| view.apply_crop(window, cx))))
@@ -1435,7 +1436,7 @@ impl ImageWindow {
                         let selected = self.paint_color == color;
                         div().id(color.name()).w(px(24.)).h(px(24.)).rounded_full()
                             .border_2()
-                            .border_color(if selected { rgb(0x8aa6ff) } else { rgb(0x303640) })
+                            .border_color(if selected { palette(cx).accent } else { palette(cx).border })
                             .bg(rgb(color.hex()))
                             .cursor_pointer()
                             .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(color.name()).build(window, cx))
@@ -1487,7 +1488,7 @@ impl ImageWindow {
             .justify_center()
             .rounded_md()
             .overflow_hidden()
-            .bg(rgb(0x22262d))
+            .bg(palette(cx).card)
             .relative()
             .map(|container| match self.painting.and_then(|index| self.references.get(index)) {
                 Some(reference) => {
@@ -1507,7 +1508,7 @@ impl ImageWindow {
                         .child(img(reference.preview.clone()).size_full().object_fit(ObjectFit::Contain))
                         .child(stroke_overlay(reference, Some(bounds)))
                         .when_some(self.crop.filter(|_| self.tool == Tool::Crop), |container, crop| {
-                            container.child(crop_overlay(crop_bounds(crop, dimensions, self.square_crop), dimensions))
+                            container.child(crop_overlay(crop_bounds(crop, dimensions, self.square_crop), dimensions, palette(cx)))
                         })
                 }
                 None => container.map(|container| match self.viewing.as_ref().or_else(|| self.before.as_ref().filter(|_| self.showing_before)).or(self.rendered.as_ref()).or_else(|| self.references.last().map(|reference| &reference.preview)) {
@@ -1518,18 +1519,18 @@ impl ImageWindow {
                 ),
                 None => container.child(
                     div()
-                        .text_color(rgb(0x9da6b5))
+                        .text_color(palette(cx).muted)
                         .child("Your image will appear here"),
                 ),
             })})
             .when(self.before.is_some() && self.painting.is_none(), |container| container.child(
                 div().absolute().top_2().left_2().px_2().py_1().rounded_md().text_xs()
-                    .bg(rgb(0x15171b)).text_color(rgb(0xe4e7ec))
+                    .bg(palette(cx).background).text_color(palette(cx).text)
                     .child(if self.showing_before { "Before" } else { "After" })))
             .when(!self.completed && self.painting.is_none() && self.rendered.is_some(), |container| {
                 container.when_some(self.preview_step, |container, step| container.child(
                     div().absolute().top_2().left_2().px_2().py_1().rounded_md().text_xs()
-                        .bg(rgb(0x15171b)).text_color(rgb(0xe4e7ec))
+                        .bg(palette(cx).background).text_color(palette(cx).text)
                         .child(format!("Preview · step {step}"))))
             })
     }
@@ -1546,7 +1547,7 @@ impl ImageWindow {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().text_sm().text_color(rgb(0x9da6b5)).child("Preview"))
+                    .child(div().text_sm().text_color(palette(cx).muted).child("Preview"))
                     .child(
                         Button::new("save")
                             .icon(Icon::default().path("icons/save.svg"))
@@ -1567,8 +1568,8 @@ impl ImageWindow {
             .gap_2()
             .p_2()
             .rounded_md()
-            .bg(rgb(0x1c1f24))
-            .child(div().text_sm().text_color(rgb(0x9da6b5)).child("References"))
+            .bg(palette(cx).panel)
+            .child(div().text_sm().text_color(palette(cx).muted).child("References"))
             .child(
                 Button::new("add-images")
                     .w_full()
@@ -1623,11 +1624,11 @@ impl ImageWindow {
                                     .rounded_md()
                                     .border_1()
                                     .border_color(if selected {
-                                        rgb(0x8aa6ff)
+                                        palette(cx).accent
                                     } else {
-                                        rgb(0x303640)
+                                        palette(cx).border
                                     })
-                                    .bg(rgb(0x22262d))
+                                    .bg(palette(cx).card)
                                     .when(!self.busy && !self.loading_image, |tile| {
                                         tile.cursor_pointer()
                                     })
@@ -1687,8 +1688,8 @@ impl ImageWindow {
             .gap_2()
             .p_2()
             .rounded_md()
-            .bg(rgb(0x1c1f24))
-            .child(div().text_sm().text_color(rgb(0x9da6b5)).child("History"))
+            .bg(palette(cx).panel)
+            .child(div().text_sm().text_color(palette(cx).muted).child("History"))
             .child(
                 div()
                     .id("history-list")
@@ -1718,8 +1719,8 @@ impl ImageWindow {
                                     .overflow_hidden()
                                     .rounded_md()
                                     .border_1()
-                                    .border_color(rgb(0x303640))
-                                    .bg(rgb(0x22262d))
+                                    .border_color(palette(cx).border)
+                                    .bg(palette(cx).card)
                                     .cursor_pointer()
                                     .on_click(cx.listener(move |view, _, _, cx| {
                                         view.view_history(index, cx)
@@ -1769,7 +1770,7 @@ impl ImageWindow {
                         list.child(
                             div()
                                 .text_sm()
-                                .text_color(rgb(0x9da6b5))
+                                .text_color(palette(cx).muted)
                                 .child("No generations yet."),
                         )
                     }),
@@ -1787,8 +1788,8 @@ impl ImageWindow {
             .py_2()
             .flex_shrink_0()
             .border_r_1()
-            .border_color(rgb(0x303640))
-            .bg(rgb(0x1c1f24))
+            .border_color(palette(cx).border)
+            .bg(palette(cx).panel)
             .children(Mode::ALL.into_iter().enumerate().map(|(index, mode)| {
                 Button::new(("mode", index))
                     .ghost()
@@ -1871,7 +1872,7 @@ impl ImageWindow {
                         self.status.clone()
                     })
                     .when_some(self.timing.as_ref(), |row, timing| {
-                        row.child(div().text_color(rgb(0x9da6b5)).child(timing.label()))
+                        row.child(div().text_color(palette(cx).muted).child(timing.label()))
                     }),
             )
     }
@@ -2035,6 +2036,7 @@ fn crop_strokes(
 fn crop_overlay(
     (left, top, right, bottom): (f32, f32, f32, f32),
     dimensions: (u32, u32),
+    palette: Palette,
 ) -> impl IntoElement {
     canvas(
         |_, _, _| {},
@@ -2058,7 +2060,7 @@ fn crop_overlay(
             }
             window.paint_quad(gpui::outline(
                 Bounds::from_corners(at(left, top), at(right, bottom)),
-                rgb(0x8aa6ff),
+                palette.accent,
                 gpui::BorderStyle::default(),
             ));
         },
