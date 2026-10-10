@@ -308,11 +308,15 @@ fn run_inner(
         .to_owned();
     let width = view["width"].as_u64().unwrap_or(0) as u32;
     let height = view["height"].as_u64().unwrap_or(0) as u32;
+    // The server's checkpoint decides the step count; Turbo ignores the request's.
+    let total_steps = view["total_steps"]
+        .as_u64()
+        .map_or(request.steps, |steps| steps as usize);
 
     on_event(Event::Started {
         width,
         height,
-        steps: request.steps,
+        steps: total_steps,
         seed: request.seed,
     });
 
@@ -346,7 +350,7 @@ fn run_inner(
             for step in completed_steps + 1..=steps {
                 on_event(Event::StepFinished {
                     step,
-                    total: request.steps,
+                    total: total_steps,
                     duration,
                 });
             }
@@ -362,7 +366,7 @@ fn run_inner(
                 {
                     Ok(image) => on_event(Event::Preview {
                         step,
-                        total: request.steps,
+                        total: total_steps,
                         image,
                     }),
                     Err(error) => log(

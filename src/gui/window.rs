@@ -1285,6 +1285,13 @@ impl Render for ImageWindow {
 
 impl ImageWindow {
     fn advanced(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        // A local checkpoint with a saved schedule ignores the requested steps.
+        let fixed_steps = {
+            let settings = cx.global::<Settings>();
+            (settings.backend == Backend::Local)
+                .then(|| settings.model.sample_sigmas().map(<[f64]>::len))
+                .flatten()
+        };
         // A running generation keeps the preview settings it started with.
         let previews = if self.busy {
             self.previews
@@ -1333,8 +1340,11 @@ impl ImageWindow {
             )
             .child(div().flex().flex_wrap().items_center().gap_3()
                 .child(div().flex().items_center().gap_2()
-                    .child("Steps")
-                    .child(Input::new(&self.steps).w(px(72.)).disabled(self.busy)))
+                    .child(match fixed_steps {
+                        Some(steps) => format!("Steps (fixed at {steps})"),
+                        None => "Steps".into(),
+                    })
+                    .child(Input::new(&self.steps).w(px(72.)).disabled(self.busy || fixed_steps.is_some())))
                 .child(div().flex().items_center().gap_2()
                     .child("Size (px)")
                     .child(Input::new(&self.size).w(px(80.)).disabled(self.busy)))

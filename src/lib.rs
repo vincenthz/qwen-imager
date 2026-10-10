@@ -46,7 +46,7 @@ pub struct ModelOptions {
     /// Keep checkpoint files unchanged while the generator exists (they are mapped).
     pub model_dir: Option<PathBuf>,
     pub offline: bool,
-    /// Original BF16 weights (the default) or an MLX-quantized pack.
+    /// Original BF16 weights (the default), an MLX-quantized pack, or Turbo.
     pub checkpoint: Checkpoint,
 }
 
@@ -69,6 +69,8 @@ pub struct Request {
     pub ratio: Option<String>,
     /// Fraction of native 2K resolution, in (0, 1].
     pub scale: f64,
+    /// Denoising steps. Checkpoints with a saved schedule (Turbo) sample their
+    /// own step count instead; `Event::Started` reports the steps actually run.
     pub steps: usize,
     pub seed: u64,
     /// Experimental shared noise: generate at this square pixel size, then use

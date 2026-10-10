@@ -202,6 +202,8 @@ struct Job {
     stage_completed: usize,
     stage_total: usize,
     completed_steps: usize,
+    /// Steps the checkpoint samples; Turbo ignores the requested count.
+    total_steps: usize,
     last_step_s: Option<f64>,
     started: Option<Instant>,
     elapsed_s: Option<f64>,
@@ -223,7 +225,7 @@ impl Job {
             "width": self.width, "height": self.height, "created_unix_ms": self.created_ms,
             "stage": self.stage, "stage_completed": self.stage_completed, "stage_total": self.stage_total,
             "reference_index": self.reference_index,
-            "completed_steps": self.completed_steps, "total_steps": self.parameters.steps,
+            "completed_steps": self.completed_steps, "total_steps": self.total_steps,
             "last_step_s": self.last_step_s,
             "elapsed_s": self.elapsed_s.or_else(|| self.started.map(|s| s.elapsed().as_secs_f64())),
             "error": self.error.as_ref().map(|_| "Generation failed; see server diagnostics"), "preview_pending": self.preview_pending,
@@ -288,7 +290,7 @@ impl Job {
                     .as_ref()
                     .filter(|p| Arc::ptr_eq(&p.pixels, &result.image))
                     .cloned()
-                    .unwrap_or_else(|| Image::new(result.image, self.parameters.steps));
+                    .unwrap_or_else(|| Image::new(result.image, self.total_steps));
                 self.preview = Some(image.clone());
                 self.output = Some(image);
             }
@@ -419,6 +421,7 @@ impl Service {
             stage_completed: 0,
             stage_total: 0,
             completed_steps: 0,
+            total_steps: self.checkpoint.steps(request.steps),
             last_step_s: None,
             started: None,
             elapsed_s: None,

@@ -71,7 +71,7 @@ use `--serve --http-debug` for additional request-start and generation-progress
 logs. See [Service diagnostics](docs/http-api.md#service-diagnostics).
 
 To generate on this Mac, open **Settings → Models** and click **Download** for the
-desired checkpoint (about 32 GB for BF16, 18 GB for MLX 8-bit, 11 GB for MLX 4-bit).
+desired checkpoint (about 32 GB for BF16 or Turbo, 18 GB for MLX 8-bit, 11 GB for MLX 4-bit).
 Downloads are optional and only start when requested. They continue while Settings
 is closed or you switch workspaces or compute hosts. Each model has its own
 download, cancel, resume, and retry controls. Existing cached files are reused;
@@ -231,6 +231,14 @@ shaders at runtime; the separate Xcode Metal shader compiler is not required.
 | `bf16` (default) | [`Qwen/Qwen-Image-2.1`](https://huggingface.co/Qwen/Qwen-Image-2.1) | ~32 GB | ~14.2 GiB |
 | `mlx-8bit` | [`ddalcu/Qwen-Image-2.1-MLX-Serve-8bit`](https://huggingface.co/ddalcu/Qwen-Image-2.1-MLX-Serve-8bit) | ~18 GB | ~7.7 GiB (estimated) |
 | `mlx-4bit` | [`ddalcu/Qwen-Image-2.1-MLX-Serve-4bit`](https://huggingface.co/ddalcu/Qwen-Image-2.1-MLX-Serve-4bit) | ~11 GB | ~4.5 GiB (estimated) |
+| `turbo` | [`Qwen/Qwen-Image-2.1-Turbo`](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo) | ~32 GB | ~14.2 GiB |
+
+Turbo is an accelerated BF16 checkpoint of the same architecture. It always
+samples the 8-step sigma schedule saved in its `model_index.json`, so the
+requested step count is ignored: the CLI warns on an explicit `--steps`, the
+GUI shows the fixed count for local generation, and HTTP jobs report
+`total_steps: 8`. Its text encoder ships as one unsharded file and its VAE in
+BF16; both load like the original's.
 
 The MLX packs keep the original's Diffusers layout and key names. The 32
 denoiser blocks and the text encoder's layers are MLX affine-quantized (group
@@ -413,7 +421,8 @@ cargo build --release
 Requires an Apple Silicon Mac with Metal access, Rust, and Xcode command line
 tools. By default this runs the full BF16 checkpoint: weights occupy about
 32 GB on disk and inference needs substantial unified memory. `--model mlx-4bit`
-or `--model mlx-8bit` selects a quantized pack instead (see
+or `--model mlx-8bit` selects a quantized pack instead, and `--model turbo` the
+8-step Turbo checkpoint (see
 [Checkpoints](#checkpoints)). Start with `--scale 0.25` on a memory-constrained
 machine. Larger resolutions and multiple references increase working memory.
 
@@ -426,7 +435,7 @@ existing Diffusers snapshot of the selected `--model`, with `processor/`,
 is loaded. Keep its files unchanged while the generator exists. Checkpoint
 revisions are pinned in `src/weights.rs`.
 
-Defaults: native 2K size, 40 steps, seed 42, `out.png`. Without `-r`, editing
+Defaults: native 2K size, 40 steps (8, fixed, for Turbo), seed 42, `out.png`. Without `-r`, editing
 follows the last reference's aspect ratio. Dimensions are rounded down to
 multiples of 32; reference images are resized to approximately 1 megapixel.
 `--scale` accepts values greater than zero and at most one. Reference images may

@@ -187,7 +187,7 @@ never accepted.
 | `prompt` | Required | Nonblank text, at most 16,384 UTF-8 bytes |
 | `ratio` | `null` (last reference ratio, or square) | `1:1`, `4:3`, `3:4`, `3:2`, `2:3`, `16:9`, `9:16` |
 | `scale` | `1.0` | Fraction of native 2K size, greater than zero and at most one; `0.25` gives square 512px |
-| `steps` | `40` | 1–1000 denoising steps |
+| `steps` | `40` | 1–1000 denoising steps; ignored by `--model turbo`, which samples a fixed 8 |
 | `seed` | `42` | Unsigned 64-bit integer |
 | `preview_mode` | `"manual"` | `"manual"`, `"auto"`, or `"off"` |
 | `preview_every` | `5` | Positive interval used in `auto` mode |
@@ -213,7 +213,8 @@ image endpoints in all modes. Preview settings must be chosen at submission.
   counts reset between loading, reference vision, text encoding, reference
   encoding, denoiser loading, sampling, and decoding; they are not a whole-job percentage.
 - `completed_steps` and `total_steps` report sampling progress independently of
-  preview progress. `last_step_s` is the latest step's duration.
+  preview progress. `total_steps` is the count the checkpoint samples, which
+  for Turbo is 8 regardless of `parameters.steps`. `last_step_s` is the latest step's duration.
 - `elapsed_s` excludes queue time; it is `null` until the job starts and stops
   increasing on completion.
 - `preview_pending`, `preview_step`, and `preview_url` describe preview readiness.

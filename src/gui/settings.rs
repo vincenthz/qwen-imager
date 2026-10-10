@@ -694,6 +694,7 @@ pub fn model_label(model: Checkpoint) -> &'static str {
         Checkpoint::Original => "BF16",
         Checkpoint::Mlx8Bit => "MLX 8-bit",
         Checkpoint::Mlx4Bit => "MLX 4-bit",
+        Checkpoint::Turbo => "Turbo",
     }
 }
 

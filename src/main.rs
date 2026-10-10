@@ -54,9 +54,9 @@ struct Args {
     /// Scale the native 2K size (0 < scale <= 1)
     #[arg(long, default_value_t = 1.0)]
     scale: f64,
-    /// Denoising steps
-    #[arg(short = 's', long, default_value_t = 40)]
-    steps: usize,
+    /// Denoising steps [default: 40; turbo always samples 8]
+    #[arg(short = 's', long)]
+    steps: Option<usize>,
     /// Random seed (repeatable in Rust; differs from PyTorch's RNG)
     #[arg(long, default_value_t = 42)]
     seed: u64,
@@ -69,7 +69,7 @@ struct Args {
     /// Write parameters and precise stage/step timings to a JSON sidecar
     #[arg(long, value_name = "PATH")]
     metrics: Option<PathBuf>,
-    /// Checkpoint: original BF16 weights, or an MLX-quantized pack
+    /// Checkpoint: original BF16 weights, an MLX-quantized pack, or the 8-step Turbo
     #[arg(long, value_enum, default_value_t = Model::Bf16)]
     model: Model,
     /// Existing Diffusers snapshot directory of the selected --model
@@ -93,6 +93,7 @@ enum Model {
     Mlx4bit,
     #[value(name = "mlx-8bit")]
     Mlx8bit,
+    Turbo,
 }
 
 impl From<Model> for Checkpoint {
@@ -101,6 +102,7 @@ impl From<Model> for Checkpoint {
             Model::Bf16 => Checkpoint::Original,
             Model::Mlx4bit => Checkpoint::Mlx4Bit,
             Model::Mlx8bit => Checkpoint::Mlx8Bit,
+            Model::Turbo => Checkpoint::Turbo,
         }
     }
 }
@@ -145,7 +147,15 @@ fn main() -> anyhow::Result<()> {
         .collect::<anyhow::Result<_>>()?;
     request.ratio = args.ratio;
     request.scale = args.scale;
-    request.steps = args.steps;
+    if let Some(steps) = args.steps {
+        if checkpoint.steps(steps) != steps {
+            eprintln!(
+                "{checkpoint} samples a fixed {} steps; ignoring --steps {steps}",
+                checkpoint.steps(steps)
+            );
+        }
+        request.steps = steps;
+    }
     request.seed = args.seed;
     request.noise_source_size = args.noise_source_size;
     request.attention = match args.attention {
@@ -236,7 +246,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(path) = &args.metrics {
         let (width, height) = request.dimensions()?;
         let report = serde_json::json!({
-            "prompt": request.prompt, "seed": request.seed, "steps": request.steps,
+            "prompt": request.prompt, "seed": request.seed, "steps": checkpoint.steps(request.steps),
             "width": width, "height": height, "noise_source_size": request.noise_source_size,
             "attention": format!("{:?}", request.attention),
             "model": checkpoint.repo(), "revision": checkpoint.revision(),

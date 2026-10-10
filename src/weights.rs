@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// A published Qwen Image 2.1 checkpoint. All use the Diffusers layout and key
 /// names; the MLX packs store most large linear layers affine-quantized.
+/// Turbo is a distilled BF16 denoiser that samples a fixed 8-step schedule.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Checkpoint {
     /// The original BF16 weights, about 32 GB.
@@ -29,16 +30,20 @@ pub enum Checkpoint {
     /// MLX 8-bit denoiser blocks and text encoder, about 18 GB.
     #[serde(rename = "mlx-8bit")]
     Mlx8Bit,
+    /// Qwen-Image-2.1-Turbo BF16 weights, about 32 GB.
+    #[serde(rename = "turbo")]
+    Turbo,
 }
 
 impl Checkpoint {
-    pub const ALL: [Self; 3] = [Self::Original, Self::Mlx4Bit, Self::Mlx8Bit];
+    pub const ALL: [Self; 4] = [Self::Original, Self::Mlx4Bit, Self::Mlx8Bit, Self::Turbo];
 
     pub fn repo(self) -> &'static str {
         match self {
             Self::Original => "Qwen/Qwen-Image-2.1",
             Self::Mlx4Bit => "ddalcu/Qwen-Image-2.1-MLX-Serve-4bit",
             Self::Mlx8Bit => "ddalcu/Qwen-Image-2.1-MLX-Serve-8bit",
+            Self::Turbo => "Qwen/Qwen-Image-2.1-Turbo",
         }
     }
 
@@ -49,6 +54,7 @@ impl Checkpoint {
             Self::Original => "790c92633540aa0cb11d9abf19eb46d861714758",
             Self::Mlx4Bit => "1cdbb51e8f9269ea9f81d76b7190547f9eb3c512",
             Self::Mlx8Bit => "dc21b8d3441eef8f50ee5915dd5ea74679bcf338",
+            Self::Turbo => "d65dbc9a7e8f6b5479e33dee6030eaab2a906509",
         }
     }
 
@@ -58,22 +64,43 @@ impl Checkpoint {
             Self::Original => "bf16",
             Self::Mlx4Bit => "mlx-4bit",
             Self::Mlx8Bit => "mlx-8bit",
+            Self::Turbo => "turbo",
         }
     }
 
     /// Approximate download size in GB.
     pub fn download_gb(self) -> u32 {
         match self {
-            Self::Original => 32,
+            Self::Original | Self::Turbo => 32,
             Self::Mlx4Bit => 11,
             Self::Mlx8Bit => 18,
         }
     }
 
+    /// Sampling sigmas saved with the checkpoint (`sample_sigmas` in its
+    /// `model_index.json`), before the terminal zero. They replace the
+    /// step-count schedule, so requested steps are ignored.
+    pub fn sample_sigmas(self) -> Option<&'static [f64]> {
+        match self {
+            Self::Turbo => Some(&[
+                1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568,
+            ]),
+            _ => None,
+        }
+    }
+
+    /// Denoising steps actually sampled for a request asking for `requested`.
+    pub fn steps(self, requested: usize) -> usize {
+        self.sample_sigmas().map_or(requested, <[f64]>::len)
+    }
+
     /// The MLX packs publish no shard index; their shards are fixed per revision.
+    /// Turbo's text encoder is one unindexed file.
     fn shards(self, component: &str) -> Option<&'static [&'static str]> {
         match (self, component) {
             (Self::Original, _) => None,
+            (Self::Turbo, "text_encoder") => Some(&["model.safetensors"]),
+            (Self::Turbo, _) => None,
             (_, "text_encoder") => Some(&[
                 "model-00001-of-00004.safetensors",
                 "model-00002-of-00004.safetensors",
@@ -319,6 +346,10 @@ impl Weights {
             .into_iter()
             .map(|name| format!("{component}/{name}"))
             .collect())
+    }
+
+    pub fn checkpoint(&self) -> Checkpoint {
+        self.checkpoint
     }
 
     pub fn config<T: DeserializeOwned>(&self, name: &str) -> Result<T> {
@@ -568,6 +599,11 @@ mod tests {
             ]
         );
         assert_eq!(remote.shard_files("text_encoder", &mut no_index)?.len(), 4);
+        let turbo = Weights::new(None, true, Checkpoint::Turbo);
+        assert_eq!(
+            turbo.shard_files("text_encoder", &mut no_index)?,
+            ["text_encoder/model.safetensors"]
+        );
 
         let directory = TempDir::new();
         let local = Weights::new(Some(directory.0.clone()), true, Checkpoint::Mlx8Bit);

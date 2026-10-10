@@ -105,17 +105,19 @@ pub fn run(
     observer: &mut Observer<'_>,
 ) -> Result<Arc<RgbaImage>> {
     let (width, height) = validate(args)?;
+    let checkpoint = weights.checkpoint();
+    let steps = checkpoint.steps(args.steps);
     if let Some(control) = &args.preview_control {
         observer.previews = Some(
             cache
                 .decoder(weights)?
-                .session(control.clone(), args.steps)?,
+                .session(control.clone(), steps)?,
         );
     }
     observer.emit(Event::Started {
         width,
         height,
-        steps: args.steps,
+        steps,
         seed: args.seed,
     })?;
     observer.progress(Stage::Loading, 0, 1)?;
@@ -259,7 +261,10 @@ pub fn run(
     )?;
     drop(encoded);
     drop(reference_latents);
-    let sigmas = schedule(args.steps, h * w);
+    let sigmas = match checkpoint.sample_sigmas() {
+        Some(sigmas) => fixed_schedule(sigmas),
+        None => schedule(steps, h * w),
+    };
     let mut attention = match args.attention {
         AttentionPrecision::Float32 => DType::F32,
         AttentionPrecision::BFloat16 => DType::BF16,
@@ -269,7 +274,7 @@ pub fn run(
         observer.check()?;
         let want_preview = (args.preview_control.is_some()
             || args.preview_every.is_some_and(|n| (i + 1) % n.get() == 0))
-            && i + 1 < args.steps;
+            && i + 1 < steps;
         let mut step = sample(&mut dit, &latents, pair, want_preview, attention, observer)?;
         if !step.finite && attention != DType::F32 {
             // Reduced-precision attention overflowed: redo this step, and the
@@ -297,12 +302,12 @@ pub fn run(
         }
         observer.emit(Event::StepFinished {
             step: i + 1,
-            total: args.steps,
+            total: steps,
             duration: step_start.elapsed(),
         })?;
         observer.check()?;
         // The final decode supersedes a preview requested during the last step.
-        if i + 1 < args.steps {
+        if i + 1 < steps {
             observer.wait_previews()?;
         }
         if args.preview_control.is_none()
@@ -319,7 +324,7 @@ pub fn run(
             )?;
             observer.emit(Event::Preview {
                 step: i + 1,
-                total: args.steps,
+                total: steps,
                 image,
             })?;
             observer.check()?;
@@ -334,7 +339,7 @@ pub fn run(
     let image = cache.decoder(weights)?.decode(
         Snapshot {
             latents: latents.to_device(&Device::Cpu)?,
-            step: args.steps,
+            step: steps,
             width,
             height,
         },
@@ -343,8 +348,8 @@ pub fn run(
     observer.progress(Stage::Decoding, 1, 1)?;
     if args.preview_every.is_some() || args.preview_control.is_some() {
         observer.emit(Event::Preview {
-            step: args.steps,
-            total: args.steps,
+            step: steps,
+            total: steps,
             image: image.clone(),
         })?;
         observer.check()?;
@@ -469,6 +474,12 @@ fn sample(
     })
 }
 
+/// A checkpoint's saved sigmas. Its scheduler config has a unit shift and no
+/// dynamic or terminal shifting, so they are used as-is, ending at zero.
+fn fixed_schedule(sigmas: &[f64]) -> Vec<f64> {
+    sigmas.iter().copied().chain([0.]).collect()
+}
+
 fn schedule(steps: usize, tokens: usize) -> Vec<f64> {
     if steps == 1 {
         return vec![1., 0.];
@@ -519,6 +530,17 @@ mod tests {
         assert!(validate(&request).is_err());
         Ok(())
     }
+    #[test]
+    fn turbo_samples_its_saved_schedule_regardless_of_requested_steps() {
+        let turbo = crate::Checkpoint::Turbo;
+        assert_eq!(turbo.steps(40), 8);
+        assert_eq!(crate::Checkpoint::Original.steps(40), 40);
+        let s = fixed_schedule(turbo.sample_sigmas().unwrap());
+        assert_eq!(s.len(), 9);
+        assert_eq!((s[0], s[7], s[8]), (1., 0.414568, 0.));
+        assert!(s.windows(2).all(|p| p[0] > p[1]));
+    }
+
     #[test]
     fn flow_schedule_has_exact_endpoints_and_descends() {
         for steps in [1, 2, 40] {
