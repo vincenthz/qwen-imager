@@ -168,7 +168,7 @@ impl Session {
     fn encrypt(&self, key: &[u8; 32], context: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
         let sequence = self
             .sequence
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| anyhow::anyhow!("Content nonce exhausted"))?;
         let mut nonce = [0; 12];
         nonce[4..].copy_from_slice(&sequence.to_be_bytes());
