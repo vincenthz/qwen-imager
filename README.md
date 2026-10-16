@@ -151,7 +151,8 @@ blank space is ignored. **Steps** and the adjacent
 step. Sequential decoding pauses sampling for each decode; parallel decoding
 runs in the background while sampling continues, skipping steps while the
 decoder is busy. Manual previews automatically request previews after step 5 and
-halfway through sampling (rounded up for odd step counts); these two checkpoints
+halfway through sampling (rounded up for odd step counts), or only halfway (step 4)
+for Turbo's fixed 8 steps; these checkpoints
 always pause sampling until decoded, waiting for any background preview first.
 Matching milestones produce one preview; the final step uses the normal final
 decode. You can also click **Preview** during generation to decode the latest

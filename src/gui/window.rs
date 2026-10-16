@@ -51,15 +51,24 @@ pub struct WorkspaceActivity;
 #[derive(Default)]
 struct ManualPreviewSchedule {
     due_step: Option<usize>,
+    // Short fixed schedules (Turbo's 8 steps) preview only at the midpoint.
+    midpoint_only: bool,
 }
 
 impl ManualPreviewSchedule {
+    fn new(fixed_schedule: bool) -> Self {
+        Self {
+            due_step: None,
+            midpoint_only: fixed_schedule,
+        }
+    }
+
     fn on_event(&mut self, event: &Event, request: impl FnOnce() -> bool) -> bool {
         match event {
             Event::StepFinished { step, total, .. } => {
                 if step == total {
                     self.due_step = None; // Final decoding supplies this image.
-                } else if *step == 5 || *step == total.div_ceil(2) {
+                } else if (*step == 5 && !self.midpoint_only) || *step == total.div_ceil(2) {
                     self.due_step = Some(*step);
                 }
             }
@@ -81,6 +90,8 @@ impl ManualPreviewSchedule {
 struct PreviewMode {
     automatic: bool,
     sequential: bool,
+    // The local checkpoint samples a saved schedule (Turbo).
+    fixed_schedule: bool,
 }
 
 impl PreviewMode {
@@ -88,6 +99,7 @@ impl PreviewMode {
         Self {
             automatic: settings.automatic_previews,
             sequential: settings.sequential_previews,
+            fixed_schedule: settings.model.sample_sigmas().is_some(),
         }
     }
 
@@ -714,7 +726,7 @@ impl ImageWindow {
                     Backend::Local => {
                         let mut generator =
                             generator.lock().unwrap_or_else(|error| error.into_inner());
-                        let mut preview_schedule = ManualPreviewSchedule::default();
+                        let mut preview_schedule = ManualPreviewSchedule::new(previews.fixed_schedule);
                         let cancel = cancellation.clone();
                         let preview_control = request.preview_control.clone();
                         let sender = sender.clone();
@@ -2935,6 +2947,19 @@ mod tests {
             }
             assert_eq!(requested, expected, "total steps: {total}");
         }
+    }
+
+    #[test]
+    fn fixed_schedules_preview_only_at_the_midpoint() {
+        let mut schedule = ManualPreviewSchedule::new(true);
+        let mut requested = Vec::new();
+        for step in 1..=8 {
+            if schedule.on_event(&step_event(step, 8), || true) {
+                requested.push(step);
+                schedule.on_event(&preview_event(step, 8), || panic!("duplicate preview"));
+            }
+        }
+        assert_eq!(requested, [4]);
     }
 
     #[test]
