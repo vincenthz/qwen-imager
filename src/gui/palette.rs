@@ -1,5 +1,8 @@
-use gpui::{App, Rgba};
-use gpui_component::{ActiveTheme as _, ThemeMode};
+use gpui::{App, FontWeight, Hsla, Rgba, Styled};
+use gpui_component::{
+    ActiveTheme as _, Selectable as _, ThemeMode,
+    button::{Button, ButtonCustomVariant, ButtonVariants as _},
+};
 use serde::{Deserialize, Serialize};
 
 /// Light or dark interface, persisted in the settings and toggled from the title bar.
@@ -97,6 +100,38 @@ const fn rgb_const(hex: u32) -> Rgba {
 /// The palette matching the active gpui_component theme mode.
 pub fn palette(cx: &App) -> Palette {
     if cx.theme().is_dark() { DARK } else { LIGHT }
+}
+
+/// Typography for panel headers and tab labels, a step above the content they title.
+pub trait Heading: Styled + Sized {
+    fn heading(self) -> Self {
+        self.text_base().font_weight(FontWeight::SEMIBOLD)
+    }
+}
+
+impl<E: Styled> Heading for E {}
+
+/// Marks a toggle button as selected, tinted with the accent rather than the
+/// theme's neutral highlight so the active choice stands out.
+pub trait AccentSelected {
+    fn accent_selected(self, selected: bool, cx: &App) -> Self;
+}
+
+impl AccentSelected for Button {
+    fn accent_selected(self, selected: bool, cx: &App) -> Self {
+        let button = self.selected(selected);
+        if !selected {
+            return button;
+        }
+        let accent = Hsla::from(palette(cx).accent);
+        // A selected button paints `active` as its fill and `color` as its border.
+        button.custom(
+            ButtonCustomVariant::new(cx)
+                .color(accent.opacity(0.5))
+                .active(accent.opacity(0.16))
+                .foreground(accent),
+        )
+    }
 }
 
 #[cfg(test)]

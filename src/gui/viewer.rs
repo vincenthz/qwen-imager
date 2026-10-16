@@ -6,9 +6,9 @@ use gpui::{
     MouseMoveEvent, Pixels, Point, RenderImage, Size, Window, canvas, div, point, prelude::*,
     px, size,
 };
-use gpui_component::{Disableable, Selectable, Sizable as _, button::Button};
+use gpui_component::{Disableable, Sizable as _, button::Button};
 
-use crate::palette::palette;
+use crate::palette::{AccentSelected as _, palette};
 
 /// Zoom steps of the buttons and keyboard shortcuts.
 const ZOOM_STEP: f32 = 1.25;
@@ -268,7 +268,7 @@ impl Render for ImageViewer {
                             .small()
                             .label("Fit")
                             .tooltip("Fit the whole image (0)")
-                            .selected(!zoomed)
+                            .accent_selected(!zoomed, cx)
                             .on_click(cx.listener(|view, _, _, cx| view.fit(cx))),
                     )
                     .child(

@@ -18,7 +18,7 @@ use gpui_component::{
 };
 use image_forger::Checkpoint;
 use crate::models::{Models, ModelState};
-use crate::palette::{Appearance, palette};
+use crate::palette::{Appearance, Heading as _, palette};
 use serde::{Deserialize, Serialize};
 
 /// Which machine runs inference. [`Backend::Local`] uses this Mac; a remote
@@ -438,7 +438,7 @@ impl Render for SettingsPanel {
                     .py_3()
                     .border_b_1()
                     .border_color(palette(cx).border)
-                    .child(div().text_lg().child("Settings"))
+                    .child(div().heading().text_lg().child("Settings"))
                     .child(
                         Button::new("settings-done")
                             .primary()

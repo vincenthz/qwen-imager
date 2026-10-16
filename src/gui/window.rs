@@ -16,14 +16,14 @@ use crate::{
     viewer::{ImageViewer, ViewerEvent},
 };
 
-use crate::palette::{Palette, palette};
+use crate::palette::{AccentSelected as _, Heading as _, Palette, palette};
 use gpui::{
     Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, DevicePixels, Entity, MouseButton, MouseDownEvent,
     MouseMoveEvent, ObjectFit, PathBuilder, Pixels, Point, RenderImage, SharedString, Subscription, Task,
     Window, canvas, div, img, point, prelude::*, px, relative, rgb, size,
 };
 use gpui_component::{
-    Disableable, Icon, Selectable, Sizable as _,
+    Disableable, Icon, Sizable as _,
     button::*,
     input::{Input, InputState, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
@@ -1759,7 +1759,7 @@ impl ImageWindow {
                 .child(div().flex().items_center().gap_2()
                     .child(Button::new("seed-mode")
                         .label(if self.automatic_seed { "Auto seed" } else { "Manual seed" })
-                        .selected(self.automatic_seed)
+                        .accent_selected(self.automatic_seed, cx)
                         .tooltip(if self.automatic_seed {
                             "A new random seed each generation. Click to use the displayed seed manually."
                         } else { "Use this seed each generation. Click to switch to automatic random seeds." })
@@ -1815,7 +1815,7 @@ impl ImageWindow {
                         Button::new("before-after")
                             .flex_shrink_0()
                             .label("Before")
-                            .selected(self.showing_before)
+                            .accent_selected(self.showing_before, cx)
                             .tooltip(if self.showing_before {
                                 "Showing the reference image. Click to show the generated image."
                             } else { "Show the reference image before generation" })
@@ -1830,17 +1830,17 @@ impl ImageWindow {
                 view_root.child(div().flex().flex_wrap().items_center().gap_2().text_sm()
                     .child(format!("Image {}", index + 1))
                     .child(Button::new("tool-draw").label("Draw")
-                        .selected(self.tool == Tool::Draw)
+                        .accent_selected(self.tool == Tool::Draw, cx)
                         .tooltip("Paint over the image")
                         .on_click(cx.listener(|view, _, _, cx| view.set_tool(Tool::Draw, cx))))
                     .child(Button::new("tool-crop").label("Crop")
-                        .selected(self.tool == Tool::Crop)
+                        .accent_selected(self.tool == Tool::Crop, cx)
                         .tooltip("Keep only part of the image")
                         .on_click(cx.listener(|view, _, _, cx| view.set_tool(Tool::Crop, cx))))
                     .child(div().w(px(8.)))
                     .when(self.tool == Tool::Crop, |row| row
                     .child(Button::new("square-crop").label("Square")
-                        .selected(self.square_crop)
+                        .accent_selected(self.square_crop, cx)
                         .tooltip("Keep the selection square")
                         .on_click(cx.listener(|view, _, _, cx| {
                             view.square_crop = !view.square_crop;
@@ -1875,7 +1875,7 @@ impl ImageWindow {
                     .children(BRUSHES.into_iter().map(|(label, width)| {
                         Button::new(("brush", (width * 1000.) as usize))
                             .label(label)
-                            .selected(self.brush == width)
+                            .accent_selected(self.brush == width, cx)
                             .tooltip("Brush size")
                             .on_click(cx.listener(move |view, _, _, cx| {
                                 view.brush = width;
@@ -1918,7 +1918,7 @@ impl ImageWindow {
                     .items_center()
                     .gap_2()
                     .min_h(px(28.))
-                    .child(div().text_sm().text_color(palette(cx).muted).child("Prompt"))
+                    .child(div().heading().text_color(palette(cx).muted).child("Prompt"))
                     .child(self.text_buttons(describe, cx))
                     .child(div().flex_1())
                     .when(!self.queue.is_empty(), |row| row.child(
@@ -1935,7 +1935,7 @@ impl ImageWindow {
                         Button::new("pause")
                             .small()
                             .icon(Icon::default().path(if self.paused { "icons/play.svg" } else { "icons/pause.svg" }))
-                            .selected(self.paused)
+                            .accent_selected(self.paused, cx)
                             .tooltip(if self.paused { "Resume" } else { "Pause after the current layer" })
                             .disabled(cancelling)
                             .on_click(cx.listener(|view, _, _, cx| view.toggle_pause(cx))),
@@ -2064,7 +2064,7 @@ impl ImageWindow {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(div().flex_1().text_color(palette(cx).strong_text).child("Description"))
+                        .child(div().flex_1().heading().text_color(palette(cx).strong_text).child("Description"))
                         .child(
                             Button::new("description-to-prompt")
                                 .small()
@@ -2190,7 +2190,7 @@ impl ImageWindow {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().text_sm().text_color(palette(cx).muted).child("Preview"))
+                    .child(div().heading().text_color(palette(cx).muted).child("Preview"))
                     .child(
                         Button::new("save")
                             .icon(Icon::default().path("icons/save.svg"))
@@ -2212,7 +2212,7 @@ impl ImageWindow {
             .p_2()
             .rounded_md()
             .bg(palette(cx).panel)
-            .child(div().text_sm().text_color(palette(cx).muted).child("References"))
+            .child(div().heading().text_color(palette(cx).muted).child("References"))
             .child(
                 Button::new("add-images")
                     .w_full()
@@ -2331,7 +2331,7 @@ impl ImageWindow {
                                             .xsmall()
                                             .flex_1()
                                             .label(if selected { "Done" } else { "Edit" })
-                                            .selected(selected)
+                                            .accent_selected(selected, cx)
                                             .tooltip(if selected {
                                                 "Finish editing"
                                             } else {
@@ -2394,7 +2394,7 @@ impl ImageWindow {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().text_sm().text_color(palette(cx).muted).child("History"))
+                    .child(div().heading().text_color(palette(cx).muted).child("History"))
                     .child(
                         Button::new("collapse-history")
                             .ghost()
@@ -2527,7 +2527,7 @@ impl ImageWindow {
                     .w(px(44.))
                     .h(px(44.))
                     .icon(Icon::default().path(mode.icon()))
-                    .selected(current == mode)
+                    .accent_selected(current == mode, cx)
                     .tooltip(format!("{} mode", mode.label()))
                     .on_click(cx.listener(move |view, _, _, cx| {
                         view.mode = mode;

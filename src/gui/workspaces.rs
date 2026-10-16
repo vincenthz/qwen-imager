@@ -7,7 +7,7 @@ use gpui::{
     Context, Entity, MouseButton, ScrollHandle, Subscription, Window, div, prelude::*, px, relative, rgba,
 };
 use gpui_component::{
-    Disableable, Icon, Selectable, Sizable as _, TitleBar,
+    Disableable, Icon, Sizable as _, TitleBar,
     button::{Button, ButtonVariants as _},
     menu::{DropdownMenu as _, PopupMenuItem},
     tab::{Tab, TabBar},
@@ -16,7 +16,7 @@ use image_forger::{Checkpoint, ModelOptions, SharedModel};
 
 use crate::{
     models::{Models, ModelState},
-    palette::{Appearance, palette},
+    palette::{AccentSelected as _, Appearance, Heading as _, palette},
     settings::{
         Backend, Settings, SettingsEvent, SettingsPanel, model_label, select_appearance, select_backend,
     },
@@ -258,7 +258,7 @@ impl Render for Workspaces {
                                     .ghost()
                                     .xsmall()
                                     .icon(Icon::default().path("icons/bell.svg"))
-                                    .selected(has_unread)
+                                    .accent_selected(has_unread, cx)
                                     .disabled(!has_unread)
                                     .tooltip(if has_unread {
                                         "Unread activity"
@@ -291,7 +291,7 @@ impl Render for Workspaces {
                                     .ghost()
                                     .xsmall()
                                     .icon(Icon::default().path("icons/settings.svg"))
-                                    .selected(self.settings.is_some())
+                                    .accent_selected(self.settings.is_some(), cx)
                                     .tooltip("Settings")
                                     .on_click(cx.listener(|view, _, window, cx| {
                                         if view.settings.is_some() {
@@ -316,9 +316,22 @@ impl Render for Workspaces {
                             }))
                             .children(self.tabs.iter().enumerate().map(|(index, _)| {
                                 let unread = self.activity.unread.contains(&index);
-                                // A Tab icon would replace the label, so the bell is a child.
+                                let active = index == self.activity.active;
+                                let accent = palette(cx).accent;
+                                // The label is a child so the active tab can carry an accent
+                                // underline; a Tab icon would replace it, so the bell is one too.
                                 Tab::new()
-                                    .label(format!("Workspace {}", index + 1))
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .flex()
+                                            .items_center()
+                                            .heading()
+                                            .border_b_2()
+                                            .border_color(if active { accent } else { rgba(0) })
+                                            .when(active, |label| label.text_color(accent))
+                                            .child(format!("Workspace {}", index + 1)),
+                                    )
                                     .when(unread, |tab| {
                                         tab.child(
                                             Icon::default()
