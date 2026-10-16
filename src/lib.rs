@@ -7,6 +7,7 @@
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 compile_error!("img-gen requires an Apple Silicon Mac with Metal.");
 
+mod chat;
 pub mod diagnostics;
 mod dit;
 pub mod image_input;
@@ -138,6 +139,65 @@ impl Request {
     }
 }
 
+/// What [`Generator::write_text`] asks the checkpoint's language model to write.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextTask {
+    /// Describe the images, or answer [`TextRequest::prompt`] about them.
+    #[default]
+    Describe,
+    /// Rewrite [`TextRequest::prompt`] as a detailed generation prompt. With
+    /// images, it becomes a precise edit instruction for those references.
+    EnhancePrompt,
+}
+
+/// Text written by the Qwen3-VL-8B language model inside the checkpoint's text
+/// encoder. Needs a checkpoint that ships its LM head (BF16 or Turbo).
+#[derive(Clone, Debug)]
+pub struct TextRequest {
+    pub task: TextTask,
+    /// The prompt to enhance, or a question about the images. An empty
+    /// question asks for a detailed description.
+    pub prompt: String,
+    /// Up to 10 images, resized as references are for generation.
+    pub images: Vec<RgbaImage>,
+    /// The reply stops after this many tokens.
+    pub max_tokens: usize,
+    /// Sampling temperature; zero always picks the most likely token.
+    pub temperature: f32,
+    pub seed: u64,
+    /// Cooperative pause, checked between tokens.
+    pub pause: Option<PauseControl>,
+}
+
+impl TextRequest {
+    pub fn new(task: TextTask, prompt: impl Into<String>) -> Self {
+        Self {
+            task,
+            prompt: prompt.into(),
+            images: Vec::new(),
+            max_tokens: match task {
+                TextTask::Describe => 1024,
+                TextTask::EnhancePrompt => 512,
+            },
+            temperature: 0.7,
+            seed: 42,
+            pause: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct TextOutput {
+    /// The description or answer, or the enhanced prompt.
+    pub text: String,
+    /// An aspect ratio from [`ASPECT_RATIOS`] suggested for an enhanced
+    /// text-to-image prompt. Edits follow their references instead.
+    pub ratio: Option<String>,
+    /// Tokens written; equals `max_tokens` when the reply was cut short.
+    pub tokens: usize,
+    pub elapsed: Duration,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
     Loading,
@@ -150,6 +210,8 @@ pub enum Stage {
     /// Loads weights on first use and prepares request-specific conditioning on every run.
     DenoiserLoading,
     Decoding,
+    /// Progress counts written tokens against the request's maximum.
+    TextGeneration,
 }
 
 /// Owned, Send events suitable for passing to a GUI thread. Counts are stage-local.
@@ -179,6 +241,10 @@ pub enum Event {
         step: usize,
         total: usize,
         image: Arc<RgbaImage>,
+    },
+    /// Newly written text from [`Generator::write_text`], in order.
+    Text {
+        delta: String,
     },
     Finished {
         elapsed: Duration,
@@ -344,6 +410,38 @@ impl Generator {
         let elapsed = start.elapsed();
         observer.emit(Event::Finished { elapsed })?;
         Ok(Generation { image, elapsed })
+    }
+}
+
+impl Generator {
+    /// Blocking text generation with the checkpoint's language model: describe
+    /// images or enhance a prompt. Emits progress, `Text` deltas as they are
+    /// written, then `Finished`. Shares the Metal device with `generate`. Uses
+    /// about 17 GB of GPU memory for the language model while it runs, released
+    /// afterwards except in a [`SharedModel`], which keeps its text encoder.
+    pub fn write_text(
+        &mut self,
+        request: &TextRequest,
+        cancellation: &CancellationToken,
+        mut on_event: impl FnMut(Event),
+    ) -> Result<TextOutput> {
+        let mut observer = Observer {
+            cancellation,
+            pause: request.pause.as_ref(),
+            callback: &mut on_event,
+            previews: None,
+        };
+        cancellation.check()?;
+        let start = Instant::now();
+        let written = pipeline::write(request, &self.weights, &mut self.cache, &mut observer)?;
+        let elapsed = start.elapsed();
+        observer.emit(Event::Finished { elapsed })?;
+        Ok(TextOutput {
+            text: written.text,
+            ratio: written.ratio,
+            tokens: written.tokens,
+            elapsed,
+        })
     }
 }
 

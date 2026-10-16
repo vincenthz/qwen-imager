@@ -254,6 +254,7 @@ impl Job {
                     Stage::ReferenceEncoding => "reference_encoding",
                     Stage::DenoiserLoading => "denoiser_loading",
                     Stage::Decoding => "decoding",
+                    Stage::TextGeneration => "text_generation",
                 };
                 self.stage_completed = completed;
                 self.stage_total = total;
@@ -274,7 +275,7 @@ impl Job {
                 self.preview = Some(Image::new(image, step));
                 self.preview_pending = false;
             }
-            Event::Finished { .. } => {}
+            Event::Text { .. } | Event::Finished { .. } => {}
         }
     }
     fn finish(&mut self, result: anyhow::Result<image_forger::Generation>) {

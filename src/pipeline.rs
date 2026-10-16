@@ -1,5 +1,5 @@
 use crate::{
-    AttentionPrecision, Event, Observer, Request, Stage,
+    AttentionPrecision, Event, Observer, Request, Stage, TextRequest, chat,
     dit::Dit,
     noise,
     preview::{DecoderWorker, Snapshot},
@@ -69,6 +69,17 @@ impl Cache {
         Ok(self.decoder.as_ref().unwrap())
     }
 
+    fn device(&mut self) -> Result<Device> {
+        if self.device.is_none() {
+            ensure!(
+                objc2_metal::MTLCreateSystemDefaultDevice().is_some(),
+                "no Metal GPU is visible; run on an Apple Silicon Mac with GPU access"
+            );
+            self.device = Some(Device::new_metal(0).context("could not initialize Metal")?);
+        }
+        Ok(self.device.as_ref().unwrap().clone())
+    }
+
     pub fn unload_models(&mut self) {
         self.denoiser = None;
         self.vae = None;
@@ -98,6 +109,40 @@ struct CachedReference {
     latents: Option<Tensor>,
 }
 
+/// Text from the language model. Reuses, but does not update, the vision
+/// features cached for the current generation references.
+pub fn write(
+    request: &TextRequest,
+    weights: &Weights,
+    cache: &mut Cache,
+    observer: &mut Observer<'_>,
+) -> Result<chat::Written> {
+    ensure!(
+        request.images.len() <= 10,
+        "at most 10 images are supported"
+    );
+    ensure!(
+        request.images.iter().all(|i| i.width() > 0 && i.height() > 0),
+        "images must not be empty"
+    );
+    observer.progress(Stage::Loading, 0, 1)?;
+    let images: Vec<_> = request.images.iter().map(resize_reference).collect();
+    let device = cache.device()?;
+    observer.progress(Stage::Loading, 1, 1)?;
+    let cached = &cache.references;
+    chat::write(request, &images, weights, &device, observer, |i, vb, observer| {
+        match cached.iter().find(|c| c.image == images[i]).and_then(|c| c.visual.as_ref()) {
+            Some(visual) => Ok(visual.to_device(&device)?),
+            None => vision::encode(&images[i], vb, i, observer),
+        }
+    })
+}
+
+fn resize_reference(img: &RgbaImage) -> RgbaImage {
+    let (w, h) = reference_dimensions(img.width(), img.height());
+    image::imageops::resize(img, w, h, FilterType::Lanczos3)
+}
+
 pub fn run(
     args: &Request,
     weights: &Weights,
@@ -122,21 +167,8 @@ pub fn run(
     })?;
     observer.progress(Stage::Loading, 0, 1)?;
     let images = &args.images;
-    let references: Vec<_> = images
-        .iter()
-        .map(|img| {
-            let (w, h) = reference_dimensions(img.width(), img.height());
-            image::imageops::resize(img, w, h, FilterType::Lanczos3)
-        })
-        .collect();
-    if cache.device.is_none() {
-        ensure!(
-            objc2_metal::MTLCreateSystemDefaultDevice().is_some(),
-            "no Metal GPU is visible; run on an Apple Silicon Mac with GPU access"
-        );
-        cache.device = Some(Device::new_metal(0).context("could not initialize Metal")?);
-    }
-    let device = cache.device.as_ref().unwrap().clone();
+    let references: Vec<_> = images.iter().map(resize_reference).collect();
+    let device = cache.device()?;
     let config: serde_json::Value = weights.config("transformer/config.json")?;
     ensure!(
         config["_class_name"] == "QwenImage21Transformer2DModel"

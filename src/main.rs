@@ -2,9 +2,9 @@ use anyhow::{Context, ensure};
 use clap::Parser;
 use image_forger::{
     AttentionPrecision, CancellationToken, Checkpoint, Event, Generator, ModelOptions, Request,
-    Stage,
+    Stage, TextRequest, TextTask,
 };
-use std::{num::NonZeroUsize, path::PathBuf, time::Instant};
+use std::{io::Write, num::NonZeroUsize, path::PathBuf, time::Instant};
 
 mod server;
 
@@ -14,9 +14,15 @@ mod server;
     about = "Generate or edit a PNG with ImageForger on Apple Metal"
 )]
 struct Args {
-    /// Text prompt describing the image or edit
-    #[arg(required_unless_present = "serve", conflicts_with = "serve")]
+    /// Text prompt describing the image or edit; with --describe, an optional question
+    #[arg(required_unless_present_any = ["serve", "describe"], conflicts_with = "serve")]
     prompt: Option<String>,
+    /// Print a description of the --image references (or answer PROMPT about them), without generating
+    #[arg(long, conflicts_with_all = ["serve", "enhance", "metrics", "preview_dir"])]
+    describe: bool,
+    /// Rewrite the prompt in detail with the model's language model before generating
+    #[arg(long, conflicts_with = "serve")]
+    enhance: bool,
     /// Run a persistent HTTP generation service
     #[arg(long, conflicts_with_all = ["output", "images", "ratio", "scale", "steps", "seed", "noise_source_size", "attention", "metrics", "preview_dir", "preview_every"])]
     serve: bool,
@@ -137,15 +143,47 @@ fn main() -> anyhow::Result<()> {
             .is_some_and(|e| e.eq_ignore_ascii_case("png")),
         "output must be a .png file to preserve RGBA"
     );
-    let mut request = Request::new(args.prompt.expect("clap requires a prompt"));
-    request.images = args
+    let images = args
         .images
         .iter()
         .map(|p| {
             image_forger::image_input::open(p).with_context(|| format!("opening {}", p.display()))
         })
-        .collect::<anyhow::Result<_>>()?;
-    request.ratio = args.ratio;
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut generator = Generator::new(ModelOptions {
+        model_dir: args.model_dir.clone(),
+        offline: args.offline,
+        checkpoint,
+    });
+    let cancellation = CancellationToken::default();
+    if args.describe {
+        ensure!(
+            !images.is_empty() || args.prompt.is_some(),
+            "--describe needs an --image, or a question as PROMPT"
+        );
+        let mut text = TextRequest::new(TextTask::Describe, args.prompt.unwrap_or_default());
+        text.images = images;
+        text.seed = args.seed;
+        write_text(&mut generator, &text, &cancellation, true)?;
+        return Ok(());
+    }
+    let mut prompt = args.prompt.expect("clap requires a prompt");
+    let mut ratio = args.ratio;
+    if args.enhance {
+        let mut text = TextRequest::new(TextTask::EnhancePrompt, prompt);
+        text.images = images.clone();
+        text.seed = args.seed;
+        let enhanced = write_text(&mut generator, &text, &cancellation, false)?;
+        eprintln!("Enhanced prompt: {}", enhanced.text);
+        if ratio.is_none() && images.is_empty() && enhanced.ratio.is_some() {
+            eprintln!("Suggested ratio: {}", enhanced.ratio.as_deref().unwrap());
+            ratio = enhanced.ratio;
+        }
+        prompt = enhanced.text;
+    }
+    let mut request = Request::new(prompt);
+    request.images = images;
+    request.ratio = ratio;
     request.scale = args.scale;
     if let Some(steps) = args.steps {
         if checkpoint.steps(steps) != steps {
@@ -167,12 +205,6 @@ fn main() -> anyhow::Result<()> {
     if let Some(dir) = &args.preview_dir {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let mut generator = Generator::new(ModelOptions {
-        model_dir: args.model_dir,
-        offline: args.offline,
-        checkpoint,
-    });
-    let cancellation = CancellationToken::default();
     let mut preview_error = None;
     let mut metrics = Vec::new();
     let started = Instant::now();
@@ -183,6 +215,7 @@ fn main() -> anyhow::Result<()> {
                 Event::StepFinished { step, total, duration } => serde_json::json!({"event": "step", "step": step, "total": total, "duration_s": duration.as_secs_f64()}),
                 Event::Started { .. } => serde_json::json!({"event": "started"}),
                 Event::Preview { step, .. } => serde_json::json!({"event": "preview", "step": step}),
+                Event::Text { .. } => serde_json::json!({"event": "text"}),
                 Event::Finished { .. } => serde_json::json!({"event": "finished"}),
             };
             record["time_s"] = started.elapsed().as_secs_f64().into();
@@ -204,15 +237,7 @@ fn main() -> anyhow::Result<()> {
         } => {
             // Keep the terminal concise; a UI can consume every layer event.
             if completed == 0 || completed == total || completed % 8 == 0 {
-                let label = match stage {
-                    Stage::Loading => "Preparing model".into(),
-                    Stage::ReferenceVision { index } => format!("Reference {} vision", index + 1),
-                    Stage::TextEncoding => "Text encoder".into(),
-                    Stage::ReferenceEncoding => "Reference latents".into(),
-                    Stage::DenoiserLoading => "Denoiser prefix".into(),
-                    Stage::Decoding => "Decoding RGBA".into(),
-                };
-                eprintln!("{label} {completed}/{total}");
+                eprintln!("{} {completed}/{total}", stage_label(stage));
             }
         }
         Event::StepFinished {
@@ -232,7 +257,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Event::Finished { .. } => {}
+        Event::Text { .. } | Event::Finished { .. } => {}
         }
     });
     if let Some(error) = preview_error {
@@ -265,6 +290,62 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn stage_label(stage: Stage) -> String {
+    match stage {
+        Stage::Loading => "Preparing model".into(),
+        Stage::ReferenceVision { index } => format!("Reference {} vision", index + 1),
+        Stage::TextEncoding => "Text encoder".into(),
+        Stage::ReferenceEncoding => "Reference latents".into(),
+        Stage::DenoiserLoading => "Denoiser prefix".into(),
+        Stage::Decoding => "Decoding RGBA".into(),
+        Stage::TextGeneration => "Writing".into(),
+    }
+}
+
+/// Runs the language model, streaming its text to stdout when `stream` is set.
+fn write_text(
+    generator: &mut Generator,
+    request: &TextRequest,
+    cancellation: &CancellationToken,
+    stream: bool,
+) -> anyhow::Result<image_forger::TextOutput> {
+    let mut started = false;
+    let output = generator.write_text(request, cancellation, |event| match event {
+        Event::Progress {
+            stage: Stage::TextGeneration,
+            ..
+        } => {}
+        Event::Progress {
+            stage,
+            completed,
+            total,
+        } if completed == 0 || completed == total || completed % 8 == 0 => {
+            eprintln!("{} {completed}/{total}", stage_label(stage));
+        }
+        Event::Text { delta } if stream => {
+            if !started {
+                started = true;
+                eprintln!("Writing");
+            }
+            print!("{delta}");
+            let _ = std::io::stdout().flush();
+        }
+        _ => {}
+    })?;
+    if started {
+        println!();
+    }
+    if output.tokens == request.max_tokens {
+        eprintln!("(stopped after {} tokens)", output.tokens);
+    }
+    eprintln!(
+        "{} tokens in {:.1}s",
+        output.tokens,
+        output.elapsed.as_secs_f32()
+    );
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +374,10 @@ mod tests {
         );
         assert!(Args::try_parse_from(["cli", "a teapot", "--http-debug"]).is_err());
         assert!(Args::try_parse_from(["cli"]).is_err());
+        let describe = Args::try_parse_from(["cli", "--describe", "-i", "a.png"]).unwrap();
+        assert!(describe.describe && describe.prompt.is_none());
+        assert!(Args::try_parse_from(["cli", "--describe", "--enhance", "x"]).is_err());
+        assert!(Args::try_parse_from(["cli", "--serve", "--enhance"]).is_err());
         assert!(Args::try_parse_from(["cli", "--serve", "--steps", "8"]).is_err());
         assert!(Args::try_parse_from(["cli", "a teapot", "--listen", "127.0.0.1:9000"]).is_err());
         let quantized = Args::try_parse_from(["cli", "a teapot", "--model", "mlx-4bit"]).unwrap();

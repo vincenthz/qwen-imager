@@ -68,6 +68,13 @@ impl Checkpoint {
         }
     }
 
+    /// Whether the text encoder ships its LM head, so
+    /// [`Generator::write_text`](crate::Generator::write_text) can use it.
+    /// The MLX packs omit it.
+    pub fn writes_text(self) -> bool {
+        matches!(self, Self::Original | Self::Turbo)
+    }
+
     /// Approximate download size in GB.
     pub fn download_gb(self) -> u32 {
         match self {

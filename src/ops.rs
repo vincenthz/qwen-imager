@@ -161,6 +161,25 @@ pub fn attention_in(
     Tensor::cat(&parts, 2)
 }
 
+/// Attention of a single query token to all of `k` and `v`, which hold float32
+/// keys and values. Query heads that share a key/value head are batched as
+/// rows of one product, so cached keys and values are never repeated per head.
+pub fn single_query_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+    let (b, h, s, d) = q.dims4()?;
+    if s != 1 {
+        candle_core::bail!("single-query attention got {s} query tokens");
+    }
+    let kv_heads = k.dim(1)?;
+    let q = q
+        .to_dtype(DType::F32)?
+        .reshape((b, kv_heads, h / kv_heads, d))?;
+    let scores = (q.matmul(&k.transpose(2, 3)?)? * (d as f64).sqrt().recip())?;
+    candle_nn::ops::softmax_last_dim(&scores)?
+        .matmul(v)?
+        .reshape((b, h, 1, d))?
+        .to_dtype(DType::BF16)
+}
+
 pub struct SwiGlu {
     gate: Linear,
     up: Linear,
@@ -192,6 +211,21 @@ impl SwiGlu {
 mod tests {
     use super::*;
     use candle_core::Device;
+
+    #[test]
+    fn single_query_attention_matches_causal_attention() -> Result<()> {
+        let cpu = Device::Cpu;
+        let q = Tensor::randn(0f32, 1., (1, 8, 5, 16), &cpu)?.to_dtype(DType::BF16)?;
+        let k = Tensor::randn(0f32, 1., (1, 2, 5, 16), &cpu)?;
+        let v = Tensor::randn(0f32, 1., (1, 2, 5, 16), &cpu)?;
+        let full = attention(&q, &k.to_dtype(DType::BF16)?, &v.to_dtype(DType::BF16)?, true)?
+            .narrow(2, 4, 1)?
+            .to_dtype(DType::F32)?;
+        let single = single_query_attention(&q.narrow(2, 4, 1)?, &k, &v)?.to_dtype(DType::F32)?;
+        let error = (full - single)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(error < 2e-2, "max error {error}");
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires Metal GPU access"]

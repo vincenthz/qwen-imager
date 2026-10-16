@@ -167,9 +167,9 @@ compute and memory bandwidth with sampling, so previews can still slow generatio
 displays it in a greyed-out field. **Manual seed** accepts the full unsigned
 64-bit range (0–18446744073709551615), so you can edit or reuse any supported seed;
 the displayed seed remains available after generation for reproducing an image.
-The latest preview replaces the previous one. Generate becomes **Cancel** while
-working, stopping at the next safe boundary. The **pause** icon next to it pauses
-generation between model layers and becomes **resume**; a paused workspace keeps
+The latest preview replaces the previous one. **Cancel**, in the title row above
+the prompt while working, stops at the next safe boundary. The **pause** icon next
+to it pauses generation between model layers and becomes **resume**; a paused workspace keeps
 its GPU memory, and can still be cancelled. Paused time is excluded from the
 elapsed time and estimate. The adjacent save icon (tooltip:
 **Save PNG**) opens the native save dialog for the displayed image.
@@ -213,6 +213,29 @@ selection to match the square output. **Apply** crops the full-resolution
 reference immediately (at least 16×16 pixels); pending paint stays where it was
 drawn and can still be undone. A crop cannot be undone; remove the image and add
 it again to recover the original.
+
+**Enhance**, in the title row above the prompt, rewrites the prompt in detail with the language
+model built into the checkpoint's text encoder: subjects, setting, composition,
+lighting, palette and style, with text to render kept verbatim. With reference
+images it looks at them and writes a precise edit instruction instead. The
+rewritten prompt replaces the original; **Undo enhance** in the status row
+restores it until the next run. Without references, the suggested aspect ratio
+is also selected. **Describe** (Advanced mode) writes a detailed description of
+the reference images into a panel below the status row, streamed as it is
+written, with **Use as prompt** and **Copy**. Both run locally on the BF16 or
+Turbo model (the MLX packs omit the language model's output layer), take
+roughly 10–30 seconds, and can be paused or cancelled like a generation.
+
+Two buttons stacked beside the prompt start a run. **Generate now** starts
+immediately; if a generation or text task is running, it cancels it and starts
+as soon as it stops. **Generate when idle** (⌘↩) starts immediately when nothing
+is running, and otherwise queues the run to start after the running and earlier
+queued runs finish; its label shows how many are waiting. Each queued run keeps
+the prompt, settings and references from when it was clicked, and the prompt
+stays editable during a generation so you can queue the next one. The previous
+result stays in view until a queued run's first preview. **Pause** and
+**Cancel** appear in the title row while a task runs; Cancel stops only the
+running task, and **Clear queue** removes the waiting runs.
 
 Model downloads, inference, and saving run off the UI thread. A bounded event
 queue limits retained preview buffers, and old image textures are released when
@@ -384,6 +407,19 @@ text/vision encoders and reference encoding. Changing only the prompt still reus
 the per-reference results. Cached results are bit-identical to recomputing them.
 Stages served from the cache emit no `Progress` events.
 
+`Generator::write_text` runs the text encoder's Qwen3-VL-8B language model with
+its LM head to write text instead of an image. `TextTask::Describe` describes up
+to 10 images, or answers `TextRequest::prompt` about them; `TextTask::EnhancePrompt`
+rewrites a prompt in detail (an edit instruction when images are given) and
+suggests one of `ASPECT_RATIOS` for text-to-image prompts. It emits `Progress`
+(`TextEncoding` for the chat, then `TextGeneration` per token), `Text` deltas as
+the reply is written, and `Finished`. Sampling is seeded (`temperature` 0 is
+greedy) and stops at `max_tokens`. Only checkpoints with
+`Checkpoint::writes_text()` (BF16 and Turbo) ship the LM head. While it runs the
+whole language model stays on the GPU (about 17 GiB) with a float32 KV cache;
+decoding takes about 0.1 s per token on an M2 Max. Vision features cached for
+the current generation references are reused.
+
 ## HTTP service
 
 Run a persistent generation service with the CLI:
@@ -416,7 +452,16 @@ cargo build --release
 ./target/release/image-forger-cli "These characters sit around a campfire" -i a.png -i b.png
 ./target/release/image-forger-cli "a red teapot" --scale 0.25 --preview-dir previews --preview-every 5
 ./target/release/image-forger-cli "a red teapot" --scale 0.5 --attention bf16
+./target/release/image-forger-cli "a cat reading a newspaper in a cafe" --enhance
+./target/release/image-forger-cli --describe -i photo.jpg
+./target/release/image-forger-cli --describe "What breed is this dog?" -i dog.jpg
 ```
+
+`--enhance` rewrites the prompt with the checkpoint's language model before
+generating, prints it, and uses its suggested aspect ratio when there are no
+references and no `-r`. `--describe` prints a description of the `-i` images
+(or the answer to PROMPT) to stdout without generating. Both need `--model bf16`
+or `--model turbo`; `--seed` also seeds their sampling.
 
 Requires an Apple Silicon Mac with Metal access, Rust, and Xcode command line
 tools. By default this runs the full BF16 checkpoint: weights occupy about

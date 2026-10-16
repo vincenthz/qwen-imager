@@ -11,15 +11,15 @@ use std::{
 use anyhow::Context as _;
 
 use crate::{
-    settings::{Backend, Settings, digits_input, parse_steps, server_url},
+    settings::{Backend, Settings, digits_input, model_label, parse_steps, server_url},
     timing::{GenerationTiming, format_duration},
     viewer::{ImageViewer, ViewerEvent},
 };
 
 use crate::palette::{Palette, palette};
 use gpui::{
-    Bounds, ClickEvent, Context, CursorStyle, DevicePixels, Entity, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ObjectFit, PathBuilder, Pixels, Point, RenderImage, Subscription, Task,
+    Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, DevicePixels, Entity, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ObjectFit, PathBuilder, Pixels, Point, RenderImage, SharedString, Subscription, Task,
     Window, canvas, div, img, point, prelude::*, px, relative, rgb, size,
 };
 use gpui_component::{
@@ -31,7 +31,8 @@ use gpui_component::{
 };
 use image_forger::{
     ASPECT_RATIOS, AttentionPrecision, CancellationToken, Cancelled, Event, Generation,
-    Generator, PauseControl, PreviewControl, Request, RgbaImage, Stage,
+    Generator, PauseControl, PreviewControl, Request, RgbaImage, Stage, TextOutput, TextRequest,
+    TextTask,
 };
 
 gpui::actions!(image_window, [Generate]);
@@ -194,6 +195,7 @@ enum Message {
     PreviewRequested,
     Inference(Event),
     Complete(image_forger::Result<Generation>),
+    Written(image_forger::Result<TextOutput>),
 }
 
 struct ReferenceImage {
@@ -202,6 +204,25 @@ struct ReferenceImage {
     preview: Arc<RenderImage>,
     // Paint not yet applied to `image`; it is baked in when generation starts.
     strokes: Vec<Stroke>,
+}
+
+/// Whether a generation interrupts the running one or waits for it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum When {
+    Now,
+    WhenIdle,
+}
+
+/// A generation snapshotted when its button was clicked, waiting to start.
+struct Pending {
+    request: Request,
+    run: RunDetails,
+    previews: PreviewMode,
+    references: Vec<Arc<RgbaImage>>,
+    backend: Backend,
+    pinned_identity: String,
+    // Started automatically after another run, rather than by a click.
+    queued: bool,
 }
 
 /// Settings of a running generation, recorded for its history entry.
@@ -340,6 +361,14 @@ pub struct ImageWindow {
     history_open: bool,
     // Settings of the running generation, for its history entry.
     run: Option<RunDetails>,
+    // Generations waiting for the running one to finish, in start order.
+    queue: Vec<Pending>,
+    // The language-model task running instead of a generation, if any.
+    writing: Option<TextTask>,
+    // The latest description of the references, streamed while it is written.
+    description: Option<String>,
+    // The prompt before Enhance replaced it, until the next run.
+    unenhanced: Option<String>,
     // Full-size viewer opened by double-clicking an image.
     viewer: Option<(Entity<ImageViewer>, Subscription)>,
     // Reference being painted on or cropped in the main view, if any.
@@ -416,6 +445,10 @@ impl ImageWindow {
             history: Vec::new(),
             history_open: true,
             run: None,
+            queue: Vec::new(),
+            writing: None,
+            description: None,
+            unenhanced: None,
             viewer: None,
             painting: None,
             tool: Tool::Draw,
@@ -486,56 +519,47 @@ impl ImageWindow {
         cx.notify();
     }
 
-    fn generate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy || self.loading_image || self.mode == Mode::Workflow {
+    /// Generates from the current prompt and settings. `Now` cancels a running
+    /// generation or text task and starts as soon as it stops; `WhenIdle` waits
+    /// for it, and for generations queued earlier, to finish.
+    fn generate(&mut self, when: When, window: &mut Window, cx: &mut Context<Self>) {
+        if self.loading_image || self.mode == Mode::Workflow {
             return;
         }
-        let backend = cx.global::<Backend>().clone();
-        if let Backend::Remote { address } = &backend {
-            self.busy = true;
-            self.cancellation = CancellationToken::default();
-            self.status = "Reading remote credentials…".into();
-            let read = crate::credentials::read_token(address, cx);
-            cx.spawn_in(window, async move |view, cx| {
-                let token = read.await;
-                let _ = view.update_in(cx, |view, window, cx| {
-                    view.busy = false;
-                    if view.cancellation.is_cancelled() {
-                        view.status = "Cancelled before connecting.".into();
-                    } else {
-                        match token {
-                            Ok(token) => view.start_generation(backend, token, window, cx),
-                            Err(error) => {
-                                crate::errors::report("Reading credentials before remote generation", &error, cx);
-                                view.status = format!("Could not read remote credentials: {error:#}");
-                            },
-                        }
-                    }
-                    cx.notify();
-                });
-            }).detach();
+        let Some(mut pending) = self.prepare_generation(window, cx) else {
             cx.notify();
+            return;
+        };
+        if !self.busy {
+            self.start_pending(pending, window, cx);
+        } else if when == When::Now {
+            self.queue.insert(0, pending);
+            self.cancel(cx);
+            self.status = "Cancelling to start the new generation…".into();
         } else {
-            self.start_generation(backend, None, window, cx);
+            pending.queued = true;
+            self.queue.push(pending);
         }
+        cx.notify();
     }
 
-    fn start_generation(&mut self, backend: Backend, token: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+    /// Snapshots the prompt, settings and references for one generation, so
+    /// later edits do not change a queued run. Reports invalid settings.
+    fn prepare_generation(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<Pending> {
+        let backend = cx.global::<Backend>().clone();
         if let Some(message) = self.models.read(cx).generation_blocker(
             &backend, cx.global::<Settings>().model,
         ) {
             crate::errors::report("Starting generation", &anyhow::anyhow!(message.clone()), cx);
             self.status = message;
-            cx.notify();
-            return;
+            return None;
         }
         let pinned_identity = match &backend {
             Backend::Remote { address } => match cx.global::<Settings>().server_identities.get(&server_url(address)) {
                 Some(pin) => pin.clone(),
                 None => {
                     self.status = "Pin this server's identity in Settings → Compute before generating.".into();
-                    cx.notify();
-                    return;
+                    return None;
                 }
             },
             Backend::Local => String::new(),
@@ -549,16 +573,14 @@ impl ImageWindow {
             Err(error) => {
                 crate::errors::report("Validating generation settings", &anyhow::anyhow!(error), cx);
                 self.status = error.into();
-                cx.notify();
-                return;
+                return None;
             }
         };
         if !self.automatic_seed {
             let Ok(seed) = self.seed.read(cx).value().parse::<u64>() else {
                 self.status = "Enter a seed from 0 to 18446744073709551615.".into();
                 crate::errors::report("Validating generation seed", &anyhow::anyhow!(self.status.clone()), cx);
-                cx.notify();
-                return;
+                return None;
             };
             request.seed = seed;
         }
@@ -577,18 +599,75 @@ impl ImageWindow {
         if let Err(error) = request.dimensions() {
             crate::errors::report("Validating generation dimensions", &error, cx);
             self.status = error.to_string();
-            cx.notify();
-            return;
+            return None;
         }
         if self.automatic_seed {
             request.seed = self.randomize_seed(window, cx);
         }
-        self.run = Some(RunDetails {
-            prompt: request.prompt.clone(),
-            seed: request.seed,
-            steps: request.steps,
-            ratio: self.ratio,
-        });
+        self.unenhanced = None;
+        self.stop_painting();
+        for reference in &mut self.references {
+            reference.bake(window);
+        }
+        Some(Pending {
+            run: RunDetails {
+                prompt: request.prompt.clone(),
+                seed: request.seed,
+                steps: request.steps,
+                ratio: self.ratio,
+            },
+            request,
+            previews,
+            references: self.references.iter().map(|reference| reference.image.clone()).collect(),
+            backend,
+            pinned_identity,
+            queued: false,
+        })
+    }
+
+    /// Starts the next queued generation once nothing is running.
+    fn start_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.busy && !self.queue.is_empty() {
+            let pending = self.queue.remove(0);
+            self.start_pending(pending, window, cx);
+        }
+    }
+
+    fn start_pending(&mut self, pending: Pending, window: &mut Window, cx: &mut Context<Self>) {
+        let Backend::Remote { address } = &pending.backend else {
+            self.start_generation(pending, None, window, cx);
+            return;
+        };
+        self.busy = true;
+        self.cancellation = CancellationToken::default();
+        self.status = "Reading remote credentials…".into();
+        let read = crate::credentials::read_token(address, cx);
+        cx.spawn_in(window, async move |view, cx| {
+            let token = read.await;
+            let _ = view.update_in(cx, |view, window, cx| {
+                view.busy = false;
+                if view.cancellation.is_cancelled() {
+                    view.status = "Cancelled before connecting.".into();
+                    view.start_next(window, cx);
+                } else {
+                    match token {
+                        Ok(token) => view.start_generation(pending, token, window, cx),
+                        Err(error) => {
+                            crate::errors::report("Reading credentials before remote generation", &error, cx);
+                            view.status = format!("Could not read remote credentials: {error:#}");
+                            view.start_next(window, cx);
+                        },
+                    }
+                }
+                cx.notify();
+            });
+        }).detach();
+        cx.notify();
+    }
+
+    fn start_generation(&mut self, pending: Pending, token: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let Pending { mut request, run, previews, references, backend, pinned_identity, queued } = pending;
+        self.run = Some(run);
         self.busy = true;
         self.previews = previews;
         self.preview_control = request.preview_control.clone();
@@ -615,20 +694,16 @@ impl ImageWindow {
                 }
             }
         }));
-        self.clear_image(window);
-        self.stop_painting();
-        for reference in &mut self.references {
-            reference.bake(window);
+        if queued {
+            // Keep the previous result in view until this run's first preview.
+            self.clear_comparison();
+        } else {
+            self.clear_image(window);
         }
         self.cancellation = CancellationToken::default();
         let cancellation = self.cancellation.clone();
         let sender = self.listen(window, cx);
         let generator = self.generator.clone();
-        let references: Vec<_> = self
-            .references
-            .iter()
-            .map(|reference| reference.image.clone())
-            .collect();
         thread::spawn(move || {
             let result = {
                 request.images = references
@@ -684,6 +759,96 @@ impl ImageWindow {
             let _ = sender.send_blocking(Message::Complete(result));
         });
         cx.notify();
+    }
+
+    /// Why Enhance and Describe are unavailable, if they are.
+    fn text_blocker(&self, cx: &Context<Self>) -> Option<String> {
+        let backend = cx.global::<Backend>();
+        if matches!(backend, Backend::Remote { .. }) {
+            return Some("Enhance and Describe run on this Mac. Select Local in the title bar.".into());
+        }
+        let model = cx.global::<Settings>().model;
+        if !model.writes_text() {
+            return Some(format!(
+                "{} omits the language model's output layer. Select BF16 or Turbo in Settings → Models.",
+                model_label(model)
+            ));
+        }
+        self.models.read(cx).generation_blocker(backend, model)
+    }
+
+    /// Runs the local language model on the prompt and references: Enhance
+    /// replaces the prompt, Describe shows a description of the references.
+    fn write_text(&mut self, task: TextTask, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.loading_image || self.mode == Mode::Workflow {
+            return;
+        }
+        if let Some(message) = self.text_blocker(cx) {
+            self.status = message;
+            cx.notify();
+            return;
+        }
+        let prompt = self.prompt.read(cx).value().trim().to_owned();
+        let mut request = match task {
+            TextTask::EnhancePrompt if prompt.is_empty() => {
+                self.status = "Enter a prompt to enhance.".into();
+                cx.notify();
+                return;
+            }
+            TextTask::Describe if self.references.is_empty() => {
+                self.status = "Add a reference image to describe.".into();
+                cx.notify();
+                return;
+            }
+            TextTask::EnhancePrompt => TextRequest::new(task, prompt),
+            TextTask::Describe => TextRequest::new(task, ""),
+        };
+        request.seed = rand::random();
+        request.pause = Some(PauseControl::default());
+        self.stop_painting();
+        for reference in &mut self.references {
+            reference.bake(window);
+        }
+        request.images = self.references.iter().map(|r| (*r.image).clone()).collect();
+        self.busy = true;
+        self.writing = Some(task);
+        if task == TextTask::Describe {
+            self.description = Some(String::new());
+        }
+        self.pause = request.pause.clone();
+        self.paused = false;
+        self.progress = 0.;
+        self.status = match task {
+            TextTask::EnhancePrompt => "Enhancing prompt…",
+            TextTask::Describe => "Describing references…",
+        }
+        .into();
+        self.cancellation = CancellationToken::default();
+        let cancellation = self.cancellation.clone();
+        let sender = self.listen(window, cx);
+        let generator = self.generator.clone();
+        thread::spawn(move || {
+            let result = {
+                let mut generator = generator.lock().unwrap_or_else(|error| error.into_inner());
+                let cancel = cancellation.clone();
+                let sender = sender.clone();
+                generator.write_text(&request, &cancellation, move |event| {
+                    if sender.send_blocking(Message::Inference(event)).is_err() {
+                        cancel.cancel();
+                    }
+                })
+            };
+            let _ = sender.send_blocking(Message::Written(result));
+        });
+        cx.notify();
+    }
+
+    fn revert_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(prompt) = self.unenhanced.take() {
+            self.prompt.update(cx, |input, cx| input.set_value(prompt, window, cx));
+            self.status = "Restored the original prompt.".into();
+            cx.notify();
+        }
     }
 
     fn request_preview(&mut self, cx: &mut Context<Self>) {
@@ -1266,12 +1431,22 @@ impl ImageWindow {
                     self.progress = completed as f32 / total.max(1) as f32;
                     let name = match stage {
                         Stage::Loading => "Preparing model",
+                        Stage::TextEncoding if self.writing.is_some() => "Reading",
                         Stage::TextEncoding => "Encoding prompt",
                         Stage::ReferenceVision { .. } | Stage::ReferenceEncoding => {
                             "Encoding reference"
                         }
                         Stage::DenoiserLoading => "Loading denoiser",
                         Stage::Decoding => "Decoding final image",
+                        Stage::TextGeneration => {
+                            // The reply usually ends well before the token limit.
+                            self.progress = 0.;
+                            self.status = match self.writing {
+                                Some(TextTask::EnhancePrompt) => format!("Enhancing prompt — {completed} tokens"),
+                                _ => format!("Describing — {completed} tokens"),
+                            };
+                            return;
+                        }
                     };
                     self.status = format!("{name} — {completed}/{total}");
                 }
@@ -1303,8 +1478,57 @@ impl ImageWindow {
                         self.status = status.into();
                     }
                 }
+                Event::Text { delta } => {
+                    if self.writing == Some(TextTask::Describe)
+                        && let Some(description) = &mut self.description
+                    {
+                        description.push_str(&delta);
+                    }
+                }
                 _ => {}
             },
+            Message::Written(result) => {
+                self.busy = false;
+                self.pause = None;
+                self.paused = false;
+                self.progress = 0.;
+                let task = self.writing.take();
+                match (result, task) {
+                    (Ok(output), Some(TextTask::EnhancePrompt)) => {
+                        let original = self.prompt.read(cx).value().to_string();
+                        self.prompt.update(cx, |input, cx| input.set_value(output.text, window, cx));
+                        self.unenhanced = Some(original);
+                        let ratio = output
+                            .ratio
+                            .and_then(|ratio| ASPECT_RATIOS.into_iter().find(|r| *r == ratio))
+                            .filter(|_| self.references.is_empty());
+                        if let Some(ratio) = ratio {
+                            self.ratio = Some(ratio);
+                        }
+                        self.status = format!(
+                            "Prompt enhanced{} — {}",
+                            ratio.map(|r| format!(", aspect {r}")).unwrap_or_default(),
+                            format_duration(output.elapsed)
+                        );
+                    }
+                    (Ok(output), _) => {
+                        self.description = Some(output.text);
+                        self.status = format!("Described — {}", format_duration(output.elapsed));
+                    }
+                    (Err(error), task) => {
+                        if task == Some(TextTask::Describe)
+                            && self.description.as_deref().is_some_and(str::is_empty)
+                        {
+                            self.description = None;
+                        }
+                        if !error.is::<Cancelled>() {
+                            crate::errors::report("Writing text", &error, cx);
+                        }
+                        self.status = error_status(error);
+                    }
+                }
+                self.start_next(window, cx);
+            }
             Message::Complete(result) => {
                 self.busy = false;
                 self.pause = None;
@@ -1329,6 +1553,7 @@ impl ImageWindow {
                         self.status = error_status(error);
                     },
                 }
+                self.start_next(window, cx);
             }
         }
         if activity {
@@ -1469,7 +1694,7 @@ impl Render for ImageWindow {
             .flex()
             .bg(palette(cx).background)
             .text_color(palette(cx).text)
-            .on_action(cx.listener(|view, _: &Generate, window, cx| view.generate(window, cx)))
+            .on_action(cx.listener(|view, _: &Generate, window, cx| view.generate(When::WhenIdle, window, cx)))
             .child(self.sidebar(cx))
             .child(match mode {
                 Mode::Simple => self.simple(cx).into_any_element(),
@@ -1503,38 +1728,7 @@ impl ImageWindow {
             .flex_col()
             .gap_3()
             .p_5()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().flex_1().min_w_0().key_context(PROMPT_CONTEXT)
-                        .child(Textarea::new(&self.prompt).disabled(self.busy)))
-                    .child(
-                        Button::new("generate")
-                            .primary()
-                            .flex_shrink_0()
-                            .label(if self.busy {
-                                if self.cancellation.is_cancelled() { "Cancelling…" } else { "Cancel" }
-                            } else {
-                                "Generate"
-                            })
-                            .when(!self.busy, |button| button.tooltip("Generate (⌘↩)"))
-                            .disabled(self.loading_image || (self.busy && self.cancellation.is_cancelled()))
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                if view.busy { view.cancel(cx); } else { view.generate(window, cx); }
-                            })),
-                    )
-                    .when(self.busy && self.pause.is_some(), |row| row.child(
-                        Button::new("pause")
-                            .flex_shrink_0()
-                            .icon(Icon::default().path(if self.paused { "icons/play.svg" } else { "icons/pause.svg" }))
-                            .selected(self.paused)
-                            .tooltip(if self.paused { "Resume generation" } else { "Pause generation after the current layer" })
-                            .disabled(self.cancellation.is_cancelled())
-                            .on_click(cx.listener(|view, _, _, cx| view.toggle_pause(cx))),
-                    ))
-            )
+            .child(self.prompt_section(true, cx))
             .child(div().flex().flex_wrap().items_center().gap_3()
                 .child(div().flex().items_center().gap_2()
                     .child(match fixed_steps {
@@ -1588,6 +1782,12 @@ impl ImageWindow {
                     Some(timing) => row.child(div().text_color(palette(cx).muted).child(timing.label())),
                     None => row,
                 })
+                .when(self.unenhanced.is_some() && !self.busy, |row| row.child(
+                    Button::new("revert-prompt")
+                        .small()
+                        .label("Undo enhance")
+                        .tooltip("Restore the prompt from before Enhance")
+                        .on_click(cx.listener(|view, _, window, cx| view.revert_prompt(window, cx)))))
                 .when(self.completed, |row| row.child(
                     div().flex().items_center().gap_2().ml_auto()
                     .child(
@@ -1609,6 +1809,7 @@ impl ImageWindow {
                             } else { "Show the reference image before generation" })
                             .on_click(cx.listener(|view, _, _, cx| view.toggle_before(cx))),
                     )))))
+            .children(self.description_panel(cx))
             .when_some(self.painting.filter(|_| !self.busy), |view_root, index| {
                 let has_strokes = !self.references[index].strokes.is_empty();
                 let crop_region = self.crop.and_then(|crop| {
@@ -1689,6 +1890,216 @@ impl ImageWindow {
                     .child(self.preview_panel(cx))
                     .child(self.history_panel(cx)),
             )
+    }
+
+    /// The prompt with its title row (Enhance, Describe, and the running
+    /// task's Pause and Cancel) and, beside it, the two Generate buttons.
+    fn prompt_section(&self, describe: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let cancelling = self.cancellation.is_cancelled();
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_h(px(28.))
+                    .child(div().text_sm().text_color(palette(cx).muted).child("Prompt"))
+                    .child(self.text_buttons(describe, cx))
+                    .child(div().flex_1())
+                    .when(!self.queue.is_empty(), |row| row.child(
+                        Button::new("clear-queue")
+                            .small()
+                            .label(format!("Clear queue ({})", self.queue.len()))
+                            .tooltip("Remove the generations waiting to start")
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.queue.clear();
+                                cx.notify();
+                            })),
+                    ))
+                    .when(self.busy && self.pause.is_some(), |row| row.child(
+                        Button::new("pause")
+                            .small()
+                            .icon(Icon::default().path(if self.paused { "icons/play.svg" } else { "icons/pause.svg" }))
+                            .selected(self.paused)
+                            .tooltip(if self.paused { "Resume" } else { "Pause after the current layer" })
+                            .disabled(cancelling)
+                            .on_click(cx.listener(|view, _, _, cx| view.toggle_pause(cx))),
+                    ))
+                    .when(self.busy, |row| row.child(
+                        Button::new("cancel")
+                            .small()
+                            .label(if cancelling { "Cancelling…" } else { "Cancel" })
+                            .tooltip("Stop the running task. Queued generations still start.")
+                            .disabled(cancelling)
+                            .on_click(cx.listener(|view, _, _, cx| view.cancel(cx))),
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .key_context(PROMPT_CONTEXT)
+                            // Editable while generating, to queue the next prompt.
+                            .child(Textarea::new(&self.prompt).disabled(self.writing.is_some())),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .w(px(176.))
+                            .flex_shrink_0()
+                            .child(
+                                Button::new("generate-now")
+                                    .primary()
+                                    .w_full()
+                                    .label("Generate now")
+                                    .tooltip(if self.busy {
+                                        "Cancel the running task and generate this prompt"
+                                    } else {
+                                        "Generate this prompt"
+                                    })
+                                    .disabled(self.loading_image || (self.busy && cancelling))
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.generate(When::Now, window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("generate-when-idle")
+                                    .w_full()
+                                    .label(match self.queue.len() {
+                                        0 => "Generate when idle".to_string(),
+                                        n => format!("Generate when idle ({n})"),
+                                    })
+                                    .tooltip("Generate this prompt after the running and queued generations finish (⌘↩)")
+                                    .disabled(self.loading_image)
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.generate(When::WhenIdle, window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    /// Enhance, and in Advanced mode Describe, before the Generate button.
+    fn text_buttons(&self, describe: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let blocker = self.text_blocker(cx);
+        let tooltip = |action: &'static str| -> SharedString {
+            match &blocker {
+                Some(blocker) => blocker.clone().into(),
+                None => action.into(),
+            }
+        };
+        div()
+            .flex()
+            .flex_shrink_0()
+            .gap_2()
+            .child(
+                Button::new("enhance-prompt")
+                    .small()
+                    .icon(Icon::default().path("icons/sparkles.svg"))
+                    .label("Enhance")
+                    .loading(self.writing == Some(TextTask::EnhancePrompt))
+                    .tooltip(tooltip(
+                        "Rewrite the prompt in detail with the model's built-in language model. \
+                         With references, it becomes a precise edit instruction.",
+                    ))
+                    .disabled(self.busy || self.loading_image)
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.write_text(TextTask::EnhancePrompt, window, cx)
+                    })),
+            )
+            .when(describe, |row| {
+                row.child(
+                    Button::new("describe-references")
+                        .small()
+                        .icon(Icon::default().path("icons/image.svg"))
+                        .label("Describe")
+                        .loading(self.writing == Some(TextTask::Describe))
+                        .tooltip(tooltip("Describe the reference images in detail"))
+                        .disabled(self.busy || self.loading_image || self.references.is_empty())
+                        .on_click(cx.listener(|view, _, window, cx| {
+                            view.write_text(TextTask::Describe, window, cx)
+                        })),
+                )
+            })
+    }
+
+    fn description_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let description = self.description.clone()?;
+        let writing = self.writing == Some(TextTask::Describe);
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_3()
+                .rounded_md()
+                .border_1()
+                .border_color(palette(cx).border)
+                .bg(palette(cx).panel)
+                .text_sm()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().flex_1().text_color(palette(cx).strong_text).child("Description"))
+                        .child(
+                            Button::new("description-to-prompt")
+                                .small()
+                                .label("Use as prompt")
+                                .tooltip("Replace the prompt with this description")
+                                .disabled(self.writing.is_some() || description.trim().is_empty())
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    if let Some(text) = view.description.clone() {
+                                        view.prompt.update(cx, |input, cx| input.set_value(text, window, cx));
+                                        view.unenhanced = None;
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                        .child(
+                            Button::new("copy-description")
+                                .small()
+                                .label("Copy")
+                                .disabled(description.trim().is_empty())
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(description.clone()))
+                                }),
+                        )
+                        .child(
+                            Button::new("close-description")
+                                .small()
+                                .label("Close")
+                                .disabled(writing)
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.description = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("description-text")
+                        .max_h(px(200.))
+                        .overflow_y_scroll()
+                        .whitespace_normal()
+                        .child(match self.description.as_deref() {
+                            Some("") if writing => "Looking at the references…".to_string(),
+                            Some(text) => text.to_string(),
+                            None => String::new(),
+                        }),
+                ),
+        )
     }
 
     fn canvas(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2121,41 +2532,7 @@ impl ImageWindow {
             .flex_col()
             .gap_4()
             .p_5()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .key_context(PROMPT_CONTEXT)
-                            .child(Textarea::new(&self.prompt).disabled(self.busy)),
-                    )
-                    .child(
-                        Button::new("generate")
-                            .primary()
-                            .flex_shrink_0()
-                            .label(if self.busy {
-                                if self.cancellation.is_cancelled() {
-                                    "Cancelling…"
-                                } else {
-                                    "Cancel"
-                                }
-                            } else {
-                                "Generate"
-                            })
-                            .when(!self.busy, |button| button.tooltip("Generate (⌘↩)"))
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                if view.busy {
-                                    view.cancel(cx);
-                                } else {
-                                    view.generate(window, cx);
-                                }
-                            })),
-                    ),
-            )
+            .child(self.prompt_section(false, cx))
             .child(
                 div()
                     .flex_1()
@@ -2180,6 +2557,17 @@ impl ImageWindow {
                     })
                     .when_some(self.timing.as_ref(), |row, timing| {
                         row.child(div().text_color(palette(cx).muted).child(timing.label()))
+                    })
+                    .when(self.unenhanced.is_some() && !self.busy, |row| {
+                        row.child(
+                            Button::new("revert-prompt")
+                                .small()
+                                .label("Undo enhance")
+                                .tooltip("Restore the prompt from before Enhance")
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.revert_prompt(window, cx)
+                                })),
+                        )
                     }),
             )
     }
