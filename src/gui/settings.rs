@@ -166,7 +166,7 @@ pub fn parse_size(text: &str) -> Result<u32, &'static str> {
     text.parse::<u32>()
         .ok()
         .filter(|size| (32..=2048).contains(size) && size % 32 == 0)
-        .ok_or("Size must be a multiple of 32 between 32 and 2048 pixels (square image).")
+        .ok_or("Size must be a multiple of 32 between 32 and 2048 pixels.")
 }
 
 pub fn digits_input(
@@ -305,7 +305,7 @@ fn servers_field(
                         .when(index > 0, |row| row.border_t_1().border_color(palette(cx).border))
                         .child(div().flex().items_center().gap_2()
                             .child(div().flex_1().min_w_0().truncate().text_sm().child(server.clone()))
-                            .child(Button::new(("remove-server", index)).xsmall().ghost()
+                            .child(Button::new(("remove-server", index)).xsmall().danger()
                                 .icon(Icon::default().path("icons/trash.svg")).tooltip("Remove host")
                                 .on_click({
                                     let panel = panel.clone();
@@ -514,7 +514,7 @@ impl Render for SettingsPanel {
                                                     .default_value(defaults.size as f64),
                                                 )
                                                 .description(
-                                                    "The default square output size, a multiple of 32.",
+                                                    "The default output size, a multiple of 32: the side of a square image; other aspect ratios keep about the same pixel count.",
                                                 ),
                                             )
                                     )

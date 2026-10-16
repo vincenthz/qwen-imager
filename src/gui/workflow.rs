@@ -7,7 +7,7 @@ use gpui::{
     Bounds, Context, CursorStyle, FocusHandle, MouseButton, MouseDownEvent, MouseMoveEvent,
     PathBuilder, Pixels, Point, Window, canvas, div, point, prelude::*, px, rgb, size,
 };
-use gpui_component::{Disableable, Sizable, button::Button};
+use gpui_component::{Disableable, Sizable, button::{Button, ButtonVariants as _}};
 
 const WIDTH: f32 = 216.;
 const HEIGHT: f32 = 144.;
@@ -665,7 +665,7 @@ impl Render for WorkflowCanvas {
                             cx.notify();
                         }
                     })))
-                .child(Button::new("workflow-remove").small().label("Remove").disabled(self.selected.is_none())
+                .child(Button::new("workflow-remove").small().danger().label("Remove").disabled(self.selected.is_none())
                     .on_click(cx.listener(|view, _, _, cx| view.delete_selected(cx)))))
             .child(div().px_3().pb_2().text_xs().text_color(palette(cx).muted)
                 .child("Workflow canvas · Arrange and connect nodes. Configuration and execution are coming later."))

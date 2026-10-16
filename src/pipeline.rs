@@ -388,7 +388,7 @@ pub(crate) fn decode(
     ))
 }
 
-fn dimensions(
+pub(crate) fn dimensions(
     ratio: Option<&str>,
     reference: Option<(u32, u32)>,
     scale: f64,
@@ -509,6 +509,12 @@ mod tests {
         assert_eq!(dimensions(Some("16:9"), None, 0.5)?, (1376, 768));
         assert_eq!(dimensions(None, Some((1600, 900)), 1.)?, (2720, 1536));
         assert!(dimensions(None, None, 0.001).is_err());
+        for ratio in crate::ASPECT_RATIOS {
+            let (w, h) = dimensions(Some(ratio), None, 0.25)?;
+            let (a, b) = ratio.split_once(':').unwrap();
+            let expected = a.parse::<f64>()? / b.parse::<f64>()?;
+            assert!((w as f64 / h as f64 / expected - 1.).abs() < 0.05, "{ratio}: {w}×{h}");
+        }
         Ok(())
     }
 

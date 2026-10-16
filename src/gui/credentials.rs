@@ -4,7 +4,7 @@ use crate::palette::palette;
 use gpui::{App, Context, Entity, Task, Window, div, prelude::*};
 use gpui_component::{
     Disableable, Sizable,
-    button::Button,
+    button::{Button, ButtonVariants as _},
     input::{Input, InputState},
 };
 
@@ -280,6 +280,7 @@ impl Render for HostCredentials {
                     .child(
                         Button::new("clear-host-token")
                             .small()
+                            .danger()
                             .label("Clear token")
                             .disabled(self.busy || !self.has_token)
                             .on_click(cx.listener(|view, _, window, cx| view.clear(window, cx))),

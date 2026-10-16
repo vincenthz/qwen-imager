@@ -8,6 +8,7 @@ mod models;
 mod palette;
 mod settings;
 mod timing;
+mod viewer;
 mod window;
 mod workflow;
 mod workspaces;
@@ -34,6 +35,12 @@ impl AssetSource for Assets {
             "icons/server.svg" => Some(Cow::Borrowed(include_bytes!("assets/server.svg"))),
             "icons/sun.svg" => Some(Cow::Borrowed(include_bytes!("assets/sun.svg"))),
             "icons/moon.svg" => Some(Cow::Borrowed(include_bytes!("assets/moon.svg"))),
+            "icons/use-input.svg" => Some(Cow::Borrowed(include_bytes!("assets/use-input.svg"))),
+            "icons/panel-close.svg" => Some(Cow::Borrowed(include_bytes!("assets/panel-close.svg"))),
+            "icons/panel-open.svg" => Some(Cow::Borrowed(include_bytes!("assets/panel-open.svg"))),
+            // Used by gpui_component menus and dropdown buttons.
+            "icons/check.svg" => Some(Cow::Borrowed(include_bytes!("assets/check.svg"))),
+            "icons/chevron-down.svg" => Some(Cow::Borrowed(include_bytes!("assets/chevron-down.svg"))),
             _ => None,
         })
     }
@@ -55,6 +62,11 @@ impl AssetSource for Assets {
             "icons/server.svg",
             "icons/sun.svg",
             "icons/moon.svg",
+            "icons/use-input.svg",
+            "icons/panel-close.svg",
+            "icons/panel-open.svg",
+            "icons/check.svg",
+            "icons/chevron-down.svg",
         ]
         .into_iter()
         .filter(|asset| asset.starts_with(path))

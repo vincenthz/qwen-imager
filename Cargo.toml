@@ -15,7 +15,7 @@ osx_minimum_system_version = "11.0"
 [features]
 default = ["cli"]
 cli = ["dep:clap", "dep:axum", "dep:tokio"]
-gui = ["dep:gpui", "dep:gpui-platform", "dep:gpui-component", "dep:async-channel", "dep:rfd"]
+gui = ["dep:gpui", "dep:gpui-platform", "dep:gpui-component", "dep:async-channel", "dep:rfd", "dep:chrono"]
 
 [[bin]]
 name = "image-forger-cli"
@@ -36,6 +36,7 @@ async-channel = { version = "2", optional = true }
 gpui = { package = "gpui-pre", version = "=0.3.7", optional = true }
 gpui-platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["font-kit", "runtime_shaders"], optional = true }
 gpui-component = { version = "0.7", optional = true }
+chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
 candle-core = { version = "0.9", features = ["metal"] }
 candle-nn = { version = "0.9", features = ["metal"] }
 candle-metal-kernels = "0.9"

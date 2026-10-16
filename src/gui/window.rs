@@ -11,23 +11,26 @@ use std::{
 use anyhow::Context as _;
 
 use crate::{
-    settings::{Backend, Settings, digits_input, parse_size, parse_steps, server_url},
+    settings::{Backend, Settings, digits_input, parse_steps, server_url},
     timing::{GenerationTiming, format_duration},
+    viewer::{ImageViewer, ViewerEvent},
 };
 
 use crate::palette::{Palette, palette};
 use gpui::{
-    Bounds, Context, CursorStyle, DevicePixels, Entity, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ObjectFit, PathBuilder, Pixels, Point, RenderImage, Task,
+    Bounds, ClickEvent, Context, CursorStyle, DevicePixels, Entity, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ObjectFit, PathBuilder, Pixels, Point, RenderImage, Subscription, Task,
     Window, canvas, div, img, point, prelude::*, px, relative, rgb, size,
 };
 use gpui_component::{
     Disableable, Icon, Selectable, Sizable as _,
     button::*,
     input::{Input, InputState, Textarea, TextareaState},
+    menu::{DropdownMenu as _, PopupMenuItem},
+    tooltip::Tooltip,
 };
 use image_forger::{
-    AttentionPrecision, CancellationToken, Cancelled, Event, Generation,
+    ASPECT_RATIOS, AttentionPrecision, CancellationToken, Cancelled, Event, Generation,
     Generator, PauseControl, PreviewControl, Request, RgbaImage, Stage,
 };
 
@@ -37,6 +40,8 @@ gpui::actions!(image_window, [Generate]);
 pub const PROMPT_CONTEXT: &str = "Prompt";
 
 const MAX_REFERENCES: usize = 10;
+/// Output sizes offered in the Size menu, besides the default from Settings.
+const SIZE_PRESETS: [u32; 8] = [256, 384, 512, 768, 1024, 1280, 1536, 2048];
 const DECODING_PREVIEW: &str = " — decoding preview…";
 
 /// A newly available image or a completed generation, for the workspace tab.
@@ -199,19 +204,54 @@ struct ReferenceImage {
     strokes: Vec<Stroke>,
 }
 
+/// Settings of a running generation, recorded for its history entry.
+struct RunDetails {
+    prompt: String,
+    seed: u64,
+    steps: usize,
+    ratio: Option<&'static str>,
+}
+
 /// A completed generation kept in the workspace history.
 struct HistoryItem {
     image: Arc<RgbaImage>,
     thumbnail: Arc<RenderImage>,
+    finished: chrono::DateTime<chrono::Local>,
+    elapsed: Duration,
+    details: Option<RunDetails>,
 }
 
 impl HistoryItem {
-    fn new(image: Arc<RgbaImage>) -> Self {
+    fn new(image: Arc<RgbaImage>, elapsed: Duration, details: Option<RunDetails>) -> Self {
         let thumbnail = image::imageops::thumbnail(&*image, 256, 256);
         Self {
             image,
             thumbnail: render_image(&thumbnail),
+            finished: chrono::Local::now(),
+            elapsed,
+            details,
         }
+    }
+
+    /// Label and value rows shown when hovering the entry.
+    fn metadata(&self) -> Vec<(&'static str, String)> {
+        let (width, height) = self.image.dimensions();
+        let mut rows = vec![
+            ("Generated", self.finished.format("%Y-%m-%d %H:%M:%S").to_string()),
+            ("Took", precise_duration(self.elapsed)),
+            ("Size", format!("{width}×{height}")),
+        ];
+        if let Some(details) = &self.details {
+            rows.push(("Seed", details.seed.to_string()));
+            rows.push(("Steps", details.steps.to_string()));
+            rows.push(("Aspect", details.ratio.unwrap_or("Match reference").into()));
+            rows.push(("Prompt", match details.prompt.chars().count() {
+                0 => "(none)".into(),
+                n if n > 200 => format!("{}…", details.prompt.chars().take(200).collect::<String>()),
+                _ => details.prompt.clone(),
+            }));
+        }
+        rows
     }
 }
 
@@ -235,6 +275,16 @@ impl ReferenceImage {
             image,
             strokes: Vec::new(),
         }
+    }
+
+    /// Label and value rows shown when hovering the reference.
+    fn metadata(&self) -> Vec<(&'static str, String)> {
+        let (width, height) = self.image.dimensions();
+        vec![
+            ("Name", self.name.clone()),
+            ("Size", format!("{width}×{height}")),
+            ("Aspect", aspect_label((width, height))),
+        ]
     }
 
     /// Applies pending strokes to the full-resolution pixels and refreshes the preview.
@@ -269,9 +319,12 @@ pub struct ImageWindow {
     workflow: Entity<crate::workflow::WorkflowCanvas>,
     prompt: Entity<TextareaState>,
     steps: Entity<InputState>,
-    size: Entity<InputState>,
+    // Side of a square output; other aspect ratios keep about the same pixel count.
+    size: u32,
     seed: Entity<InputState>,
     automatic_seed: bool,
+    // Output aspect ratio; None follows the last reference.
+    ratio: Option<&'static str>,
     previews: PreviewMode,
     preview_control: Option<PreviewControl>,
     pause: Option<PauseControl>,
@@ -284,6 +337,11 @@ pub struct ImageWindow {
     references: Vec<ReferenceImage>,
     // Completed generations for this workspace, newest last.
     history: Vec<HistoryItem>,
+    history_open: bool,
+    // Settings of the running generation, for its history entry.
+    run: Option<RunDetails>,
+    // Full-size viewer opened by double-clicking an image.
+    viewer: Option<(Entity<ImageViewer>, Subscription)>,
     // Reference being painted on or cropped in the main view, if any.
     painting: Option<usize>,
     tool: Tool,
@@ -333,7 +391,6 @@ impl ImageWindow {
         });
         let settings = cx.global::<Settings>().clone();
         let steps = cx.new(|cx| digits_input(window, cx, settings.steps.to_string()));
-        let size = cx.new(|cx| digits_input(window, cx, settings.size.to_string()));
         let seed = cx.new(|cx| {
             digits_input(window, cx, rand::random_range(0..(1_u64 << 30)).to_string())
         });
@@ -342,9 +399,10 @@ impl ImageWindow {
             workflow: cx.new(crate::workflow::WorkflowCanvas::new),
             prompt,
             steps,
-            size,
+            size: settings.size,
             seed,
             automatic_seed: true,
+            ratio: Some("1:1"),
             previews: PreviewMode::from_settings(&settings),
             preview_control: None,
             pause: None,
@@ -356,6 +414,9 @@ impl ImageWindow {
             loading_image: false,
             references: Vec::new(),
             history: Vec::new(),
+            history_open: true,
+            run: None,
+            viewer: None,
             painting: None,
             tool: Tool::Draw,
             paint_color: PaintColor::Red,
@@ -415,13 +476,12 @@ impl ImageWindow {
             return;
         }
         let settings = cx.global::<Settings>().clone();
-        for (input, old, new) in [
-            (&self.steps, previous.steps.to_string(), settings.steps.to_string()),
-            (&self.size, previous.size.to_string(), settings.size.to_string()),
-        ] {
-            if input.read(cx).value().as_ref() == old.as_str() {
-                input.update(cx, |input, cx| input.set_value(new, window, cx));
-            }
+        let (old, new) = (previous.steps.to_string(), settings.steps.to_string());
+        if self.steps.read(cx).value().as_ref() == old.as_str() {
+            self.steps.update(cx, |input, cx| input.set_value(new, window, cx));
+        }
+        if self.size == previous.size {
+            self.size = settings.size;
         }
         cx.notify();
     }
@@ -482,18 +542,8 @@ impl ImageWindow {
         };
         // Trailing blank lines would otherwise change the prompt's encoding.
         let mut request = Request::new(self.prompt.read(cx).value().trim());
-        let size = match parse_size(&self.size.read(cx).value()) {
-            Ok(size) => size,
-            Err(error) => {
-                crate::errors::report("Validating generation settings", &anyhow::anyhow!(error), cx);
-                self.status = error.into();
-                cx.notify();
-                return;
-            }
-        };
-        request.scale = f64::from(size) / 2048.;
-        // Keep the Size control's square output dimensions when editing a reference.
-        request.ratio = Some("1:1".into());
+        request.scale = f64::from(self.size) / 2048.;
+        request.ratio = self.ratio.map(Into::into);
         request.steps = match parse_steps(&self.steps.read(cx).value()) {
             Ok(steps) => steps,
             Err(error) => {
@@ -533,6 +583,12 @@ impl ImageWindow {
         if self.automatic_seed {
             request.seed = self.randomize_seed(window, cx);
         }
+        self.run = Some(RunDetails {
+            prompt: request.prompt.clone(),
+            seed: request.seed,
+            steps: request.steps,
+            ratio: self.ratio,
+        });
         self.busy = true;
         self.previews = previews;
         self.preview_control = request.preview_control.clone();
@@ -778,6 +834,69 @@ impl ImageWindow {
         }
     }
 
+    /// The image shown in the main view when no reference is being edited.
+    fn displayed(&self) -> Option<&Arc<RenderImage>> {
+        self.viewing
+            .as_ref()
+            .or_else(|| self.before.as_ref().filter(|_| self.showing_before))
+            .or(self.rendered.as_ref())
+            .or_else(|| self.references.last().map(|reference| &reference.preview))
+    }
+
+    /// Opens the viewer on a texture it then owns.
+    fn open_viewer(&mut self, image: Arc<RenderImage>, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_viewer(window, cx);
+        let viewer = cx.new(|cx| ImageViewer::new(image, window, cx));
+        let subscription = cx.subscribe_in(&viewer, window, |view, _, event, window, cx| match event {
+            ViewerEvent::Close => {
+                view.close_viewer(window, cx);
+                view.activate(window, cx);
+            }
+        });
+        self.viewer = Some((viewer, subscription));
+        cx.notify();
+    }
+
+    fn close_viewer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((viewer, _)) = self.viewer.take() {
+            let _ = window.drop_image(viewer.read(cx).image().clone());
+            cx.notify();
+        }
+    }
+
+    fn view_displayed_full(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.painting.is_some() {
+            return;
+        }
+        if let Some(texture) = self.displayed().and_then(|image| copy_texture(image)) {
+            self.open_viewer(texture, window, cx);
+        }
+    }
+
+    fn view_reference_full(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(reference) = self.references.get(index) else {
+            return;
+        };
+        // Show pending paint as it will be applied.
+        let texture = if reference.strokes.is_empty() {
+            render_image(&reference.image)
+        } else {
+            let mut painted = (*reference.image).clone();
+            for stroke in &reference.strokes {
+                rasterize_stroke(&mut painted, stroke);
+            }
+            render_image(&painted)
+        };
+        self.open_viewer(texture, window, cx);
+    }
+
+    fn view_history_full(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(item) = self.history.get(index) {
+            let texture = render_image(&item.image);
+            self.open_viewer(texture, window, cx);
+        }
+    }
+
     fn remove_history(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.history.len() {
             return;
@@ -984,6 +1103,77 @@ impl ImageWindow {
         cx.notify();
     }
 
+    fn reference_dimensions(&self) -> Option<(u32, u32)> {
+        self.references.last().map(|reference| reference.image.dimensions())
+    }
+
+    /// The output size the current Size and Aspect settings produce.
+    fn output_dimensions(&self) -> Option<(u32, u32)> {
+        output_dimensions(self.size, self.ratio, self.reference_dimensions())
+    }
+
+    fn size_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        let (current, ratio) = (self.size, self.ratio);
+        let reference = self.reference_dimensions();
+        let default = cx.global::<Settings>().size;
+        Button::new("output-size")
+            .label(format!("{current} px"))
+            .dropdown_caret(true)
+            .tooltip("Output size: the side of a square image. Other aspect ratios keep about the same pixel count.")
+            .disabled(self.busy)
+            .dropdown_menu(move |menu, _, _| {
+                size_options(current, default).into_iter().fold(menu, |menu, size| {
+                    let view = view.clone();
+                    let mut label = format!("{size} px");
+                    if let Some((width, height)) = output_dimensions(size, ratio, reference) {
+                        label.push_str(&format!(" · {width}×{height}"));
+                    }
+                    if size == default {
+                        label.push_str(" · default");
+                    }
+                    menu.item(
+                        PopupMenuItem::new(label)
+                            .checked(size == current)
+                            .on_click(move |_, _, cx| {
+                                let _ = view.update(cx, |view, cx| {
+                                    view.size = size;
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                })
+            })
+    }
+
+    fn ratio_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity().downgrade();
+        let current = self.ratio;
+        let reference = self.reference_dimensions();
+        Button::new("aspect-ratio")
+            .label(ratio_label(current, reference))
+            .dropdown_caret(true)
+            .tooltip("Output aspect ratio. Size sets the side of a square image; other ratios keep about the same pixel count.")
+            .disabled(self.busy)
+            .dropdown_menu(move |menu, _, _| {
+                let options = std::iter::once(None).chain(ASPECT_RATIOS.into_iter().map(Some));
+                options.fold(menu, |menu, ratio| {
+                    let view = view.clone();
+                    let menu = menu.item(
+                        PopupMenuItem::new(ratio_label(ratio, reference))
+                            .checked(current == ratio)
+                            .on_click(move |_, _, cx| {
+                                let _ = view.update(cx, |view, cx| {
+                                    view.ratio = ratio;
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                    if ratio.is_none() { menu.separator() } else { menu }
+                })
+            })
+    }
+
     fn randomize_seed(&mut self, window: &mut Window, cx: &mut Context<Self>) -> u64 {
         let seed = rand::random_range(0..(1_u64 << 30));
         self.seed.update(cx, |input, cx| {
@@ -1050,6 +1240,10 @@ impl ImageWindow {
             }
             Message::Inference(event) => match event {
                 Event::Started { steps, .. } => {
+                    // A saved schedule may override the requested steps.
+                    if let Some(run) = &mut self.run {
+                        run.steps = steps;
+                    }
                     let mut timing = GenerationTiming::new(steps);
                     timing.set_paused(self.paused);
                     self.timing = Some(timing);
@@ -1122,7 +1316,7 @@ impl ImageWindow {
                 match result {
                     Ok(generated) => {
                         self.set_image(generated.image.clone(), window);
-                        self.history.push(HistoryItem::new(generated.image));
+                        self.history.push(HistoryItem::new(generated.image, generated.elapsed, self.run.take()));
                         // References cannot change while busy, so these are the run's inputs.
                         self.before = self.references.last().map(|r| r.preview.clone());
                         self.completed = true;
@@ -1130,6 +1324,7 @@ impl ImageWindow {
                         self.status = format!("Complete — {}", format_duration(generated.elapsed));
                     }
                     Err(error) => {
+                        self.run = None;
                         if !error.is::<Cancelled>() { crate::errors::report("Generating image", &error, cx); }
                         self.status = error_status(error);
                     },
@@ -1270,6 +1465,7 @@ impl Render for ImageWindow {
         let mode = self.mode;
         div()
             .size_full()
+            .relative()
             .flex()
             .bg(palette(cx).background)
             .text_color(palette(cx).text)
@@ -1280,6 +1476,7 @@ impl Render for ImageWindow {
                 Mode::Advanced => self.advanced(cx).into_any_element(),
                 Mode::Workflow => self.workflow.clone().into_any_element(),
             })
+            .when_some(self.viewer.as_ref(), |root, (viewer, _)| root.child(viewer.clone()))
     }
 }
 
@@ -1346,8 +1543,13 @@ impl ImageWindow {
                     })
                     .child(Input::new(&self.steps).w(px(72.)).disabled(self.busy || fixed_steps.is_some())))
                 .child(div().flex().items_center().gap_2()
-                    .child("Size (px)")
-                    .child(Input::new(&self.size).w(px(80.)).disabled(self.busy)))
+                    .child("Size")
+                    .child(self.size_menu(cx)))
+                .child(div().flex().items_center().gap_2()
+                    .child("Aspect")
+                    .child(self.ratio_menu(cx))
+                    .when_some(self.output_dimensions(), |row, (width, height)| row.child(
+                        div().text_sm().text_color(palette(cx).muted).child(format!("{width}×{height}")))))
                 .child(div().flex().items_center().gap_2()
                     .child(Button::new("seed-mode")
                         .label(if self.automatic_seed { "Auto seed" } else { "Manual seed" })
@@ -1391,6 +1593,7 @@ impl ImageWindow {
                     .child(
                         Button::new("use-as-input")
                             .flex_shrink_0()
+                            .icon(Icon::default().path("icons/use-input.svg"))
                             .label("Use as input")
                             .tooltip("Replace all reference images with this result to keep editing it")
                             .disabled(self.loading_image)
@@ -1425,7 +1628,7 @@ impl ImageWindow {
                     .when(self.tool == Tool::Crop, |row| row
                     .child(Button::new("square-crop").label("Square")
                         .selected(self.square_crop)
-                        .tooltip("Keep the selection square, like the generated image")
+                        .tooltip("Keep the selection square")
                         .on_click(cx.listener(|view, _, _, cx| {
                             view.square_crop = !view.square_crop;
                             cx.notify();
@@ -1490,6 +1693,7 @@ impl ImageWindow {
 
     fn canvas(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .id("preview-canvas")
             .flex_1()
             .min_h_0()
             .w_full()
@@ -1521,8 +1725,14 @@ impl ImageWindow {
                             container.child(crop_overlay(crop_bounds(crop, dimensions, self.square_crop), dimensions, palette(cx)))
                         })
                 }
-                None => container.map(|container| match self.viewing.as_ref().or_else(|| self.before.as_ref().filter(|_| self.showing_before)).or(self.rendered.as_ref()).or_else(|| self.references.last().map(|reference| &reference.preview)) {
-                Some(image) => container.child(
+                None => container.map(|container| match self.displayed() {
+                Some(image) => container
+                    .on_click(cx.listener(|view, event: &ClickEvent, window, cx| {
+                        if event.click_count() == 2 {
+                            view.view_displayed_full(window, cx);
+                        }
+                    }))
+                    .child(
                     img(image.clone())
                         .size_full()
                         .object_fit(ObjectFit::Contain),
@@ -1642,8 +1852,24 @@ impl ImageWindow {
                                     .when(!self.busy && !self.loading_image, |tile| {
                                         tile.cursor_pointer()
                                     })
-                                    .on_click(cx.listener(move |view, _, _, cx| {
-                                        view.view_reference(index, cx)
+                                    .tooltip({
+                                        let rows: Rc<[(&'static str, String)]> = reference.metadata().into();
+                                        move |window, cx| {
+                                            let rows = rows.clone();
+                                            Tooltip::element(move |_, cx| {
+                                                history_tooltip(&rows, cx).child(
+                                                    div().text_color(palette(cx).muted)
+                                                        .child("Click to preview · Double-click to view full size"))
+                                            })
+                                            .build(window, cx)
+                                        }
+                                    })
+                                    .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
+                                        if event.click_count() == 2 {
+                                            view.view_reference_full(index, window, cx);
+                                        } else {
+                                            view.view_reference(index, cx);
+                                        }
                                     }))
                                     .child(
                                         img(reference.preview.clone())
@@ -1654,6 +1880,14 @@ impl ImageWindow {
                                         tile.child(stroke_overlay(reference, None))
                                     }),
                             )
+                            .child({
+                                let (width, height) = reference.image.dimensions();
+                                div()
+                                    .text_xs()
+                                    .text_color(palette(cx).muted)
+                                    .truncate()
+                                    .child(format!("{width}×{height} · {}", aspect_label((width, height))))
+                            })
                             .child(
                                 div()
                                     .flex()
@@ -1661,6 +1895,7 @@ impl ImageWindow {
                                     .child(
                                         Button::new(("remove-image", index))
                                             .xsmall()
+                                            .danger()
                                             .icon(Icon::default().path("icons/trash.svg"))
                                             .tooltip(format!("Remove {}", reference.name))
                                             .disabled(self.busy || self.loading_image)
@@ -1690,6 +1925,38 @@ impl ImageWindow {
     }
 
     fn history_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.history_open {
+            return div()
+                .w(px(40.))
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_2()
+                .py_2()
+                .rounded_md()
+                .bg(palette(cx).panel)
+                .child(
+                    Button::new("expand-history")
+                        .ghost()
+                        .small()
+                        .icon(Icon::default().path("icons/panel-open.svg"))
+                        .tooltip("Show history")
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.history_open = true;
+                            cx.notify();
+                        })),
+                )
+                .when(!self.history.is_empty(), |strip| {
+                    strip.child(
+                        div()
+                            .text_xs()
+                            .text_color(palette(cx).muted)
+                            .child(self.history.len().to_string()),
+                    )
+                })
+                .into_any_element();
+        }
         div()
             .w(px(220.))
             .flex_shrink_0()
@@ -1699,7 +1966,24 @@ impl ImageWindow {
             .p_2()
             .rounded_md()
             .bg(palette(cx).panel)
-            .child(div().text_sm().text_color(palette(cx).muted).child("History"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_sm().text_color(palette(cx).muted).child("History"))
+                    .child(
+                        Button::new("collapse-history")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::default().path("icons/panel-close.svg"))
+                            .tooltip("Hide history")
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.history_open = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
             .child(
                 div()
                     .id("history-list")
@@ -1712,6 +1996,7 @@ impl ImageWindow {
                     .children(self.history.iter().enumerate().map(|(index, item)| {
                         let thumbnail = item.thumbnail.clone();
                         let image = item.image.clone();
+                        let metadata: Rc<[(&'static str, String)]> = item.metadata().into();
                         div()
                             .w_full()
                             .flex_shrink_0()
@@ -1732,8 +2017,17 @@ impl ImageWindow {
                                     .border_color(palette(cx).border)
                                     .bg(palette(cx).card)
                                     .cursor_pointer()
-                                    .on_click(cx.listener(move |view, _, _, cx| {
-                                        view.view_history(index, cx)
+                                    .tooltip(move |window, cx| {
+                                        let metadata = metadata.clone();
+                                        Tooltip::element(move |_, cx| history_tooltip(&metadata, cx))
+                                            .build(window, cx)
+                                    })
+                                    .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
+                                        if event.click_count() == 2 {
+                                            view.view_history_full(index, window, cx);
+                                        } else {
+                                            view.view_history(index, cx);
+                                        }
                                     }))
                                     .child(
                                         img(thumbnail)
@@ -1747,7 +2041,8 @@ impl ImageWindow {
                                     .gap_1()
                                     .child(
                                         Button::new(("remove-history", index))
-                                            .xsmall()
+                                            .small()
+                                            .danger()
                                             .icon(Icon::default().path("icons/trash.svg"))
                                             .tooltip("Remove from history")
                                             .on_click(cx.listener(move |view, _, window, cx| {
@@ -1756,7 +2051,7 @@ impl ImageWindow {
                                     )
                                     .child(
                                         Button::new(("save-history", index))
-                                            .xsmall()
+                                            .small()
                                             .flex_1()
                                             .icon(Icon::default().path("icons/save.svg"))
                                             .tooltip("Save PNG")
@@ -1766,10 +2061,11 @@ impl ImageWindow {
                                     )
                                     .child(
                                         Button::new(("use-history", index))
-                                            .xsmall()
+                                            .small()
                                             .flex_1()
-                                            .icon(Icon::default().path("icons/image.svg"))
+                                            .child(Icon::default().path("icons/use-input.svg").size(px(18.)))
                                             .tooltip("Use as input")
+                                            .disabled(self.busy || self.loading_image)
                                             .on_click(cx.listener(move |view, _, window, cx| {
                                                 view.use_history_as_input(index, window, cx)
                                             })),
@@ -1785,6 +2081,7 @@ impl ImageWindow {
                         )
                     }),
             )
+            .into_any_element()
     }
 
     fn sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1894,6 +2191,75 @@ fn error_status(error: anyhow::Error) -> String {
     } else {
         format!("Error: {error:#}")
     }
+}
+
+/// The aspect ratio of `width`×`height`, reduced when its terms are small
+/// (1920×1080 is 16:9) and as a decimal otherwise (2560×1080 is 2.37:1).
+fn aspect_label((width, height): (u32, u32)) -> String {
+    fn gcd(a: u32, b: u32) -> u32 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    let divisor = gcd(width, height).max(1);
+    let (a, b) = (width / divisor, height / divisor);
+    if a <= 32 && b <= 32 {
+        format!("{a}:{b}")
+    } else if width >= height {
+        format!("{:.2}:1", width as f32 / height as f32)
+    } else {
+        format!("1:{:.2}", height as f32 / width as f32)
+    }
+}
+
+/// The Size menu: the presets plus the current and default sizes, ascending.
+fn size_options(current: u32, default: u32) -> Vec<u32> {
+    let mut sizes: Vec<u32> = SIZE_PRESETS.into_iter().chain([current, default]).collect();
+    sizes.sort_unstable();
+    sizes.dedup();
+    sizes
+}
+
+fn output_dimensions(size: u32, ratio: Option<&str>, reference: Option<(u32, u32)>) -> Option<(u32, u32)> {
+    image_forger::output_dimensions(ratio, reference, f64::from(size) / 2048.).ok()
+}
+
+/// An output ratio choice; None follows the last reference, or is square.
+fn ratio_label(ratio: Option<&str>, reference: Option<(u32, u32)>) -> String {
+    match (ratio, reference) {
+        (Some(ratio), _) => ratio.into(),
+        (None, Some(reference)) => format!("Match reference ({})", aspect_label(reference)),
+        (None, None) => "Match reference (1:1)".into(),
+    }
+}
+
+/// Durations under a minute keep a tenth of a second, so fast runs compare.
+fn precise_duration(duration: Duration) -> String {
+    if duration < Duration::from_secs(60) {
+        format!("{:.1}s", duration.as_secs_f32())
+    } else {
+        format_duration(duration)
+    }
+}
+
+fn history_tooltip(rows: &[(&'static str, String)], cx: &gpui::App) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .max_w(px(320.))
+        .text_xs()
+        .children(rows.iter().map(|(label, value)| {
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(64.))
+                        .flex_shrink_0()
+                        .text_color(palette(cx).muted)
+                        .child(*label),
+                )
+                .child(div().min_w_0().child(value.clone()))
+        }))
 }
 
 fn contain(bounds: Bounds<Pixels>, (width, height): (u32, u32)) -> Bounds<Pixels> {
@@ -2118,6 +2484,15 @@ fn rasterize_stroke(image: &mut RgbaImage, stroke: &Stroke) {
     }
 }
 
+/// A separate texture with the same pixels, so its owner can drop it independently.
+fn copy_texture(image: &RenderImage) -> Option<Arc<RenderImage>> {
+    let size = image.size(0);
+    let bytes = image.as_bytes(0)?.to_vec();
+    // Already BGRA: RgbaImage is only the 4-channel container here.
+    let buffer = RgbaImage::from_raw(size.width.0 as u32, size.height.0 as u32, bytes)?;
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
+}
+
 fn render_image(rgba: &RgbaImage) -> Arc<RenderImage> {
     // GPUI's RenderImage expects BGRA bytes. Preserve alpha for the preview.
     let mut bgra = rgba.clone();
@@ -2199,6 +2574,51 @@ mod tests {
             &[10, 30, 200, 128]
         );
         assert_eq!(rgba.as_raw(), &[200, 30, 10, 128]);
+    }
+
+    #[test]
+    fn aspect_labels_reduce_small_terms_and_fall_back_to_decimals() {
+        assert_eq!(aspect_label((1920, 1080)), "16:9");
+        assert_eq!(aspect_label((1024, 1536)), "2:3");
+        assert_eq!(aspect_label((512, 512)), "1:1");
+        assert_eq!(aspect_label((2560, 1080)), "2.37:1");
+        assert_eq!(aspect_label((1179, 2556)), "1:2.17");
+        assert_eq!(ratio_label(None, Some((4000, 3000))), "Match reference (4:3)");
+        assert_eq!(ratio_label(Some("9:16"), Some((4000, 3000))), "9:16");
+    }
+
+    #[test]
+    fn size_options_include_current_and_default_sizes_once() {
+        assert_eq!(size_options(512, 1024), SIZE_PRESETS);
+        assert_eq!(size_options(544, 2048), [256, 384, 512, 544, 768, 1024, 1280, 1536, 2048]);
+        assert_eq!(size_options(96, 640), [96, 256, 384, 512, 640, 768, 1024, 1280, 1536, 2048]);
+        for size in SIZE_PRESETS {
+            assert!(crate::settings::parse_size(&size.to_string()).is_ok(), "{size}");
+        }
+    }
+
+    #[test]
+    fn texture_copy_keeps_pixels_under_a_new_id() {
+        let original = render_image(&RgbaImage::from_raw(2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap());
+        let copy = copy_texture(&original).unwrap();
+        assert_ne!(copy.id, original.id);
+        assert_eq!(copy.size(0), original.size(0));
+        assert_eq!(copy.as_bytes(0), original.as_bytes(0));
+    }
+
+    #[test]
+    fn history_metadata_reports_time_duration_and_settings() {
+        let details = RunDetails { prompt: "x".repeat(300), seed: 42, steps: 8, ratio: Some("16:9") };
+        let item = HistoryItem::new(Arc::new(RgbaImage::new(64, 32)), Duration::from_millis(3400), Some(details));
+        let rows = item.metadata();
+        let value = |label| rows.iter().find(|(l, _)| *l == label).map(|(_, v)| v.as_str());
+        assert_eq!(value("Took"), Some("3.4s"));
+        assert_eq!(value("Size"), Some("64×32"));
+        assert_eq!(value("Seed"), Some("42"));
+        assert_eq!(value("Steps"), Some("8"));
+        assert_eq!(value("Aspect"), Some("16:9"));
+        assert_eq!(value("Prompt").unwrap().chars().count(), 201);
+        assert_eq!(value("Generated").unwrap().len(), "2026-01-01 00:00:00".len());
     }
 
     #[test]

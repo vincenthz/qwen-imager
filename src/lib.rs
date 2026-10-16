@@ -102,6 +102,19 @@ pub enum AttentionPrecision {
     BFloat16,
 }
 
+/// Output aspect ratios accepted by [`Request::ratio`].
+pub const ASPECT_RATIOS: [&str; 7] = ["1:1", "4:3", "3:4", "3:2", "2:3", "16:9", "9:16"];
+
+/// Output size for `ratio` at `scale` of native 2K resolution. Without a ratio,
+/// follows the `reference` dimensions, or is square.
+pub fn output_dimensions(
+    ratio: Option<&str>,
+    reference: Option<(u32, u32)>,
+    scale: f64,
+) -> Result<(u32, u32)> {
+    pipeline::dimensions(ratio, reference, scale)
+}
+
 impl Request {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {

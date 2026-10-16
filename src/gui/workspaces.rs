@@ -316,10 +316,16 @@ impl Render for Workspaces {
                             }))
                             .children(self.tabs.iter().enumerate().map(|(index, _)| {
                                 let unread = self.activity.unread.contains(&index);
+                                // A Tab icon would replace the label, so the bell is a child.
                                 Tab::new()
                                     .label(format!("Workspace {}", index + 1))
                                     .when(unread, |tab| {
-                                        tab.icon(Icon::default().path("icons/bell.svg"))
+                                        tab.child(
+                                            Icon::default()
+                                                .path("icons/bell.svg")
+                                                .size_3p5()
+                                                .text_color(palette(cx).accent),
+                                        )
                                     })
                             }))
                             .suffix(
