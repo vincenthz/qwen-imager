@@ -18,7 +18,7 @@ use crate::{
 
 use crate::palette::{AccentSelected as _, Heading as _, Palette, palette};
 use gpui::{
-    Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, DevicePixels, Entity, MouseButton, MouseDownEvent,
+    Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, DevicePixels, Entity, EntityId, MouseButton, MouseDownEvent,
     MouseMoveEvent, ObjectFit, PathBuilder, Pixels, Point, RenderImage, SharedString, Subscription, Task,
     Window, canvas, div, img, point, prelude::*, px, relative, rgb, size,
 };
@@ -216,6 +216,31 @@ struct ReferenceImage {
     preview: Arc<RenderImage>,
     // Paint not yet applied to `image`; it is baked in when generation starts.
     strokes: Vec<Stroke>,
+}
+
+/// A reference tile dragged to a new position in its workspace's list.
+#[derive(Clone)]
+struct DraggedReference {
+    workspace: EntityId,
+    index: usize,
+    preview: Arc<RenderImage>,
+}
+
+impl Render for DraggedReference {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Matches the tile in the 220px references panel, so it lifts in place.
+        div()
+            .w(px(204.))
+            .h(px(110.))
+            .overflow_hidden()
+            .rounded_md()
+            .border_1()
+            .border_color(palette(cx).accent)
+            .bg(palette(cx).card)
+            .opacity(0.8)
+            .cursor_grabbing()
+            .child(img(self.preview.clone()).size_full().object_fit(ObjectFit::Contain))
+    }
 }
 
 /// Whether a generation interrupts the running one or waits for it.
@@ -963,6 +988,20 @@ impl ImageWindow {
         } else {
             format!("{} reference image(s) loaded.", self.references.len())
         };
+        cx.notify();
+    }
+
+    /// Moves a reference to `to`, shifting the ones in between; the order is
+    /// the order the model sees them in.
+    fn move_reference(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let count = self.references.len();
+        if self.busy || self.loading_image || from == to || from >= count || to >= count {
+            return;
+        }
+        let reference = self.references.remove(from);
+        self.references.insert(to, reference);
+        self.painting = self.painting.map(|painting| moved_index(painting, from, to));
+        self.status = format!("Reference moved to position {} of {count}.", to + 1);
         cx.notify();
     }
 
@@ -2248,6 +2287,8 @@ impl ImageWindow {
                     .overflow_y_scroll()
                     .children(self.references.iter().enumerate().map(|(index, reference)| {
                         let selected = self.painting == Some(index);
+                        let workspace = cx.entity_id();
+                        let movable = !self.busy && !self.loading_image && self.references.len() > 1;
                         div()
                             .w_full()
                             .flex_shrink_0()
@@ -2275,6 +2316,23 @@ impl ImageWindow {
                                     .when(!self.busy && !self.loading_image, |tile| {
                                         tile.cursor_pointer()
                                     })
+                                    .when(movable, |tile| {
+                                        tile.on_drag(
+                                            DraggedReference { workspace, index, preview: reference.preview.clone() },
+                                            |drag, _, _, cx| cx.new(|_| drag.clone()),
+                                        )
+                                        .can_drop(move |value, _, _| {
+                                            value
+                                                .downcast_ref::<DraggedReference>()
+                                                .is_some_and(|drag| drag.workspace == workspace && drag.index != index)
+                                        })
+                                        .drag_over::<DraggedReference>(|tile, _, _, cx| {
+                                            tile.border_2().border_color(palette(cx).accent)
+                                        })
+                                        .on_drop(cx.listener(move |view, drag: &DraggedReference, _, cx| {
+                                            view.move_reference(drag.index, index, cx);
+                                        }))
+                                    })
                                     .tooltip({
                                         let rows: Rc<[(&'static str, String)]> = reference.metadata().into();
                                         move |window, cx| {
@@ -2282,7 +2340,7 @@ impl ImageWindow {
                                             Tooltip::element(move |_, cx| {
                                                 history_tooltip(&rows, cx).child(
                                                     div().text_color(palette(cx).muted)
-                                                        .child("Click to preview · Double-click to view full size"))
+                                                        .child("Click to preview · Double-click to view full size · Drag to reorder"))
                                             })
                                             .build(window, cx)
                                         }
@@ -2582,6 +2640,19 @@ impl ImageWindow {
                         )
                     }),
             )
+    }
+}
+
+/// Where the item at `index` ends up after the item at `from` moves to `to`.
+fn moved_index(index: usize, from: usize, to: usize) -> usize {
+    if index == from {
+        to
+    } else if from < index && index <= to {
+        index - 1
+    } else if to <= index && index < from {
+        index + 1
+    } else {
+        index
     }
 }
 
@@ -2919,6 +2990,18 @@ mod tests {
             step,
             total,
             image: Arc::new(RgbaImage::new(1, 1)),
+        }
+    }
+
+    #[test]
+    fn moved_index_follows_the_reordered_list() {
+        for (from, to) in [(0, 3), (3, 0), (1, 2), (2, 1), (4, 0), (0, 4)] {
+            let mut list: Vec<usize> = (0..5).collect();
+            let item = list.remove(from);
+            list.insert(to, item);
+            for index in 0..5 {
+                assert_eq!(list[moved_index(index, from, to)], index, "{from} → {to}, item {index}");
+            }
         }
     }
 
