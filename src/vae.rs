@@ -140,7 +140,14 @@ fn conv(
             stride,
             ..Default::default()
         };
-        return candle_nn::conv2d(input, output, kernel, config, vb)?.forward(x);
+        let conv = candle_nn::conv2d(input, output, kernel, config, vb)?;
+        if !crate::device::upcast(x) {
+            return conv.forward(x);
+        }
+        let bias = conv.bias().map(|b| b.to_dtype(DType::F32)).transpose()?;
+        return candle_nn::Conv2d::new(conv.weight().to_dtype(DType::F32)?, bias, config)
+            .forward(&x.to_dtype(DType::F32)?)?
+            .to_dtype(x.dtype());
     }
     let oh = (h + 2 * padding - kernel) / stride + 1;
     let ow = (w + 2 * padding - kernel) / stride + 1;
@@ -311,9 +318,30 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the cached Qwen 2.1 checkpoint and Metal GPU access"]
+    fn cpu_bf16_convolution_matches_f32() -> Result<()> {
+        let x = Tensor::randn(0f32, 1., (1, 8, 6, 5), &Device::Cpu)?;
+        let tensors = std::collections::HashMap::from([
+            (
+                "weight".into(),
+                Tensor::randn(0f32, 0.2, (4, 8, 3, 3), &Device::Cpu)?,
+            ),
+            ("bias".into(), Tensor::randn(0f32, 1., 4, &Device::Cpu)?),
+        ]);
+        let run = |dtype| -> Result<Tensor> {
+            let vb = VarBuilder::from_tensors(tensors.clone(), dtype, &Device::Cpu);
+            conv(&x.to_dtype(dtype)?, vb, 8, 4, 3, 1, 2)?.to_dtype(DType::F32)
+        };
+        let (expected, actual) = (run(DType::F32)?, run(DType::BF16)?);
+        assert_eq!(actual.dims(), [1, 4, 3, 3]);
+        let error = (expected - actual)?.abs()?.flatten_all()?.max(0)?;
+        assert!(error.to_scalar::<f32>()? < 0.05);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires the cached Qwen 2.1 checkpoint"]
     fn checkpoint_matches_diffusers_reference() -> anyhow::Result<()> {
-        let device = Device::new_metal(0)?;
+        let device = crate::device::new()?;
         let weights = crate::weights::Weights::new(None, true, crate::Checkpoint::Original);
         let vae = Vae::new(
             weights.builder("vae", DType::F32, &device)?,

@@ -117,9 +117,19 @@ impl Default for Settings {
 impl Global for Settings {}
 
 impl Settings {
+    #[cfg(target_os = "macos")]
     fn path() -> Option<PathBuf> {
         let home = std::env::var_os("HOME")?;
         Some(PathBuf::from(home).join("Library/Application Support/ImageForger/settings.json"))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn path() -> Option<PathBuf> {
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| Some(PathBuf::from(std::env::var_os("HOME")?).join(".config")))?;
+        Some(config.join("ImageForger/settings.json"))
     }
 
     /// Missing or unreadable settings fall back to the defaults.
@@ -540,7 +550,7 @@ impl Render for SettingsPanel {
                                     .group(
                                         SettingGroup::new()
                                             .title("Compute hosts")
-                                            .description("Add a host or HTTP(S) URL. Paste its IMAGEFORGER_API_TOKEN and server identity from the server console, then Save & test. Tokens are stored in macOS Keychain.")
+                                            .description("Add a host or HTTP(S) URL. Paste its IMAGEFORGER_API_TOKEN and server identity from the server console, then Save & test. Tokens are stored in the system keychain.")
                                             .item(
                                                 SettingItem::render({
                                                     let panel = panel.clone();

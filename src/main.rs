@@ -11,7 +11,7 @@ mod server;
 #[derive(Parser)]
 #[command(
     version,
-    about = "Generate or edit a PNG with ImageForger on Apple Metal"
+    about = "Generate or edit a PNG with ImageForger on Apple Metal or the CPU"
 )]
 struct Args {
     /// Text prompt describing the image or edit; with --describe, an optional question
@@ -228,7 +228,8 @@ fn main() -> anyhow::Result<()> {
             steps,
             seed,
         } => eprintln!(
-            "{checkpoint} · Metal · {width}x{height} · {steps} steps · seed {seed}"
+            "{checkpoint} · {} · {width}x{height} · {steps} steps · seed {seed}",
+            image_forger::DEVICE
         ),
         Event::Progress {
             stage,

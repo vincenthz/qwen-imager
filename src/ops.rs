@@ -228,6 +228,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     #[ignore = "requires Metal GPU access"]
     fn metal_attention_matches_dense_reference() -> Result<()> {
         let gpu = Device::new_metal(0)?;
@@ -301,6 +302,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     #[ignore = "requires Metal GPU access"]
     fn causal_attention_ignores_stale_memory_after_the_last_key() -> Result<()> {
         // A fresh device has its own buffer pool. Releasing a larger NaN buffer
@@ -347,6 +349,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     #[ignore = "requires Metal GPU access"]
     fn attention_handles_qwen_key_magnitudes() -> Result<()> {
         let data = candle_core::safetensors::load(

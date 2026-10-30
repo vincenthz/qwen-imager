@@ -1,7 +1,10 @@
-//! Immutable model buffers shared by independent Metal inference queues.
+//! Immutable model buffers shared by independent Metal inference queues. On the
+//! CPU every session shares the same tensors directly.
 use crate::weights::Weights;
 use anyhow::Result;
-use candle_core::{DType, Device, Shape, Storage, Tensor, metal_backend::MetalStorage};
+use candle_core::{DType, Device, Shape, Tensor};
+#[cfg(target_os = "macos")]
+use candle_core::{Storage, metal_backend::MetalStorage};
 use candle_nn::{VarBuilder, var_builder::SimpleBackend};
 use std::{
     collections::HashMap,
@@ -44,7 +47,7 @@ impl SharedWeights {
             None => {
                 // Each component has a loading queue, serialized by its tensor
                 // cache lock. Workspaces never enqueue work on these queues.
-                let loader = Device::new_metal(0)?;
+                let loader = crate::device::new()?;
                 let source = weights.uncached_builder(component, dtype, &loader)?;
                 let tensors = Arc::new(SharedTensors {
                     source,
@@ -141,6 +144,7 @@ impl SimpleBackend for SharedBackend {
 // shared across queues must NOT go back into that allocator when one alias is
 // dropped. Private buffers are excluded from Candle's allocator; Metal's own
 // retain count then keeps the allocation alive across all workspace aliases.
+#[cfg(target_os = "macos")]
 fn immutable_buffer(tensor: Tensor) -> candle_core::Result<Tensor> {
     let Device::Metal(device) = tensor.device() else {
         return Ok(tensor);
@@ -179,6 +183,12 @@ fn immutable_buffer(tensor: Tensor) -> candle_core::Result<Tensor> {
     )))
 }
 
+#[cfg(not(target_os = "macos"))]
+fn immutable_buffer(tensor: Tensor) -> candle_core::Result<Tensor> {
+    Ok(tensor)
+}
+
+#[cfg(target_os = "macos")]
 fn on_queue(tensor: &Tensor, target: &Device) -> candle_core::Result<Tensor> {
     if tensor.device().same_device(target) {
         return Ok(tensor.clone());
@@ -205,6 +215,11 @@ fn on_queue(tensor: &Tensor, target: &Device) -> candle_core::Result<Tensor> {
         }
         _ => candle_core::bail!("shared weights require queues on the same physical device"),
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn on_queue(tensor: &Tensor, target: &Device) -> candle_core::Result<Tensor> {
+    tensor.to_device(target)
 }
 
 #[cfg(test)]
@@ -267,9 +282,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     #[ignore = "requires Metal GPU access"]
     fn metal_weight_aliases_share_storage_across_independent_queues() -> Result<()> {
-        let loader = Device::new_metal(0)?;
+        let loader = crate::device::new()?;
         let first = Device::new_metal(0)?;
         let second = Device::new_metal(0)?;
         let source = immutable_buffer(Tensor::new(&[1f32, 2., 3., 4.], &loader)?)?;

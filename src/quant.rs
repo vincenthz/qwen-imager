@@ -10,12 +10,17 @@
 //! never exist in device memory. The CPU (and unsupported shapes) dequantize
 //! into a temporary dense weight instead.
 use candle_core::{
-    CpuStorage, CustomOp2, CustomOp3, DType, Device, Layout, MetalStorage, Module, Result, Shape,
-    Tensor, backend::BackendStorage,
+    CpuStorage, CustomOp2, CustomOp3, DType, Device, Layout, Module, Result, Shape, Tensor,
 };
+#[cfg(target_os = "macos")]
+use candle_core::{MetalStorage, backend::BackendStorage};
+#[cfg(target_os = "macos")]
 use candle_metal_kernels::metal::ComputePipeline;
 use candle_nn::VarBuilder;
+#[cfg(target_os = "macos")]
 use objc2_metal::{MTLResourceUsage, MTLSize};
+use rayon::prelude::*;
+#[cfg(target_os = "macos")]
 use std::{collections::HashMap, sync::Mutex};
 
 pub enum Linear {
@@ -95,11 +100,24 @@ impl Linear {
     }
 }
 
+impl Linear {
+    /// The product in float32, from BF16 or packed weights converted per call.
+    fn forward_f32(&self, x: &Tensor) -> Result<Tensor> {
+        let (weight, bias) = match self {
+            Self::Dense(linear) => (linear.weight().to_dtype(DType::F32)?, linear.bias()),
+            Self::Affine(a) => (a.dequantize_in(DType::F32)?, a.bias.as_ref()),
+        };
+        let bias = bias.map(|b| b.to_dtype(DType::F32)).transpose()?;
+        candle_nn::Linear::new(weight, bias).forward(&x.to_dtype(DType::F32)?)
+    }
+}
+
 impl Module for Linear {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Dense(linear) => linear.forward(x),
             Self::Affine(a) if a.fused(x) => a.forward(x),
+            _ if crate::device::upcast(x) => self.forward_f32(x)?.to_dtype(x.dtype()),
+            Self::Dense(linear) => linear.forward(x),
             Self::Affine(_) => self.dense()?.forward(x),
         }
     }
@@ -143,9 +161,14 @@ impl Affine {
     }
 
     fn dequantize(&self) -> Result<Tensor> {
+        self.dequantize_in(self.scales.dtype())
+    }
+
+    /// Dense weights in `dtype`, which the scales and offsets are converted to.
+    fn dequantize_in(&self, dtype: DType) -> Result<Tensor> {
         self.packed.apply_op3_no_bwd(
-            &self.scales,
-            &self.offsets,
+            &self.scales.to_dtype(dtype)?,
+            &self.offsets.to_dtype(dtype)?,
             &Dequantize {
                 bits: self.bits,
                 group: self.group,
@@ -155,6 +178,7 @@ impl Affine {
     }
 }
 
+#[cfg(target_os = "macos")]
 const SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -311,6 +335,7 @@ template [[host_name("dequantize_bf16")]] [[kernel]] void dequantize<bfloat>(
     device bfloat *, uint2);
 "#;
 
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct DequantizeParams {
     input: u32,
@@ -321,8 +346,10 @@ struct DequantizeParams {
     bits: u32,
 }
 
+#[cfg(target_os = "macos")]
 static PIPELINES: Mutex<Option<HashMap<(u64, &'static str), ComputePipeline>>> = Mutex::new(None);
 
+#[cfg(target_os = "macos")]
 fn pipeline(device: &candle_core::MetalDevice, name: &'static str) -> Result<ComputePipeline> {
     let metal = device.device();
     let key = (metal.registry_id(), name);
@@ -350,6 +377,7 @@ struct Dequantize {
     input: usize,
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct Qmm {
     scales: Tensor,
     offsets: Tensor,
@@ -357,6 +385,7 @@ struct Qmm {
     group: usize,
 }
 
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct QmmParams {
     m: u32,
@@ -367,6 +396,7 @@ struct QmmParams {
 }
 
 /// A contiguous Metal tensor's buffer and byte offset.
+#[cfg(target_os = "macos")]
 fn metal_buffer(t: &Tensor) -> Result<(candle_metal_kernels::metal::Buffer, usize)> {
     let (storage, layout) = t.storage_and_layout();
     let candle_core::Storage::Metal(storage) = &*storage else {
@@ -393,6 +423,7 @@ impl CustomOp2 for Qmm {
         candle_core::bail!("mlx-qmm is Metal-only")
     }
 
+    #[cfg(target_os = "macos")]
     fn metal_fwd(
         &self,
         x: &MetalStorage,
@@ -524,15 +555,18 @@ impl CustomOp3 for Dequantize {
         let groups = self.input / self.group;
         let per_word = 32 / self.bits;
         let mask = (1u32 << self.bits) - 1;
-        let mut values = Vec::with_capacity(output * self.input);
-        for row in 0..output {
-            for col in 0..self.input {
-                let word = packed[row * words + col / per_word];
-                let q = (word >> (self.bits * (col % per_word))) & mask;
-                let g = row * groups + col / self.group;
-                values.push(scales_f[g] * q as f32 + offsets_f[g]);
-            }
-        }
+        let mut values = vec![0f32; output * self.input];
+        values
+            .par_chunks_mut(self.input)
+            .enumerate()
+            .for_each(|(row, values)| {
+                for (col, value) in values.iter_mut().enumerate() {
+                    let word = packed[row * words + col / per_word];
+                    let q = (word >> (self.bits * (col % per_word))) & mask;
+                    let g = row * groups + col / self.group;
+                    *value = scales_f[g] * q as f32 + offsets_f[g];
+                }
+            });
         let storage = match scales {
             CpuStorage::BF16(_) => {
                 CpuStorage::BF16(values.into_iter().map(half::bf16::from_f32).collect())
@@ -542,6 +576,7 @@ impl CustomOp3 for Dequantize {
         Ok((storage, Shape::from((output, self.input))))
     }
 
+    #[cfg(target_os = "macos")]
     fn metal_fwd(
         &self,
         packed: &MetalStorage,
@@ -654,11 +689,12 @@ mod tests {
 
     #[test]
     fn cpu_dequantization_matches_mlx() -> Result<()> {
-        // Candle's CPU backend has no BF16 matmul.
+        check(&Device::Cpu, DType::BF16)?;
         check(&Device::Cpu, DType::F32)
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     #[ignore = "requires Metal GPU access"]
     fn metal_dequantization_matches_mlx() -> Result<()> {
         let device = Device::new_metal(0)?;
@@ -667,6 +703,7 @@ mod tests {
     }
 
     /// A random packed layer: words, scales and offsets of plausible magnitude.
+    #[cfg(target_os = "macos")]
     fn random_layer(
         n: usize,
         k: usize,
@@ -702,6 +739,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     #[ignore = "requires Metal GPU access"]
     fn fused_metal_matmul_matches_dequantized_weights() -> Result<()> {
         let gpu = Device::new_metal(0)?;

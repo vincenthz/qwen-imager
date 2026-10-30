@@ -73,7 +73,7 @@ fn ui_messages_and_inputs_can_cross_threads() {
 }
 
 #[test]
-#[ignore = "requires cached Qwen Image 2.1 checkpoint and Metal GPU"]
+#[ignore = "requires cached Qwen Image 2.1 checkpoint"]
 fn manual_background_previews_preserve_pixels_and_do_not_leak_between_runs()
 -> image_forger::Result<()> {
     let mut request = Request::new("A red ceramic teapot on a wooden table.");
@@ -137,7 +137,7 @@ fn manual_background_previews_preserve_pixels_and_do_not_leak_between_runs()
 }
 
 #[test]
-#[ignore = "requires cached Qwen Image 2.1 checkpoint and Metal GPU"]
+#[ignore = "requires cached Qwen Image 2.1 checkpoint"]
 fn blocking_previews_and_pause_hold_sampling() -> image_forger::Result<()> {
     use std::time::{Duration, Instant};
     let mut request = Request::new("A red ceramic teapot on a wooden table.");
@@ -195,7 +195,7 @@ fn blocking_previews_and_pause_hold_sampling() -> image_forger::Result<()> {
 }
 
 #[test]
-#[ignore = "requires cached Qwen Image 2.1 checkpoint and Metal GPU"]
+#[ignore = "requires cached Qwen Image 2.1 checkpoint"]
 fn previews_preserve_output_and_report_ordered_progress() -> image_forger::Result<()> {
     let mut request = Request::new("A red ceramic teapot on a wooden table.");
     request.scale = 0.0625;
@@ -321,7 +321,7 @@ fn previews_preserve_output_and_report_ordered_progress() -> image_forger::Resul
 }
 
 #[test]
-#[ignore = "requires cached Qwen Image 2.1 checkpoint and Metal GPU"]
+#[ignore = "requires cached Qwen Image 2.1 checkpoint"]
 fn cached_encoder_results_match_a_fresh_generator() -> image_forger::Result<()> {
     let cancellation = CancellationToken::default();
     let mut request = Request::new("A red ceramic teapot on a wooden table.");
@@ -376,7 +376,7 @@ fn cached_encoder_results_match_a_fresh_generator() -> image_forger::Result<()> 
 }
 
 #[test]
-#[ignore = "requires cached Qwen Image 2.1 checkpoint and Metal GPU"]
+#[ignore = "requires cached Qwen Image 2.1 checkpoint"]
 fn shared_model_sessions_run_concurrently_and_cancel_independently() -> image_forger::Result<()> {
     use image_forger::{PreviewControl, SharedModel};
     use std::{sync::mpsc, thread, time::Duration};
@@ -492,7 +492,7 @@ fn shared_model_sessions_run_concurrently_and_cancel_independently() -> image_fo
 }
 
 #[test]
-#[ignore = "requires the cached MLX 4-bit checkpoint and Metal GPU"]
+#[ignore = "requires the cached MLX 4-bit checkpoint"]
 fn mlx_checkpoint_generates_and_edits_with_shared_weights() -> image_forger::Result<()> {
     use image_forger::{Checkpoint, SharedModel};
     let model = SharedModel::new(ModelOptions {

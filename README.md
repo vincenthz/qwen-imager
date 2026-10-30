@@ -7,6 +7,31 @@ and RGBA PNG output. An optional GPUI desktop window uses the same library.
 The library takes and returns in-memory RGBA images. It runs the original BF16
 checkpoint or a smaller MLX-quantized (4-bit or 8-bit) pack of the same model.
 
+## Linux (CPU)
+
+On Linux (and any platform other than macOS) the same code runs on Candle's CPU
+backend; no GPU is used. Weights stay BF16 (or packed) in memory, and each
+matrix product and VAE convolution is computed in float32, since Candle's CPU
+backend has no BF16 matmul. Expect minutes per step rather than seconds; the
+Turbo checkpoint's 8 steps or an MLX pack are the practical choices. RAM needs follow
+the checkpoint sizes below (about 32 GB for BF16, 11 GB for MLX 4-bit) plus
+working memory.
+
+```sh
+cargo run --release --bin image-forger-cli -- --model turbo "a red fox in the snow"
+```
+
+The desktop window also builds on Linux. On Fedora, install its system
+libraries first:
+
+```sh
+sudo dnf install wayland-devel libxkbcommon-devel libxkbcommon-x11-devel \
+  libxcb-devel fontconfig-devel freetype-devel vulkan-loader-devel dbus-devel
+```
+
+Settings are stored in `$XDG_CONFIG_HOME/ImageForger/settings.json` (by default
+`~/.config`), and API tokens in the Secret Service keyring.
+
 ## Desktop window
 
 From the repository root:

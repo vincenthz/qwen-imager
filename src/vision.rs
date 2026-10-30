@@ -68,7 +68,10 @@ pub fn encode(
     let patch_weight = vb
         .get((1152, 3, 2, 16, 16), "patch_embed.proj.weight")?
         .reshape((1152, 1536))?;
-    let patch = candle_nn::Linear::new(patch_weight, Some(vb.get(1152, "patch_embed.proj.bias")?));
+    let patch = crate::quant::Linear::Dense(candle_nn::Linear::new(
+        patch_weight,
+        Some(vb.get(1152, "patch_embed.proj.bias")?),
+    ));
     let mut x = patch.forward(&Tensor::from_vec(pixels, (n, 1536), device)?.to_dtype(dtype)?)?;
 
     // Learned 48x48 positions, bilinear interpolation with aligned corners.

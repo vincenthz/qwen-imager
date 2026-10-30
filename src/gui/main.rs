@@ -86,12 +86,12 @@ fn main() {
             let appearance = settings.appearance;
             cx.set_global(settings);
             Theme::change(appearance.mode(), None, cx);
-            // Bound after gpui_component so Cmd-Enter in the prompt generates
-            // instead of inserting a newline like Enter.
+            // Bound after gpui_component so Cmd-Enter (Ctrl-Enter off macOS)
+            // in the prompt generates instead of inserting a newline like Enter.
             cx.bind_keys([
-                KeyBinding::new("cmd-q", Quit, None),
+                KeyBinding::new("secondary-q", Quit, None),
                 KeyBinding::new(
-                    "cmd-enter",
+                    "secondary-enter",
                     window::Generate,
                     Some(&format!("{} > Input", window::PROMPT_CONTEXT)),
                 ),

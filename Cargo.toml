@@ -2,14 +2,14 @@
 name = "image-forger"
 version = "0.1.0"
 edition = "2024"
-description = "ImageForger: image generation and editing on Apple Metal"
+description = "ImageForger: image generation and editing on Apple Metal or the CPU"
 
 [package.metadata.bundle.bin.ImageForger]
 name = "ImageForger"
 identifier = "app.image-forger.desktop"
 icon = ["assets/app-icon.icns"]
 category = "Photography"
-short_description = "Create and edit photos locally with generative AI."
+short_description = "Create and edit photos locally with generative AI"
 osx_minimum_system_version = "11.0"
 
 [features]
@@ -34,25 +34,31 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "sync"], optional = true }
 async-channel = { version = "2", optional = true }
 gpui = { package = "gpui-pre", version = "=0.3.9", optional = true }
-gpui-platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["font-kit", "runtime_shaders"], optional = true }
+gpui-platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["font-kit", "runtime_shaders", "wayland", "x11"], optional = true }
 gpui-component = { version = "0.8", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
-candle-core = { version = "0.9", features = ["metal"] }
-candle-nn = { version = "0.9", features = ["metal"] }
-candle-metal-kernels = "0.9"
+candle-core = "0.9"
+candle-nn = "0.9"
 clap = { version = "4", features = ["derive"], optional = true }
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 half = "2"
 heic-rs = "0.1.1"
 rfd = { version = "0.17.2", optional = true }
-objc2-metal = { version = "0.3", default-features = false, features = ["MTLDevice"] }
 rand = "0.9"
+rayon = "1"
 rand_distr = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 ureq = "2"
+
+# Metal on macOS; every other platform runs on the CPU.
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.9", features = ["metal"] }
+candle-nn = { version = "0.9", features = ["metal"] }
+candle-metal-kernels = "0.9"
+objc2-metal = { version = "0.3", default-features = false, features = ["MTLDevice"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -1,13 +1,18 @@
 //! Metal kernels for the VAE's NCHW convolutions and channel norms. Candle's
 //! conv2d and strided copies are bandwidth-starved at VAE sizes; these kernels
 //! read NCHW directly and write the layouts the following matmul needs.
-use candle_core::{
-    CustomOp1, DType, Layout, MetalStorage, Result, Shape, Tensor, backend::BackendStorage,
-};
+//! Other platforms use Candle's own convolutions instead.
+use candle_core::{CustomOp1, Layout, Result, Shape, Tensor};
+#[cfg(target_os = "macos")]
+use candle_core::{DType, MetalStorage, backend::BackendStorage};
+#[cfg(target_os = "macos")]
 use candle_metal_kernels::metal::ComputePipeline;
+#[cfg(target_os = "macos")]
 use objc2_metal::{MTLResourceUsage, MTLSize};
+#[cfg(target_os = "macos")]
 use std::{collections::HashMap, sync::Mutex};
 
+#[cfg(target_os = "macos")]
 const SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -75,6 +80,7 @@ template [[host_name("channel_norm_bf16")]] [[kernel]] void channel_norm<bfloat>
     constant ChannelNorm &, device const bfloat *, device const bfloat *, device bfloat *, uint);
 "#;
 
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct Im2colParams {
     c: u32,
@@ -88,6 +94,7 @@ struct Im2colParams {
     rows: u32,
 }
 
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct ChannelNormParams {
     c: u32,
@@ -95,9 +102,12 @@ struct ChannelNormParams {
     scale: f32,
 }
 
+#[cfg(target_os = "macos")]
 type PipelineKey = (u64, &'static str);
+#[cfg(target_os = "macos")]
 static PIPELINES: Mutex<Option<HashMap<PipelineKey, ComputePipeline>>> = Mutex::new(None);
 
+#[cfg(target_os = "macos")]
 fn pipeline(device: &candle_core::MetalDevice, name: &'static str) -> Result<ComputePipeline> {
     let metal = device.device();
     let key = (metal.registry_id(), name);
@@ -119,6 +129,7 @@ fn pipeline(device: &candle_core::MetalDevice, name: &'static str) -> Result<Com
     Ok(p)
 }
 
+#[cfg(target_os = "macos")]
 fn kernel_name(dtype: DType, f32: &'static str, bf16: &'static str) -> Result<&'static str> {
     match dtype {
         DType::F32 => Ok(f32),
@@ -127,6 +138,7 @@ fn kernel_name(dtype: DType, f32: &'static str, bf16: &'static str) -> Result<&'
     }
 }
 
+#[cfg(target_os = "macos")]
 fn size(x: usize, y: usize) -> MTLSize {
     MTLSize {
         width: x,
@@ -135,6 +147,7 @@ fn size(x: usize, y: usize) -> MTLSize {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct Im2colOp {
     k: usize,
     stride: usize,
@@ -157,6 +170,7 @@ impl CustomOp1 for Im2colOp {
         candle_core::bail!("vae-im2col is Metal-only")
     }
 
+    #[cfg(target_os = "macos")]
     fn metal_fwd(&self, storage: &MetalStorage, layout: &Layout) -> Result<(MetalStorage, Shape)> {
         let (_, c, h, w) = layout.shape().dims4()?;
         let Some((start, _)) = layout.contiguous_offsets() else {
@@ -216,6 +230,7 @@ pub fn im2col(
     })
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct ChannelNormOp {
     gamma: Tensor,
 }
@@ -233,6 +248,7 @@ impl CustomOp1 for ChannelNormOp {
         candle_core::bail!("vae-channel-norm is Metal-only")
     }
 
+    #[cfg(target_os = "macos")]
     fn metal_fwd(&self, storage: &MetalStorage, layout: &Layout) -> Result<(MetalStorage, Shape)> {
         let (b, c, h, w) = layout.shape().dims4()?;
         let Some((start, _)) = layout.contiguous_offsets() else {

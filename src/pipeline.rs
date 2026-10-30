@@ -48,7 +48,7 @@ pub fn validate(args: &Request) -> Result<(u32, u32)> {
 
 /// Results that depend only on the prompt and reference images, kept between
 /// requests so re-rolling the seed or changing steps/size skips the encoders.
-/// Encoder results are held on the CPU. Model weights and their Metal device
+/// Encoder results are held on the CPU. Model weights and their compute device
 /// persist until the generator is dropped or its model cache is unloaded.
 #[derive(Default)]
 pub struct Cache {
@@ -71,11 +71,7 @@ impl Cache {
 
     fn device(&mut self) -> Result<Device> {
         if self.device.is_none() {
-            ensure!(
-                objc2_metal::MTLCreateSystemDefaultDevice().is_some(),
-                "no Metal GPU is visible; run on an Apple Silicon Mac with GPU access"
-            );
-            self.device = Some(Device::new_metal(0).context("could not initialize Metal")?);
+            self.device = Some(crate::device::new()?);
         }
         Ok(self.device.as_ref().unwrap().clone())
     }

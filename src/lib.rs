@@ -1,13 +1,15 @@
-//! ImageForger: native image generation and editing on Apple Metal.
+//! ImageForger: native image generation and editing on Apple Metal, or on the
+//! CPU on other platforms.
 //!
 //! Run [`Generator::generate`] on a worker thread. Callbacks execute synchronously
 //! on that thread; forward owned [`Event`] values to your UI through a channel.
 //! No tensor or GPU handle is exposed to the caller. See `examples/progress.rs`.
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
 compile_error!("img-gen requires an Apple Silicon Mac with Metal.");
 
 mod chat;
+mod device;
 pub mod diagnostics;
 mod dit;
 pub mod image_input;
@@ -36,6 +38,8 @@ use std::{
 };
 
 pub use anyhow::Result;
+/// The compute backend this build runs on: "Metal" or "CPU".
+pub const DEVICE: &str = device::NAME;
 pub use image::RgbaImage;
 pub use preview::PreviewControl;
 pub use weights::Checkpoint;

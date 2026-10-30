@@ -1,7 +1,7 @@
 //! A dedicated decoder queue: only CPU latent snapshots cross between Metal devices.
 use crate::{CancellationToken, Event, RgbaImage, pipeline, weights::Weights};
 use anyhow::{Context, Result, ensure};
-use candle_core::{Device, Tensor};
+use candle_core::Tensor;
 use std::{
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
@@ -216,7 +216,7 @@ impl DecoderWorker {
         let mut vae = None;
         Self::spawn(move |snapshot| {
             if device.is_none() {
-                device = Some(Device::new_metal(0)?);
+                device = Some(crate::device::new()?);
             }
             let device = device.as_ref().unwrap();
             let vae = pipeline::load_vae(&mut vae, &weights, device)?;
@@ -332,7 +332,7 @@ mod tests {
 
     fn snapshot(step: usize) -> Snapshot {
         Snapshot {
-            latents: Tensor::new(&[step as f32], &Device::Cpu).unwrap(),
+            latents: Tensor::new(&[step as f32], &candle_core::Device::Cpu).unwrap(),
             step,
             width: 1,
             height: 1,
