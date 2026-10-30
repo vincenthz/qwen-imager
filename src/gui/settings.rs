@@ -12,7 +12,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     input::{Input, InputState},
     setting::{
-        NumberFieldOptions, SelectIndex, SettingField, SettingGroup, SettingItem, SettingPage,
+        NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage,
         Settings as SettingsComponent,
     },
 };
@@ -198,24 +198,20 @@ pub enum SettingsEvent {
 pub struct SettingsPanel {
     server_input: Entity<InputState>,
     credentials: HashMap<String, Entity<HostCredentials>>,
-    models: Entity<Models>,
-    models_page: bool,
-    _models_subscription: Subscription,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsPanel {}
 
 impl SettingsPanel {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>, models: Entity<Models>, models_page: bool) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let server_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("host or host:port")
         });
-        let subscription = cx.observe(&models, |_, _, cx| cx.notify());
         let credentials = cx.global::<Settings>().servers.clone().into_iter().map(|address| {
             let editor = cx.new(|cx| HostCredentials::new(address.clone(), window, cx));
             (address, editor)
         }).collect();
-        Self { server_input, credentials, models, models_page, _models_subscription: subscription }
+        Self { server_input, credentials }
     }
 }
 
@@ -417,6 +413,76 @@ fn models_field(models: &Entity<Models>, cx: &mut App) -> gpui::AnyElement {
         .into_any_element()
 }
 
+/// Local checkpoints in a panel over the window: download state, downloads
+/// and cancellation. Emits only `Dismissed`.
+pub struct ModelsPanel {
+    models: Entity<Models>,
+    _models_subscription: Subscription,
+}
+
+impl EventEmitter<SettingsEvent> for ModelsPanel {}
+
+impl ModelsPanel {
+    pub fn new(cx: &mut Context<Self>, models: Entity<Models>) -> Self {
+        let subscription = cx.observe(&models, |_, _, cx| cx.notify());
+        Self { models, _models_subscription: subscription }
+    }
+}
+
+impl Render for ModelsPanel {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .w(px(560.))
+            .max_w_full()
+            .max_h(px(680.))
+            .rounded_lg()
+            .border_1()
+            .border_color(palette(cx).border)
+            .bg(palette(cx).panel)
+            .shadow_lg()
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(palette(cx).border)
+                    .child(div().heading().text_lg().child("Models"))
+                    .child(
+                        Button::new("models-done")
+                            .primary()
+                            .label("Done")
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(SettingsEvent::Dismissed)
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("models-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .p_4()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(palette(cx).muted)
+                            .child("Optional for remote compute. Downloads continue when this panel is closed. Progress is for the current file. Choose the model new workspaces use in Settings → Generation."),
+                    )
+                    .child(models_field(&self.models, cx)),
+            )
+    }
+}
+
 impl Render for SettingsPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let panel = cx.weak_entity();
@@ -465,7 +531,6 @@ impl Render for SettingsPanel {
                     .w_full()
                     .child(
                         SettingsComponent::new("settings")
-                            .default_selected_index(SelectIndex { page_ix: if self.models_page { 3 } else { 0 }, group_ix: None })
                             .page(
                                 SettingPage::new("General")
                                     .group(
@@ -682,17 +747,6 @@ impl Render for SettingsPanel {
                                                 ),
                                             )
                                     )
-                            )
-                            .page(
-                                SettingPage::new("Models").group(
-                                    SettingGroup::new()
-                                        .title("Local models")
-                                        .description("Optional for remote compute. Downloads continue when Settings is closed. Progress is for the current file.")
-                                        .item(SettingItem::render({
-                                            let models = self.models.clone();
-                                            move |_, _, cx| models_field(&models, cx)
-                                        }))
-                                )
                             )
                     )
             )

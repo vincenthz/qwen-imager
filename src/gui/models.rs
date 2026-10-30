@@ -132,7 +132,7 @@ fn generation_blocker(
         return None;
     }
     Some(format!(
-        "{}: {}. Download local models in Settings → Models, or select a remote compute host in the title bar.",
+        "{}: {}. Download local models in the Models panel, or select a remote compute host in the title bar.",
         model_label(checkpoint),
         state.label()
     ))

@@ -48,6 +48,13 @@ const DECODING_PREVIEW: &str = " — decoding preview…";
 /// A newly available image or a completed generation, for the workspace tab.
 pub struct WorkspaceActivity;
 
+/// A panel the sidebar asks the workspaces to show over the window.
+#[derive(Clone, Copy)]
+pub enum OpenPanel {
+    Settings,
+    Models,
+}
+
 #[derive(Default)]
 struct ManualPreviewSchedule {
     due_step: Option<usize>,
@@ -442,6 +449,7 @@ pub struct ImageWindow {
 }
 
 impl gpui::EventEmitter<WorkspaceActivity> for ImageWindow {}
+impl gpui::EventEmitter<OpenPanel> for ImageWindow {}
 
 impl ImageWindow {
     pub fn new(
@@ -453,7 +461,11 @@ impl ImageWindow {
         let prompt = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(3, 12)
-                .placeholder("Describe the image or the changes you want… (⌘↩ to generate)")
+                .placeholder(if cfg!(target_os = "macos") {
+                    "Describe the image or the changes you want… (⌘↩ to generate)"
+                } else {
+                    "Describe the image or the changes you want… (Ctrl+Enter to generate)"
+                })
         });
         let settings = cx.global::<Settings>().clone();
         let steps = cx.new(|cx| digits_input(window, cx, settings.steps.to_string()));
@@ -807,7 +819,7 @@ impl ImageWindow {
         let model = cx.global::<Settings>().model;
         if !model.writes_text() {
             return Some(format!(
-                "{} omits the language model's output layer. Select BF16 or Turbo in Settings → Models.",
+                "{} omits the language model's output layer. Select BF16 or Turbo in Settings → Generation.",
                 model_label(model)
             ));
         }
@@ -2592,6 +2604,9 @@ impl ImageWindow {
                         cx.notify();
                     }))
             }))
+            .child(div().flex_1())
+            .child(panel_button("models", "icons/download.svg", "Models", OpenPanel::Models, cx))
+            .child(panel_button("settings", "icons/settings.svg", "Settings", OpenPanel::Settings, cx))
     }
 
     fn simple(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2641,6 +2656,24 @@ impl ImageWindow {
                     }),
             )
     }
+}
+
+/// A sidebar button that opens `panel` over the window.
+fn panel_button(
+    id: &'static str,
+    icon: &'static str,
+    tooltip: &'static str,
+    panel: OpenPanel,
+    cx: &mut Context<ImageWindow>,
+) -> Button {
+    Button::new(id)
+        .ghost()
+        .large()
+        .w(px(44.))
+        .h(px(44.))
+        .icon(Icon::default().path(icon))
+        .tooltip(tooltip)
+        .on_click(cx.listener(move |_, _, _, cx| cx.emit(panel)))
 }
 
 /// Where the item at `index` ends up after the item at `from` moves to `to`.

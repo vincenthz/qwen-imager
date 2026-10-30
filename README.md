@@ -95,24 +95,24 @@ written to stderr. The HTTP service logs requests and job lifecycle events;
 use `--serve --http-debug` for additional request-start and generation-progress
 logs. See [Service diagnostics](docs/http-api.md#service-diagnostics).
 
-To generate on this Mac, open **Settings → Models** and click **Download** for the
+To generate on this Mac, open **Models** (the download icon near the bottom of the
+left sidebar) and click **Download** for the
 desired checkpoint (about 32 GB for BF16 or Turbo, 18 GB for MLX 8-bit, 11 GB for MLX 4-bit).
-Downloads are optional and only start when requested. They continue while Settings
-is closed or you switch workspaces or compute hosts. Each model has its own
+Downloads are optional and only start when requested. They continue while the Models
+panel is closed or you switch workspaces or compute hosts. Each model has its own
 download, cancel, resume, and retry controls. Existing cached files are reused;
 **Refresh local cache** detects files downloaded outside the app. `HF_HOME` and
 `HF_HUB_CACHE` work as they do in the CLI.
 
-Named model icons in the title bar show local availability: green check marks for
+The Models panel shows each checkpoint's local availability: green check marks for
 downloaded models, blue download icons with a progress bar during downloads, grey
-icons for unavailable models, and orange for errors. Hover for status details or
-click an icon to open **Settings → Models**. Progress bars and percentages describe
-the **current file**, not the entire model; while its size is unknown, Settings
-shows a connecting message. Local generation requires the selected checkpoint to
+icons for unavailable models, and orange for errors. Progress bars and percentages
+describe the **current file**, not the entire model; while its size is unknown, the
+panel shows a connecting message. Local generation requires the selected checkpoint to
 be downloaded, but missing files never block access to the interface.
 
-The title bar also has a **gear** icon for **Settings** and a **bell** for unread
-workspace activity. **Workspace 1** and additional workspaces appear beneath it.
+The **gear** at the bottom of the left sidebar opens **Settings**; the title bar has
+a **bell** for unread workspace activity. **Workspace 1** and additional workspaces appear beneath it.
 Click **+** to create and select a new workspace. Each workspace retains its own
 prompt, settings, reference images and drawings, preview, and finished result.
 Switching tabs keeps background generation running. A **bell** appears on a
@@ -162,7 +162,7 @@ Settings are saved in `~/Library/Application Support/ImageForger/settings.json`:
   soon as it is idle; one still generating finishes with the previous model
   first, and both models stay in memory until it does. Switching drops the
   workspace's cached prompt and reference encodings. If the selected model is
-  not fully downloaded, local Generate points to **Settings → Models**; remote
+  not fully downloaded, local Generate points to the **Models** panel; remote
   generation uses the remote server's model.
 - **Compute hosts** and the selected **Local / Remote** backend. Removing the
   selected remote host switches future generations to Local; a running generation

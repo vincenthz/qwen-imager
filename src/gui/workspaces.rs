@@ -4,7 +4,7 @@ use std::{
 };
 
 use gpui::{
-    Context, Entity, MouseButton, ScrollHandle, Subscription, Window, div, prelude::*, px, relative, rgba,
+    AnyView, Context, Entity, MouseButton, ScrollHandle, Subscription, Window, div, prelude::*, rgba,
 };
 use gpui_component::{
     Disableable, Icon, Sizable as _, TitleBar,
@@ -15,12 +15,12 @@ use gpui_component::{
 use image_forger::{Checkpoint, ModelOptions, SharedModel};
 
 use crate::{
-    models::{Models, ModelState},
+    models::Models,
     palette::{AccentSelected as _, Appearance, Heading as _, palette},
     settings::{
-        Backend, Settings, SettingsEvent, SettingsPanel, model_label, select_appearance, select_backend,
+        Backend, Settings, ModelsPanel, SettingsEvent, SettingsPanel, select_appearance, select_backend,
     },
-    window::{ImageWindow, WorkspaceActivity},
+    window::{ImageWindow, OpenPanel, WorkspaceActivity},
 };
 
 #[derive(Default)]
@@ -45,6 +45,7 @@ impl TabActivity {
 struct Workspace {
     view: Entity<ImageWindow>,
     _activity: Subscription,
+    _panels: Subscription,
 }
 
 pub struct Workspaces {
@@ -56,7 +57,8 @@ pub struct Workspaces {
     _downloads_subscription: Subscription,
     _backend_subscription: Subscription,
     _error_subscription: Subscription,
-    settings: Option<(Entity<SettingsPanel>, Subscription)>,
+    /// Settings or Models, shown over the active workspace.
+    panel: Option<(AnyView, Subscription)>,
 }
 
 fn shared_model(checkpoint: Checkpoint) -> SharedModel {
@@ -75,7 +77,7 @@ impl Workspaces {
             tabs: Vec::new(),
             activity: TabActivity::default(),
             tab_scroll: ScrollHandle::new(),
-            settings: None,
+            panel: None,
             downloads,
             _downloads_subscription: subscription,
             _backend_subscription: cx.observe_global::<Backend>(|_, cx| cx.notify()),
@@ -94,29 +96,51 @@ impl Workspaces {
             workspaces.activity.received(index);
             cx.notify();
         });
+        let panels = cx.subscribe_in(&view, window, |workspaces, _, panel: &OpenPanel, window, cx| {
+            match panel {
+                OpenPanel::Settings => workspaces.open_settings(window, cx),
+                OpenPanel::Models => workspaces.open_models(window, cx),
+            }
+        });
         self.tabs.push(Workspace {
             view,
             _activity: subscription,
+            _panels: panels,
         });
         self.select(index, window, cx);
     }
 
-    fn open_settings(&mut self, models_page: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() && !models_page {
+    fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panel.is_some() {
             return;
         }
         // The hidden workspace inputs must not receive keyboard events.
         window.blur(cx);
-        let panel = cx.new(|cx| SettingsPanel::new(window, cx, self.downloads.clone(), models_page));
+        let panel = cx.new(|cx| SettingsPanel::new(window, cx));
         let subscription = cx.subscribe_in(&panel, window, |workspaces, _, event, window, cx| {
             match event {
                 SettingsEvent::Saved(previous) => {
                     workspaces.on_settings_saved(&previous, window, cx);
                 }
-                SettingsEvent::Dismissed => workspaces.close_settings(window, cx),
+                SettingsEvent::Dismissed => workspaces.close_panel(window, cx),
             }
         });
-        self.settings = Some((panel, subscription));
+        self.panel = Some((panel.into(), subscription));
+        cx.notify();
+    }
+
+    fn open_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panel.is_some() {
+            return;
+        }
+        window.blur(cx);
+        let panel = cx.new(|cx| ModelsPanel::new(cx, self.downloads.clone()));
+        let subscription = cx.subscribe_in(&panel, window, |workspaces, _, event, window, cx| {
+            if let SettingsEvent::Dismissed = event {
+                workspaces.close_panel(window, cx)
+            }
+        });
+        self.panel = Some((panel.into(), subscription));
         cx.notify();
     }
 
@@ -144,8 +168,8 @@ impl Workspaces {
         cx.notify();
     }
 
-    fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.settings.take().is_some() {
+    fn close_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.panel.take().is_some() {
             window.blur(cx);
             self.tabs[self.activity.active]
                 .view
@@ -169,23 +193,6 @@ impl Workspaces {
             .view
             .update(cx, |view, cx| view.activate(window, cx));
         cx.notify();
-    }
-
-    fn download_indicators(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div().flex().items_center().gap_1()
-            .children(self.downloads.read(cx).entries.iter().enumerate().map(|(index, entry)| {
-                let state = &entry.state;
-                div().flex().flex_col().gap(px(1.))
-                    .child(Button::new(("model-status", index)).ghost().xsmall()
-                        .icon(Icon::default().path(if matches!(state, ModelState::Ready) { "icons/downloaded.svg" } else { "icons/download.svg" }).text_color(state.color(palette(cx))))
-                        .label(model_label(entry.checkpoint))
-                        .tooltip(format!("{}: {} — open model downloads", model_label(entry.checkpoint), state.label()))
-                        .on_click(cx.listener(|view, _, window, cx| view.open_settings(true, window, cx))))
-                    .child(div().h(px(3.)).w_full().rounded_md().overflow_hidden()
-                        .when(state.is_downloading(), |bar| bar.bg(palette(cx).border))
-                        .when_some(state.fraction(), |bar, fraction| bar.child(
-                            div().h_full().w(relative(fraction)).bg(palette(cx).accent))))
-            }))
     }
 
     fn open_unread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -219,7 +226,6 @@ impl Render for Workspaces {
                             .gap_1()
                             .pr_2()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                            .child(self.download_indicators(cx))
                             .child(
                                 Button::new("compute-backend")
                                     .ghost()
@@ -286,21 +292,6 @@ impl Render for Workspaces {
                                         select_appearance(appearance.toggled(), cx)
                                     })
                             })
-                            .child(
-                                Button::new("settings")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(Icon::default().path("icons/settings.svg"))
-                                    .accent_selected(self.settings.is_some(), cx)
-                                    .tooltip("Settings")
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        if view.settings.is_some() {
-                                            view.close_settings(window, cx);
-                                        } else {
-                                            view.open_settings(false, window, cx);
-                                        }
-                                    })),
-                            ),
                     ),
             )
             .child(
@@ -359,10 +350,10 @@ impl Render for Workspaces {
                     .w_full()
                     .relative()
                     .child(self.tabs[self.activity.active].view.clone())
-                    .when_some(self.settings.as_ref(), |root, (panel, _)| {
+                    .when_some(self.panel.as_ref(), |root, (panel, _)| {
                         root.child(
                             div()
-                                .id("settings-backdrop")
+                                .id("panel-backdrop")
                                 .absolute()
                                 .inset_0()
                                 .flex()
@@ -374,12 +365,12 @@ impl Render for Workspaces {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|view, _, window, cx| {
-                                        view.close_settings(window, cx)
+                                        view.close_panel(window, cx)
                                     }),
                                 )
                                 .child(
                                     div()
-                                        .id("settings-panel")
+                                        .id("panel")
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation()
                                         })
