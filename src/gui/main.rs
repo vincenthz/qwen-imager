@@ -17,6 +17,8 @@ actions!(img_gen_gui, [Quit]);
 
 struct Assets;
 
+// gpui_component's own icons, such as the window controls it draws on Linux,
+// come from its default set; the application's icons take precedence.
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
         Ok(match path {
@@ -32,6 +34,7 @@ impl AssetSource for Assets {
             "icons/sliders.svg" => Some(Cow::Borrowed(include_bytes!("assets/sliders.svg"))),
             "icons/workflow.svg" => Some(Cow::Borrowed(include_bytes!("assets/workflow.svg"))),
             "icons/trash.svg" => Some(Cow::Borrowed(include_bytes!("assets/trash.svg"))),
+            "icons/star.svg" => Some(Cow::Borrowed(include_bytes!("assets/star.svg"))),
             "icons/server.svg" => Some(Cow::Borrowed(include_bytes!("assets/server.svg"))),
             "icons/sun.svg" => Some(Cow::Borrowed(include_bytes!("assets/sun.svg"))),
             "icons/moon.svg" => Some(Cow::Borrowed(include_bytes!("assets/moon.svg"))),
@@ -41,12 +44,12 @@ impl AssetSource for Assets {
             // Used by gpui_component menus and dropdown buttons.
             "icons/check.svg" => Some(Cow::Borrowed(include_bytes!("assets/check.svg"))),
             "icons/chevron-down.svg" => Some(Cow::Borrowed(include_bytes!("assets/chevron-down.svg"))),
-            _ => None,
+            _ => return gpui_kit_assets::Assets.load(path),
         })
     }
 
     fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
-        Ok([
+        let mut assets = [
             "icons/download.svg",
             "icons/downloaded.svg",
             "icons/save.svg",
@@ -59,6 +62,7 @@ impl AssetSource for Assets {
             "icons/sliders.svg",
             "icons/workflow.svg",
             "icons/trash.svg",
+            "icons/star.svg",
             "icons/server.svg",
             "icons/sun.svg",
             "icons/moon.svg",
@@ -70,8 +74,12 @@ impl AssetSource for Assets {
         ]
         .into_iter()
         .filter(|asset| asset.starts_with(path))
-        .map(Into::into)
-        .collect())
+        .map(SharedString::from)
+        .collect::<Vec<_>>();
+        assets.extend(gpui_kit_assets::Assets.list(path)?);
+        assets.sort();
+        assets.dedup();
+        Ok(assets)
     }
 }
 
@@ -123,4 +131,22 @@ fn main() {
             .expect("opening the image generation window");
             cx.activate(true);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Assets;
+    use gpui::AssetSource as _;
+
+    #[test]
+    fn component_icons_fall_back_to_the_default_set() -> anyhow::Result<()> {
+        for icon in ["window-close", "window-minimize", "window-maximize", "window-restore"] {
+            let path = format!("icons/{icon}.svg");
+            assert!(Assets.load(&path)?.is_some(), "{path}");
+            assert!(Assets.list("icons/")?.contains(&path.into()));
+        }
+        let ours: &[u8] = include_bytes!("assets/check.svg");
+        assert_eq!(Assets.load("icons/check.svg")?.as_deref(), Some(ours));
+        Ok(())
+    }
 }

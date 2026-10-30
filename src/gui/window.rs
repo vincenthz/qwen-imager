@@ -819,7 +819,7 @@ impl ImageWindow {
         let model = cx.global::<Settings>().model;
         if !model.writes_text() {
             return Some(format!(
-                "{} omits the language model's output layer. Select BF16 or Turbo in Settings → Generation.",
+                "{} omits the language model's output layer. Set BF16 or Turbo as the default in Models.",
                 model_label(model)
             ));
         }

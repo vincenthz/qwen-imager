@@ -3,7 +3,7 @@ use crate::credentials::HostCredentials;
 
 use anyhow::Context as _;
 use gpui::{
-    App, Context, Entity, EventEmitter, Global, SharedString, Subscription, WeakEntity, Window, div, prelude::*,
+    App, Context, Entity, EventEmitter, Global, Subscription, WeakEntity, Window, div, prelude::*,
     px, relative,
 };
 use gpui_component::{
@@ -217,8 +217,8 @@ impl SettingsPanel {
 
 /// Apply a settings mutation: persist it, replace the global, and notify the
 /// workspaces so they can switch models and refresh their defaults.
-fn commit(
-    panel: &WeakEntity<SettingsPanel>,
+fn commit<P: EventEmitter<SettingsEvent>>(
+    panel: &WeakEntity<P>,
     cx: &mut App,
     mutate: impl FnOnce(&mut Settings),
 ) {
@@ -382,16 +382,29 @@ fn output_directory_field(panel: WeakEntity<SettingsPanel>, cx: &mut App) -> gpu
         .into_any_element()
 }
 
-fn models_field(models: &Entity<Models>, cx: &mut App) -> gpui::AnyElement {
+fn models_field(panel: &WeakEntity<ModelsPanel>, models: &Entity<Models>, cx: &mut App) -> gpui::AnyElement {
+    let default = cx.global::<Settings>().model;
     div().flex().flex_col().gap_4().w_full()
         .children(models.read(cx).entries.iter().enumerate().map(|(index, entry)| {
             let download = models.clone();
             let cancel = models.clone();
             let state = &entry.state;
+            let checkpoint = entry.checkpoint;
+            let panel = panel.clone();
             div().flex().flex_col().gap_2().p_3().rounded_md().border_1().border_color(palette(cx).border)
                 .child(div().flex().items_center().gap_2()
                     .child(Icon::default().path(if matches!(state, ModelState::Ready) { "icons/downloaded.svg" } else { "icons/download.svg" }).text_color(state.color(palette(cx))))
-                    .child(div().flex_1().text_sm().child(format!("{} · about {} GB", model_label(entry.checkpoint), entry.checkpoint.download_gb()))))
+                    .child(div().flex_1().text_sm().child(format!("{} · about {} GB", model_label(entry.checkpoint), entry.checkpoint.download_gb())))
+                    .when(checkpoint == default, |row| row.child(
+                        div().flex().items_center().gap_1().text_xs().text_color(palette(cx).accent)
+                            .child(Icon::default().path("icons/star.svg").size_3p5().text_color(palette(cx).accent))
+                            .child("Default")))
+                    .when(checkpoint != default, |row| row.child(
+                        Button::new(("default-model", index)).small().ghost()
+                            .icon(Icon::default().path("icons/star.svg"))
+                            .label("Set as default")
+                            .tooltip("Use this model in every workspace")
+                            .on_click(move |_, _, cx| commit(&panel, cx, |s| s.model = checkpoint)))))
                 .child(div().text_xs().text_color(state.color(palette(cx))).child(state.label()))
                 .when_some(state.fraction(), |row, fraction| row.child(
                     div().h(px(4.)).w_full().rounded_md().overflow_hidden().bg(palette(cx).border)
@@ -414,18 +427,21 @@ fn models_field(models: &Entity<Models>, cx: &mut App) -> gpui::AnyElement {
 }
 
 /// Local checkpoints in a panel over the window: download state, downloads
-/// and cancellation. Emits only `Dismissed`.
+/// and cancellation, and the default model, which emits `Saved`.
 pub struct ModelsPanel {
     models: Entity<Models>,
-    _models_subscription: Subscription,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl EventEmitter<SettingsEvent> for ModelsPanel {}
 
 impl ModelsPanel {
     pub fn new(cx: &mut Context<Self>, models: Entity<Models>) -> Self {
-        let subscription = cx.observe(&models, |_, _, cx| cx.notify());
-        Self { models, _models_subscription: subscription }
+        let subscriptions = vec![
+            cx.observe(&models, |_, _, cx| cx.notify()),
+            cx.observe_global::<Settings>(|_, cx| cx.notify()),
+        ];
+        Self { models, _subscriptions: subscriptions }
     }
 }
 
@@ -476,9 +492,9 @@ impl Render for ModelsPanel {
                         div()
                             .text_sm()
                             .text_color(palette(cx).muted)
-                            .child("Optional for remote compute. Downloads continue when this panel is closed. Progress is for the current file. Choose the model new workspaces use in Settings → Generation."),
+                            .child("Optional for remote compute. Downloads continue when this panel is closed. Progress is for the current file. Every workspace generates with the default model."),
                     )
-                    .child(models_field(&self.models, cx)),
+                    .child(models_field(&cx.weak_entity(), &self.models, cx)),
             )
     }
 }
@@ -487,10 +503,6 @@ impl Render for SettingsPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let panel = cx.weak_entity();
         let defaults = Settings::default();
-        let model_options: Vec<(SharedString, SharedString)> = Checkpoint::ALL
-            .iter()
-            .map(|&model| (model.name().into(), model_label(model).into()))
-            .collect();
 
         div()
             .flex()
@@ -703,47 +715,6 @@ impl Render for SettingsPanel {
                                                 )
                                                 .description(
                                                     "Faster sampling with slightly different pixels.",
-                                                ),
-                                            )
-                                    )
-                                    .group(
-                                        SettingGroup::new()
-                                            .title("Model")
-                                            .item(
-                                                SettingItem::new(
-                                                    "Checkpoint",
-                                                    SettingField::dropdown(
-                                                        model_options,
-                                                        |cx| {
-                                                            cx.global::<Settings>()
-                                                                .model
-                                                                .name()
-                                                                .into()
-                                                        },
-                                                        {
-                                                            let panel = panel.clone();
-                                                            move |value, cx| {
-                                                                if let Some(model) =
-                                                                    Checkpoint::ALL
-                                                                        .into_iter()
-                                                                        .find(|m| {
-                                                                            m.name()
-                                                                                == value.as_str()
-                                                                        })
-                                                                {
-                                                                    commit(&panel, cx, |s| {
-                                                                        s.model = model
-                                                                    });
-                                                                }
-                                                            }
-                                                        },
-                                                    )
-                                                    .default_value(SharedString::from(
-                                                        defaults.model.name(),
-                                                    )),
-                                                )
-                                                .description(
-                                                    "The model weights used by new workspaces.",
                                                 ),
                                             )
                                     )

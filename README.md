@@ -104,6 +104,14 @@ download, cancel, resume, and retry controls. Existing cached files are reused;
 **Refresh local cache** detects files downloaded outside the app. `HF_HOME` and
 `HF_HUB_CACHE` work as they do in the CLI.
 
+The model marked **Default** (BF16 initially) is the one every workspace uses;
+click **Set as default** on another checkpoint to switch (see
+[Checkpoints](#checkpoints)). Each workspace switches as soon as it is idle; one
+still generating finishes with the previous model first, and both models stay in
+memory until it does. Switching drops the workspace's cached prompt and reference
+encodings. If the default model is not fully downloaded, local Generate points to
+the **Models** panel; remote generation uses the remote server's model.
+
 The Models panel shows each checkpoint's local availability: green check marks for
 downloaded models, blue download icons with a progress bar during downloads, grey
 icons for unavailable models, and orange for errors. Progress bars and percentages
@@ -157,13 +165,6 @@ Settings are saved in `~/Library/Application Support/ImageForger/settings.json`:
   different pixels. If a BF16 step produces non-finite latents, it is redone in
   Float32 and the rest of that generation stays in Float32. Applies from the
   next generation.
-- **Model**: **BF16** (the default, the original checkpoint), **MLX 8-bit**, or
-  **MLX 4-bit** (see [Checkpoints](#checkpoints)). Each workspace switches as
-  soon as it is idle; one still generating finishes with the previous model
-  first, and both models stay in memory until it does. Switching drops the
-  workspace's cached prompt and reference encodings. If the selected model is
-  not fully downloaded, local Generate points to the **Models** panel; remote
-  generation uses the remote server's model.
 - **Compute hosts** and the selected **Local / Remote** backend. Removing the
   selected remote host switches future generations to Local; a running generation
   continues on the backend it started with.

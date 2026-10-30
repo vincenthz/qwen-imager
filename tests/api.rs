@@ -394,6 +394,8 @@ fn shared_model_sessions_run_concurrently_and_cancel_independently() -> image_fo
         image::Rgba([220, 40, 30, 255]),
     ));
     let requests = [first, second];
+    // Both sessions load weights and encode before step 1; far slower on the CPU.
+    let timeout = Duration::from_secs(if image_forger::DEVICE == "CPU" { 1800 } else { 180 });
     let mut baseline = generator();
     let expected: Vec<_> = requests
         .iter()
@@ -431,7 +433,7 @@ fn shared_model_sessions_run_concurrently_and_cancel_independently() -> image_fo
                         let _ = ready.send((index, true));
                         // Neither session can pass step 1 until BOTH reach it.
                         // A whole-generation lock would fail this handshake.
-                        if start.recv_timeout(Duration::from_secs(180)).is_err() {
+                        if start.recv_timeout(timeout).is_err() {
                             cancel.cancel();
                         }
                     }
@@ -447,8 +449,8 @@ fn shared_model_sessions_run_concurrently_and_cancel_independently() -> image_fo
         }
         drop(ready);
         let reached = (|| -> image_forger::Result<()> {
-            let a = receiver.recv_timeout(Duration::from_secs(180))?;
-            let b = receiver.recv_timeout(Duration::from_secs(180))?;
+            let a = receiver.recv_timeout(timeout)?;
+            let b = receiver.recv_timeout(timeout)?;
             anyhow::ensure!(
                 a.1 && b.1 && a.0 != b.0,
                 "both independent sessions must reach step 1: {a:?}, {b:?}"

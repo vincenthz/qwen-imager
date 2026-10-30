@@ -136,8 +136,11 @@ impl Workspaces {
         window.blur(cx);
         let panel = cx.new(|cx| ModelsPanel::new(cx, self.downloads.clone()));
         let subscription = cx.subscribe_in(&panel, window, |workspaces, _, event, window, cx| {
-            if let SettingsEvent::Dismissed = event {
-                workspaces.close_panel(window, cx)
+            match event {
+                SettingsEvent::Saved(previous) => {
+                    workspaces.on_settings_saved(previous, window, cx);
+                }
+                SettingsEvent::Dismissed => workspaces.close_panel(window, cx),
             }
         });
         self.panel = Some((panel.into(), subscription));
