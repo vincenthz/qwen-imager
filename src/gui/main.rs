@@ -96,14 +96,16 @@ fn main() {
             Theme::change(appearance.mode(), None, cx);
             // Bound after gpui_component so Cmd-Enter (Ctrl-Enter off macOS)
             // in the prompt generates instead of inserting a newline like Enter.
-            cx.bind_keys([
-                KeyBinding::new("secondary-q", Quit, None),
-                KeyBinding::new(
-                    "secondary-enter",
-                    window::Generate,
-                    Some(&format!("{} > Input", window::PROMPT_CONTEXT)),
-                ),
-            ]);
+            // `KeyBinding::new` no longer resolves the `secondary-` alias
+            // (it panics); `load` resolves it against the host OS.
+            let prompt_context = KeyBindingContextPredicate::parse(&format!("{} > Input", window::PROMPT_CONTEXT))
+                .expect("valid prompt key context");
+            let bindings = [
+                KeyBinding::load("secondary-q", Box::new(Quit), None, false, None, cx),
+                KeyBinding::load("secondary-enter", Box::new(window::Generate), Some(prompt_context.into()), false, None, cx),
+            ]
+            .map(|binding| binding.expect("valid keystroke"));
+            cx.bind_keys(bindings);
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
