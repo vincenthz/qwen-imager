@@ -332,7 +332,7 @@ impl Render for ImageViewer {
                             view.toggle_zoom(position, cx);
                         }
                     }))
-                    .on_scroll_wheel(cx.listener(|view, event: &gpui::ScrollWheelEvent, _, cx| {
+                    .on_scroll(cx.listener(|view, event: &gpui::ScrollEvent, _, cx| {
                         match event.delta {
                             // Mouse wheels zoom; trackpads pan unless ⌘ or Ctrl is held.
                             gpui::ScrollDelta::Lines(lines) => {

@@ -678,7 +678,7 @@ impl Render for WorkflowCanvas {
                 .on_mouse_up(MouseButton::Middle, cx.listener(|view, event: &gpui::MouseUpEvent, _, cx| view.finish(event.position, cx)))
                 .on_mouse_up_out(MouseButton::Left, cx.listener(|view, _, _, cx| { view.drag = None; cx.notify(); }))
                 .on_mouse_up_out(MouseButton::Middle, cx.listener(|view, _, _, cx| { view.drag = None; cx.notify(); }))
-                .on_scroll_wheel(cx.listener(|view, event: &gpui::ScrollWheelEvent, _, cx| {
+                .on_scroll(cx.listener(|view, event: &gpui::ScrollEvent, _, cx| {
                     let delta = event.delta.pixel_delta(px(24.));
                     if event.modifiers.control || event.modifiers.platform {
                         view.viewport.zoom_at(view.local(event.position), view.viewport.zoom * (-f32::from(delta.y) * 0.005).exp());
